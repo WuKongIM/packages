@@ -14,11 +14,11 @@ test-signed packages are never public releases.
   credentials.
 - This repository independently verifies the immutable source release before
   accepting a publication request.
-- Preview APT and RPM signing use separate short-lived signing subkeys in a
-  protected GitHub Environment.
+- Once provisioned, preview APT and RPM signing will use separate short-lived
+  signing subkeys in a protected GitHub Environment.
 - Stable signing keys remain outside GitHub-hosted CI.
-- GitHub Pages receives one complete, verified repository snapshot. It never
-  receives a partially updated index.
+- GitHub Pages will receive only complete, verified preview snapshots. Stable
+  publication requires migration to object storage and a CDN.
 
 See [docs/release-contract.md](docs/release-contract.md) for the release,
 retention, signing, and recovery contracts.

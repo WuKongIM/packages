@@ -1,11 +1,14 @@
 name: Safety Automation - Deploy Package Repository Bootstrap
 
 on:
+  pull_request:
   push:
     branches:
       - main
     paths:
       - ".github/workflows/pages.yml"
+      - ".github/CODEOWNERS"
+      - "keys/**"
       - "manifests/**"
       - "site/**"
       - "tests/**"
@@ -25,7 +28,7 @@ jobs:
     name: Validate complete Pages snapshot
     if: github.repository == 'WuKongIM/packages'
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 30
     permissions:
       contents: read
     steps:
@@ -47,7 +50,10 @@ jobs:
 
   deploy:
     name: Deploy complete Pages snapshot
-    if: github.repository == 'WuKongIM/packages'
+    if: >-
+      github.repository == 'WuKongIM/packages' &&
+      github.ref == 'refs/heads/main' &&
+      github.event_name != 'pull_request'
     needs: build
     runs-on: ubuntu-24.04
     timeout-minutes: 10

@@ -13,16 +13,20 @@ data and never execute files from them.
 
 ## Channels and retention
 
-The public layouts are:
+The intended public layouts are:
 
-- `/apt/dists/preview` and `/rpm/preview/el/9/x86_64` for pre-releases;
-- `/apt/dists/stable` and `/rpm/stable/el/9/x86_64` for stable releases.
+- `/apt/dists/preview` and `/rpm/preview/el/9/x86_64` for pre-releases on
+  GitHub Pages;
+- `/apt/dists/stable` and `/rpm/stable/el/9/x86_64` for stable releases only
+  after publication has migrated to object storage and a CDN.
 
-GitHub Pages has a 1 GiB published-site limit. The publisher therefore keeps
-at most three amd64 versions online and rejects any snapshot larger than
-900 MiB. Release assets remain immutable audit evidence even after a version
-ages out of the installable window. Adding another architecture requires a new
-capacity decision before changing this limit.
+GitHub Pages documents a 1 GB published-site limit. The preview publisher keeps
+at most four amd64 versions online and treats 750 MiB as a mandatory migration
+threshold rather than consuming the remaining platform capacity. Stable
+publication is never enabled on Pages. Release assets remain immutable audit
+evidence even after a version ages out of the installable window. Adding
+another architecture requires a new capacity decision before changing this
+limit.
 
 ## Signing
 
@@ -32,8 +36,8 @@ do not receive a non-standard signature. RPM packages are signed before
 `createrepo_c` builds metadata, and the same channel RPM certificate signs
 `repodata/repomd.xml`.
 
-Preview CI may import only an encrypted sign-only subkey. Its offline
-certify-only primary key must not be present. The workflow accepts exact
+After it is provisioned, preview CI may import only an encrypted sign-only
+subkey. Its offline certify-only primary key must not be present. The workflow accepts exact
 40-hex primary and signing-subkey fingerprints from a reviewed manifest and
 fails when the key is revoked, expired, has less than 30 days remaining, or
 has any unexpected secret material. Preview subkeys last at most 180 days;

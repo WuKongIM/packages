@@ -1,7 +1,7 @@
 {
   "schema": "wukongim.native_package_channels/v1",
-  "site_limit_bytes": 943718400,
-  "max_online_versions": 3,
+  "site_limit_bytes": 786432000,
+  "max_online_versions": 4,
   "architectures": [
     "amd64"
   ],
