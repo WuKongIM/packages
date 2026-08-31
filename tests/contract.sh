@@ -29,13 +29,11 @@ if grep -REI --exclude=README.md --exclude=contract.sh \
   exit 1
 fi
 
-site_bytes="$(find "$ROOT_DIR/site" -type f -exec stat -f '%z' {} + 2>/dev/null | awk '{total += $1} END {print total + 0}')"
-if [[ "$site_bytes" == 0 ]]; then
-  site_bytes="$(find "$ROOT_DIR/site" -type f -printf '%s\n' | awk '{total += $1} END {print total + 0}')"
-fi
 limit_bytes="$(jq -r '.site_limit_bytes' "$MANIFEST")"
-((site_bytes <= limit_bytes)) || {
-  echo "site snapshot is ${site_bytes} bytes; limit is ${limit_bytes}" >&2
+site_kib="$(du -sk "$ROOT_DIR/site" | awk '{print $1}')"
+limit_kib="$((limit_bytes / 1024))"
+((site_kib <= limit_kib)) || {
+  echo "site snapshot is ${site_kib} KiB; limit is ${limit_kib} KiB" >&2
   exit 1
 }
 
