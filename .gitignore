@@ -1,0 +1,7 @@
+.DS_Store
+dist/
+tmp/
+.gnupg/
+private/
+secrets/
+*.private
