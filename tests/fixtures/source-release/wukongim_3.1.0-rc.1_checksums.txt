@@ -1,0 +1,6 @@
+a65d7da7f673cdc77c915c4d0e4bbbe9647c1b561c5b6bf008c8dc2e50bfc632  wukongim_3.1.0-rc.1_darwin_amd64.tar.gz
+f8f15594db2e88c5ee0a9bae453e9a94cd542f78f89a8dfb0caa54d8639ce032  wukongim_3.1.0-rc.1_darwin_arm64.tar.gz
+76649682a12752f30e405e3ccbf23c18f10b8a48f9f1ec91a93be6d8b860eba4  wukongim_3.1.0-rc.1_linux_amd64.deb
+a82d21400b86c0f3283be25333bb0740a9b0ec66dc97a1620918b07c06e5d634  wukongim_3.1.0-rc.1_linux_amd64.rpm
+35748f3955e78cec41339905a2fdfb24aeb002203a7ec448084fdc4611d63237  wukongim_3.1.0-rc.1_linux_amd64.tar.gz
+ca79b2494783d25f81c679453eb39998ba6af31f9f2b0c1943273fdb9ebfa290  wukongim_3.1.0-rc.1_linux_arm64.tar.gz

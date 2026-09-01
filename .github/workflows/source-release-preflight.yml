@@ -1,0 +1,173 @@
+name: Safety Automation - Verify Native Package Source Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_release_id:
+        description: Numeric immutable WuKongIM source Release id
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: native-package-source-preflight-${{ inputs.source_release_id }}
+  cancel-in-progress: false
+
+jobs:
+  control:
+    name: Validate source-read control
+    if: >-
+      github.repository == 'WuKongIM/packages' &&
+      github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      control_sha: ${{ steps.request.outputs.control_sha }}
+      source_release_id: ${{ steps.request.outputs.source_release_id }}
+    steps:
+      - name: Check out exact protected control
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Validate control and numeric Release id
+        id: request
+        shell: bash
+        env:
+          SOURCE_RELEASE_ID: ${{ inputs.source_release_id }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          ./tests/contract.sh
+          jq -e '.enabled == true' manifests/source-read.json >/dev/null || {
+            echo 'source-read GitHub App control is not provisioned' >&2
+            exit 78
+          }
+          [[ "$SOURCE_RELEASE_ID" =~ ^[1-9][0-9]*$ ]] || {
+            echo 'source_release_id must be a positive numeric GitHub Release id' >&2
+            exit 64
+          }
+          echo "control_sha=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+          echo "source_release_id=$SOURCE_RELEASE_ID" >> "$GITHUB_OUTPUT"
+
+  verify:
+    name: Verify immutable source package assets
+    needs: control
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: native-package-source-read
+    permissions:
+      contents: read
+    steps:
+      - name: Check out exact validated control
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ needs.control.outputs.control_sha }}
+          persist-credentials: false
+
+      - name: Revalidate exact control commit
+        env:
+          CONTROL_SHA: ${{ needs.control.outputs.control_sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$CONTROL_SHA"
+          ./tests/contract.sh
+          jq -e '.enabled == true' manifests/source-read.json >/dev/null
+
+      - name: Mint source-repository read token
+        id: source-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ secrets.WK_SOURCE_READ_APP_CLIENT_ID }}
+          private-key: ${{ secrets.WK_SOURCE_READ_APP_PRIVATE_KEY }}
+          owner: WuKongIM
+          repositories: WuKongIM
+          permission-contents: read
+          permission-attestations: read
+
+      - name: Resolve exact immutable source Release
+        env:
+          GH_TOKEN: ${{ steps.source-token.outputs.token }}
+          SOURCE_RELEASE_ID: ${{ needs.control.outputs.source_release_id }}
+          SOURCE_ASSETS: ${{ runner.temp }}/source-assets
+          SOURCE_RECEIPT: ${{ runner.temp }}/source-release.json
+        run: >-
+          ./scripts/resolve-source-release.py
+          --release-id "$SOURCE_RELEASE_ID"
+          --output-dir "$SOURCE_ASSETS"
+          --token-env GH_TOKEN
+          >"$SOURCE_RECEIPT"
+
+      - name: Verify fixed workflow attestations for all seven assets
+        env:
+          GH_TOKEN: ${{ steps.source-token.outputs.token }}
+          SOURCE_ASSETS: ${{ runner.temp }}/source-assets
+          SOURCE_RECEIPT: ${{ runner.temp }}/source-release.json
+          SOURCE_ATTESTATIONS: ${{ runner.temp }}/source-attestations
+        run: >-
+          ./scripts/verify-source-attestations.py
+          --receipt "$SOURCE_RECEIPT"
+          --asset-dir "$SOURCE_ASSETS"
+          --evidence-dir "$SOURCE_ATTESTATIONS"
+          >"$RUNNER_TEMP/source-attestation-summary.json"
+
+      - name: Install package metadata inspector
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends rpm
+
+      - name: Inspect unsigned package identities without executing payloads
+        shell: bash
+        env:
+          SOURCE_ASSETS: ${{ runner.temp }}/source-assets
+          SOURCE_RECEIPT: ${{ runner.temp }}/source-release.json
+        run: |
+          set -euo pipefail
+          version="$(jq -r '.version' "$SOURCE_RECEIPT")"
+          deb="$SOURCE_ASSETS/wukongim_${version}_linux_amd64.deb"
+          rpm_package="$SOURCE_ASSETS/wukongim_${version}_linux_amd64.rpm"
+          expected_deb_version="${version/-/~}"
+          expected_rpm_version="${expected_deb_version//-/_}"
+
+          test "$(dpkg-deb --field "$deb" Package)" = wukongim
+          test "$(dpkg-deb --field "$deb" Architecture)" = amd64
+          test "$(dpkg-deb --field "$deb" Version)" = "$expected_deb_version"
+          test "$(rpm -qp --queryformat '%{NAME}' "$rpm_package")" = wukongim
+          test "$(rpm -qp --queryformat '%{ARCH}' "$rpm_package")" = x86_64
+          test "$(rpm -qp --queryformat '%{VERSION}' "$rpm_package")" = "$expected_rpm_version"
+          test "$(rpm -qp --queryformat '%{RELEASE}' "$rpm_package")" = 1
+          test "$(rpm -qp --queryformat '%{SIGPGP:pgpsig}' "$rpm_package")" = '(none)'
+          test "$(rpm -qp --queryformat '%{SIGGPG:pgpsig}' "$rpm_package")" = '(none)'
+
+          jq -n \
+            --arg schema 'wukongim/source-package-metadata/v1' \
+            --arg version "$version" \
+            --arg deb_version "$expected_deb_version" \
+            --arg rpm_version "$expected_rpm_version" \
+            '{
+              schema: $schema,
+              package: "wukongim",
+              version: $version,
+              deb: {version: $deb_version, architecture: "amd64"},
+              rpm: {version: $rpm_version, release: "1", architecture: "x86_64", signed: false}
+            }' >"$RUNNER_TEMP/source-package-metadata.json"
+
+      - name: Upload public verification evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-package-source-preflight-${{ needs.control.outputs.source_release_id }}
+          path: |
+            ${{ runner.temp }}/source-release.json
+            ${{ runner.temp }}/source-attestations/
+            ${{ runner.temp }}/source-attestation-summary.json
+            ${{ runner.temp }}/source-package-metadata.json
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Reject tracked-tree mutation
+        if: always()
+        run: git diff --exit-code HEAD --
