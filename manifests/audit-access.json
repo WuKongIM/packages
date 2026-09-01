@@ -1,6 +1,6 @@
 {
   "schema": "wukongim.native_package_audit_access/v1",
-  "enabled": false,
+  "enabled": true,
   "reader": {
     "environment": "native-package-preview-audit-read",
     "app_client_id_secret": "WK_PACKAGE_AUDIT_READER_APP_CLIENT_ID",
