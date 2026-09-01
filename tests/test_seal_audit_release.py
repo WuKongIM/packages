@@ -34,7 +34,7 @@ class FixtureState:
         self.assets: dict[str, bytes] = {}
         self.asset_ids = {ARCHIVE_NAME: 6001, RECEIPT_NAME: 6002}
         self.upload_host: str | None = None
-        self.requests: list[tuple[str, str]] = []
+        self.requests: list[tuple[str, str, str | None]] = []
         self.uploads: list[str] = []
         self.patches = 0
         self.tag_sha = CONTROL_SHA
@@ -90,7 +90,7 @@ class FixtureHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         state = self.server.state
-        state.requests.append(("GET", self.path))
+        state.requests.append(("GET", self.path, self.headers.get("Authorization")))
         release_path = (
             f"/repos/{sealer.resolver.AUDIT_REPOSITORY}/releases/{RELEASE_ID}"
         )
@@ -162,7 +162,7 @@ class FixtureHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         state = self.server.state
-        state.requests.append(("POST", self.path))
+        state.requests.append(("POST", self.path, self.headers.get("Authorization")))
         parsed = urllib.parse.urlsplit(self.path)
         expected_path = (
             f"/repos/{sealer.resolver.AUDIT_REPOSITORY}/releases/{RELEASE_ID}/assets"
@@ -185,7 +185,7 @@ class FixtureHandler(BaseHTTPRequestHandler):
 
     def do_PATCH(self) -> None:
         state = self.server.state
-        state.requests.append(("PATCH", self.path))
+        state.requests.append(("PATCH", self.path, self.headers.get("Authorization")))
         expected_path = (
             f"/repos/{sealer.resolver.AUDIT_REPOSITORY}/releases/{RELEASE_ID}"
         )
@@ -235,7 +235,13 @@ class SealAuditReleaseTest(unittest.TestCase):
         receipt.write_bytes(receipt_data)
         return archive, receipt, archive_data, receipt_data
 
-    def seal(self, state: FixtureState) -> tuple[dict[str, Any], bytes, bytes]:
+    def seal(
+        self,
+        state: FixtureState,
+        *,
+        token: str = "test-token",
+        policy_token: str | None = None,
+    ) -> tuple[dict[str, Any], bytes, bytes]:
         with TemporaryDirectory() as temporary, serve(state) as base:
             archive, receipt, archive_data, receipt_data = self.artifacts(Path(temporary))
             result = sealer.seal_audit_release(
@@ -245,11 +251,31 @@ class SealAuditReleaseTest(unittest.TestCase):
                 receipt_path=receipt,
                 api_base_url=base,
                 download_base_url=base,
-                token="test-token",
+                token=token,
+                policy_token=policy_token,
                 max_polls=1,
                 poll_seconds=0,
             )
         return result, archive_data, receipt_data
+
+    def test_routes_policy_token_only_to_immutable_policy_endpoint(self) -> None:
+        state = FixtureState()
+        self.seal(
+            state,
+            token="contents-token",
+            policy_token="policy-token",
+        )
+        policy_path = (
+            f"/repos/{sealer.resolver.AUDIT_REPOSITORY}/immutable-releases"
+        )
+        self.assertTrue(any(path == policy_path for _, path, _ in state.requests))
+        self.assertTrue(any(method in {"POST", "PATCH"} for method, _, _ in state.requests))
+        for method, path, authorization in state.requests:
+            with self.subTest(method=method, path=path):
+                if path == policy_path:
+                    self.assertEqual("Bearer policy-token", authorization)
+                else:
+                    self.assertEqual("Bearer contents-token", authorization)
 
     def test_fills_empty_draft_in_order_and_seals(self) -> None:
         state = FixtureState()

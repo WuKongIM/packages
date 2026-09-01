@@ -29,7 +29,7 @@ jobs:
       github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
-    environment: native-package-preview-audit
+    environment: native-package-preview-audit-read
     permissions:
       contents: read
     outputs:
@@ -50,16 +50,25 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
-      - name: Mint read-scoped package publisher token
-        id: publisher-token
+      - name: Validate reviewed audit access before credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./scripts/validate-control.py
+          jq -e '.enabled == true' manifests/audit-access.json >/dev/null || {
+            echo 'audit App access is not provisioned' >&2
+            exit 78
+          }
+
+      - name: Mint read-scoped package audit reader token
+        id: audit-reader-token
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
-          client-id: ${{ secrets.WK_PACKAGE_PUBLISHER_APP_CLIENT_ID }}
-          private-key: ${{ secrets.WK_PACKAGE_PUBLISHER_APP_PRIVATE_KEY }}
+          client-id: ${{ secrets.WK_PACKAGE_AUDIT_READER_APP_CLIENT_ID }}
+          private-key: ${{ secrets.WK_PACKAGE_AUDIT_READER_APP_PRIVATE_KEY }}
           owner: WuKongIM
           repositories: packages
           permission-administration: read
-          permission-contents: read
 
       - name: Validate enabled production contracts and exact current main
         shell: bash
@@ -115,7 +124,8 @@ jobs:
         id: resolve
         shell: bash
         env:
-          GH_TOKEN: ${{ steps.publisher-token.outputs.token }}
+          GH_TOKEN: ${{ github.token }}
+          IMMUTABLE_POLICY_TOKEN: ${{ steps.audit-reader-token.outputs.token }}
           REQUESTED_AUDIT_RELEASE_ID: ${{ inputs.audit_release_id }}
         run: |
           set -euo pipefail
@@ -123,7 +133,8 @@ jobs:
           release_json="$RUNNER_TEMP/audit-release-api.json"
           resolution="$RUNNER_TEMP/target-resolution.json"
           assets="$RUNNER_TEMP/target-release-assets"
-          gh api "repos/WuKongIM/packages/immutable-releases" \
+          GH_TOKEN="$IMMUTABLE_POLICY_TOKEN" \
+            gh api "repos/WuKongIM/packages/immutable-releases" \
             | jq -e '.enabled == true' >/dev/null
           gh api "repos/WuKongIM/packages/releases/$audit_id" >"$release_json"
           expected_tag="native-package-preview-r${audit_id}"
@@ -195,6 +206,7 @@ jobs:
             scripts/
             manifests/
             keys/
+            site/
             tests/contract.sh
           if-no-files-found: error
           retention-days: 7
@@ -939,14 +951,24 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     environment: native-package-preview-audit
-    permissions:
-      contents: read
+    permissions: {}
     steps:
       - name: Download exact control
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: native-package-control-${{ github.sha }}
           path: ${{ runner.temp }}/control
+
+      - name: Validate reviewed audit access before credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          control_root="$RUNNER_TEMP/control"
+          python3 "$control_root/scripts/validate-control.py" --root "$control_root"
+          jq -e '.enabled == true' "$control_root/manifests/audit-access.json" >/dev/null || {
+            echo 'audit App access is not provisioned' >&2
+            exit 78
+          }
 
       - name: Download verified deterministic candidate
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -1030,7 +1052,7 @@ jobs:
       needs.recover.result == 'success'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
-    environment: native-package-preview-audit
+    environment: native-package-preview-audit-read
     permissions:
       contents: read
     steps:
@@ -1040,27 +1062,38 @@ jobs:
           name: native-package-control-${{ github.sha }}
           path: ${{ runner.temp }}/control
 
+      - name: Validate reviewed audit access before credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          control_root="$RUNNER_TEMP/control"
+          python3 "$control_root/scripts/validate-control.py" --root "$control_root"
+          jq -e '.enabled == true' "$control_root/manifests/audit-access.json" >/dev/null || {
+            echo 'audit App access is not provisioned' >&2
+            exit 78
+          }
+
       - name: Download recovered candidate
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: native-package-audit-candidate-${{ needs.control.outputs.audit_release_id }}
           path: ${{ runner.temp }}/candidate
 
-      - name: Mint read-scoped package publisher token
-        id: publisher-token
+      - name: Mint read-scoped package audit reader token
+        id: audit-reader-token
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
-          client-id: ${{ secrets.WK_PACKAGE_PUBLISHER_APP_CLIENT_ID }}
-          private-key: ${{ secrets.WK_PACKAGE_PUBLISHER_APP_PRIVATE_KEY }}
+          client-id: ${{ secrets.WK_PACKAGE_AUDIT_READER_APP_CLIENT_ID }}
+          private-key: ${{ secrets.WK_PACKAGE_AUDIT_READER_APP_PRIVATE_KEY }}
           owner: WuKongIM
           repositories: packages
           permission-administration: read
-          permission-contents: read
 
-      - name: Re-resolve immutable bytes with a read-scoped audit token
+      - name: Re-resolve immutable bytes with split read-scoped tokens
         shell: bash
         env:
-          GH_TOKEN: ${{ steps.publisher-token.outputs.token }}
+          GH_TOKEN: ${{ github.token }}
+          IMMUTABLE_POLICY_TOKEN: ${{ steps.audit-reader-token.outputs.token }}
           AUDIT_RELEASE_ID: ${{ needs.control.outputs.audit_release_id }}
         run: |
           set -euo pipefail
@@ -1069,7 +1102,9 @@ jobs:
             --expected-control-sha "$GITHUB_SHA" \
             --archive "$RUNNER_TEMP/candidate/wukongim-preview-r${AUDIT_RELEASE_ID}-site.tar" \
             --receipt "$RUNNER_TEMP/candidate/wukongim-preview-r${AUDIT_RELEASE_ID}-receipt.json" \
-            --token-env GH_TOKEN >"$RUNNER_TEMP/immutable-result.json"
+            --token-env GH_TOKEN \
+            --policy-token-env IMMUTABLE_POLICY_TOKEN \
+            >"$RUNNER_TEMP/immutable-result.json"
           jq -e \
             '.initial_classification == "immutable_complete" and
              .final_classification == "immutable_complete" and .immutable == true' \
