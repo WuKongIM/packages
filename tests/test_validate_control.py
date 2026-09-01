@@ -278,10 +278,10 @@ class ValidateControlTest(unittest.TestCase):
 
             self.assert_rejected(root, "duplicate JSON key: schema")
 
-    def test_accepts_exact_disabled_audit_access_boundary(self) -> None:
+    def test_accepts_exact_enabled_audit_access_boundary(self) -> None:
         with copied_control_root() as root:
             audit_access = load_manifest(root, "audit-access.json")
-            self.assertIs(audit_access["enabled"], False)
+            self.assertIs(audit_access["enabled"], True)
 
             result = self.run_validator(root)
 
