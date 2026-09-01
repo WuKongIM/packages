@@ -764,6 +764,11 @@ class ValidateControlTest(unittest.TestCase):
         for name, changes, diagnostic in cases:
             with self.subTest(case=name), copied_control_root() as root:
                 toolchain = load_manifest(root, "signing-toolchain.json")
+                toolchain.update({
+                    "enabled": False,
+                    "digest": None,
+                    "workflow_sha": None,
+                })
                 toolchain.update(changes)
                 write_manifest(root, "signing-toolchain.json", toolchain)
 
