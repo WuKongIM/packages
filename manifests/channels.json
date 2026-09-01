@@ -10,7 +10,7 @@
   "channels": {
     "preview": {
       "enabled": false,
-      "status": "signing_not_provisioned",
+      "status": "awaiting_first_release",
       "releases": [],
       "retirement": {
         "phase": "none",

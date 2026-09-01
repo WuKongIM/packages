@@ -23,6 +23,9 @@ never committed to Git.
 - Once provisioned, preview APT and RPM signing use separate certificates and
   separate protected GitHub Environments. Each certificate pre-distributes a
   current and a next short-lived signing subkey.
+- Preview primary and next private keys currently use an explicitly accepted
+  single-operator online-workstation custody model. CI still receives only the
+  encrypted current sign-only subkey for the applicable package family.
 - Stable signing keys remain outside GitHub-hosted CI.
 - GitHub Pages will receive only complete, verified preview snapshots. Stable
   publication requires migration to object storage and a CDN.

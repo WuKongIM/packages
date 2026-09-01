@@ -398,6 +398,18 @@ class ValidateControlTest(unittest.TestCase):
 
     def test_rejects_extra_binary_key_file_while_signing_is_disabled(self) -> None:
         with copied_control_root() as root:
+            signing = load_manifest(root, "preview-signing.json")
+            signing["enabled"] = False
+            for family in ("apt", "rpm"):
+                (root / signing[family]["public_key"]).unlink()
+                signing[family]["primary_fingerprint"] = None
+                signing[family]["signing_subkeys"] = {
+                    "current": None,
+                    "next": None,
+                    "historical": [],
+                }
+            write_manifest(root, "preview-signing.json", signing)
+
             (root / "keys" / "unarmored-secret-subkey.gpg").write_bytes(
                 b"\x95\x01\x02binary-secret-key-packet\n"
             )
