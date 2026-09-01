@@ -36,7 +36,7 @@ external provisioning succeeds.
 
 GitHub's Immutable Releases status endpoint requires repository
 Administration read access, which the workflow `GITHUB_TOKEN` cannot request.
-The private `WuKongIM Package Immutable Policy Reader` GitHub App is installed only on
+The private `WuKongIM Package Policy Reader` GitHub App is installed only on
 `WuKongIM/packages` with Administration read permission only; GitHub supplies
 the implicit Metadata read permission. Its client ID and private key exist
 only in the protected
