@@ -1,0 +1,154 @@
+name: Safety Automation - Prepare Native Package Audit Draft
+
+on:
+  workflow_dispatch:
+    inputs:
+      expected_main_sha:
+        description: Exact protected packages/main commit to bind to the draft
+        required: true
+        type: string
+      operation:
+        description: Planned reviewed publication operation
+        required: true
+        type: choice
+        options:
+          - add_release
+          - remove_indexes
+          - remove_payloads
+      target_version:
+        description: Strict prerelease SemVer target without a v prefix
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: packages-pages
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Create one empty ID-bound audit draft
+    if: >-
+      github.repository == 'WuKongIM/packages' &&
+      github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: native-package-preview-audit
+    permissions:
+      contents: read
+    steps:
+      - name: Check out exact protected control
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Mint package publisher token
+        id: publisher-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ secrets.WK_PACKAGE_PUBLISHER_APP_CLIENT_ID }}
+          private-key: ${{ secrets.WK_PACKAGE_PUBLISHER_APP_PRIVATE_KEY }}
+          owner: WuKongIM
+          repositories: packages
+          permission-administration: read
+          permission-contents: write
+
+      - name: Fence exact current main and validate request
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.publisher-token.outputs.token }}
+          EXPECTED_MAIN_SHA: ${{ inputs.expected_main_sha }}
+          OPERATION: ${{ inputs.operation }}
+          TARGET_VERSION: ${{ inputs.target_version }}
+        run: |
+          set -euo pipefail
+          [[ "$EXPECTED_MAIN_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$EXPECTED_MAIN_SHA" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git fetch --no-tags --depth=1 origin main
+          test "$(git rev-parse FETCH_HEAD)" = "$GITHUB_SHA"
+          test "$(gh api repos/WuKongIM/packages/immutable-releases --jq .enabled)" = true
+          [[ "$OPERATION" =~ ^(add_release|remove_indexes|remove_payloads)$ ]]
+          [[ "$TARGET_VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-[0-9A-Za-z.-]+$ ]]
+          ./tests/contract.sh
+          jq -e '.enabled == true' manifests/preview-signing.json >/dev/null || {
+            echo 'production signing control is not provisioned' >&2
+            exit 78
+          }
+          jq -e '.enabled == true' manifests/signing-toolchain.json >/dev/null || {
+            echo 'production signing toolchain is not provisioned' >&2
+            exit 78
+          }
+
+      - name: Create and bind empty draft to its numeric Release id
+        id: draft
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.publisher-token.outputs.token }}
+          OPERATION: ${{ inputs.operation }}
+          TARGET_VERSION: ${{ inputs.target_version }}
+        run: |
+          set -euo pipefail
+          temporary_tag="native-package-preview-draft-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          notes="$(jq -n -r \
+            --arg operation "$OPERATION" \
+            --arg target "$TARGET_VERSION" \
+            --arg sha "$GITHUB_SHA" \
+            '"Native package audit draft.\n\nOperation: `" + $operation + "`\nTarget: `" + $target + "`\nControl: `" + $sha + "`\n\nThis draft is not a package publication and must remain empty until the reviewed publisher consumes its numeric Release id."')"
+          created="$(jq -n \
+            --arg tag "$temporary_tag" \
+            --arg target "$GITHUB_SHA" \
+            --arg name 'Native package audit draft' \
+            --arg body "$notes" \
+            '{tag_name:$tag,target_commitish:$target,name:$name,body:$body,draft:true,prerelease:true,make_latest:"false"}' \
+            | gh api --method POST repos/WuKongIM/packages/releases --input -)"
+          release_id="$(jq -er '.id | select(type == "number" and . > 0)' <<<"$created")"
+          final_tag="native-package-preview-r${release_id}"
+          final_name="WuKongIM preview package snapshot r${release_id}"
+          patched="$(jq -n --arg tag "$final_tag" --arg name "$final_name" \
+            '{tag_name:$tag,name:$name}' \
+            | gh api --method PATCH "repos/WuKongIM/packages/releases/${release_id}" --input -)"
+          jq -e \
+            --argjson id "$release_id" \
+            --arg tag "$final_tag" \
+            '.id == $id and .tag_name == $tag and .draft == true and
+             .immutable == false and .published_at == null and (.assets | length) == 0' \
+            <<<"$patched" >/dev/null
+          echo "release_id=$release_id" >>"$GITHUB_OUTPUT"
+          echo "tag=$final_tag" >>"$GITHUB_OUTPUT"
+
+      - name: Re-resolve exact empty draft by numeric id
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.publisher-token.outputs.token }}
+          RELEASE_ID: ${{ steps.draft.outputs.release_id }}
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/audit-draft-resolution.json"
+          ./scripts/resolve-audit-release.py \
+            --release-id "$RELEASE_ID" \
+            --expected-control-sha "$GITHUB_SHA" \
+            --expected-tag-state absent \
+            --output-dir "$RUNNER_TEMP/audit-draft-assets" \
+            --token-env GH_TOKEN >"$evidence"
+          jq -e \
+            --argjson id "$RELEASE_ID" \
+            '.release_id == $id and .classification == "empty_draft" and
+             .draft == true and .immutable == false and .asset_count == 0' \
+            "$evidence" >/dev/null
+          cat "$evidence" >>"$GITHUB_STEP_SUMMARY"
+          {
+            echo '### Native package audit draft prepared'
+            echo
+            echo "- Release id: \`$RELEASE_ID\`"
+            echo "- Tag reserved on publication: \`${{ steps.draft.outputs.tag }}\`"
+            echo "- Previous control commit for bind: \`$GITHUB_SHA\`"
+            echo '- No package, signature, or Pages content was published.'
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Reject tracked-tree mutation
+        if: always()
+        run: git diff --exit-code HEAD --

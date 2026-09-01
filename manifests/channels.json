@@ -1,5 +1,5 @@
 {
-  "schema": "wukongim.native_package_channels/v2",
+  "schema": "wukongim.native_package_channels/v3",
   "source_repository": "WuKongIM/WuKongIM",
   "site_limit_bytes": 786432000,
   "site_warning_bytes": 629145600,
@@ -16,6 +16,12 @@
         "phase": "none",
         "version": null,
         "not_before": null
+      },
+      "publication": {
+        "audit_release_id": null,
+        "base_audit_release_id": null,
+        "operation": "none",
+        "target_version": null
       }
     },
     "stable": {

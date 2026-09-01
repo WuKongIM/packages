@@ -1,0 +1,817 @@
+from __future__ import annotations
+
+import hashlib
+import importlib.util
+import json
+import re
+import stat
+import subprocess
+import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest import mock
+
+
+ROOT = Path(__file__).resolve().parents[1]
+SCRIPT = ROOT / "scripts" / "validate-production-package-clients.py"
+SPEC = importlib.util.spec_from_file_location(
+    "validate_production_package_clients", SCRIPT
+)
+assert SPEC is not None and SPEC.loader is not None
+validator = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(validator)
+
+
+APT_CERTIFICATE = b"reviewed apt certificate\n"
+RPM_CERTIFICATE = b"reviewed rpm certificate\n"
+DEB_PAYLOAD = b"authenticated deb payload\n"
+RPM_PAYLOAD = b"authenticated rpm payload\n"
+RETAINED_DEB_PAYLOAD = b"retained authenticated deb payload\n"
+RETAINED_RPM_PAYLOAD = b"retained authenticated rpm payload\n"
+VERSION = "3.1.0-rc.1"
+RETAINED_VERSION = "3.0.0-rc.1"
+AUDIT_RELEASE_ID = 4242
+CONTROL_SHA = "1" * 40
+
+
+def digest(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+class Fixture:
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        self.site = root / "site"
+        (self.site / "keys").mkdir(parents=True)
+        self.apt_certificate = root / "apt-preview.asc"
+        self.rpm_certificate = root / "rpm-preview.asc"
+        self.apt_certificate.write_bytes(APT_CERTIFICATE)
+        self.rpm_certificate.write_bytes(RPM_CERTIFICATE)
+        (self.site / "keys/apt-preview.asc").write_bytes(APT_CERTIFICATE)
+        (self.site / "keys/rpm-preview.asc").write_bytes(RPM_CERTIFICATE)
+        self.snapshot = root / "snapshot.json"
+        self.snapshot_value = {
+            "schema": validator.SNAPSHOT_SCHEMA,
+            "audit_release_id": AUDIT_RELEASE_ID,
+            "control_sha": CONTROL_SHA,
+            "releases": [{
+                "version": VERSION,
+                "source_sha": "a" * 40,
+                "source_release_id": 100,
+                "package_release_id": 200,
+                "deb_sha256": digest(DEB_PAYLOAD),
+                "rpm_sha256": digest(b"unsigned rpm payload\n"),
+                "state": "active",
+                "not_before": None,
+            }],
+            "retirement": {
+                "phase": "none",
+                "version": None,
+                "not_before": None,
+            },
+            "payloads": {
+                "apt": [{
+                    "version": VERSION,
+                    "path": (
+                        "apt/pool/main/w/wukongim/"
+                        f"wukongim_{VERSION}_linux_amd64.deb"
+                    ),
+                    "source_sha256": digest(DEB_PAYLOAD),
+                    "published_sha256": digest(DEB_PAYLOAD),
+                    "indexed": True,
+                }],
+                "rpm": [{
+                    "version": VERSION,
+                    "path": (
+                        "rpm/preview/el/9/x86_64/Packages/"
+                        f"wukongim_{VERSION}_linux_amd64.rpm"
+                    ),
+                    "source_sha256": digest(b"unsigned rpm payload\n"),
+                    "published_sha256": digest(RPM_PAYLOAD),
+                    "indexed": True,
+                }],
+            },
+            "public_keys": {
+                "apt": {
+                    "path": "keys/apt-preview.asc",
+                    "sha256": digest(APT_CERTIFICATE),
+                    "size": len(APT_CERTIFICATE),
+                    "primary_fingerprint": "A" * 40,
+                    "current_signing_subkey_fingerprint": "B" * 40,
+                    "next_signing_subkey_fingerprint": "C" * 40,
+                    "historical_signing_subkey_fingerprints": [],
+                },
+                "rpm": {
+                    "path": "keys/rpm-preview.asc",
+                    "sha256": digest(RPM_CERTIFICATE),
+                    "size": len(RPM_CERTIFICATE),
+                    "primary_fingerprint": "D" * 40,
+                    "current_signing_subkey_fingerprint": "E" * 40,
+                    "next_signing_subkey_fingerprint": "F" * 40,
+                    "historical_signing_subkey_fingerprints": [],
+                },
+            },
+            "source_attestations": None,
+            "toolchain": {
+                "image": "ghcr.io/wukongim/native-package-signing-toolchain",
+                "digest": "sha256:" + "2" * 64,
+                "workflow_sha": "3" * 40,
+                "manifest_sha256": "4" * 64,
+                "manifest_size": 256,
+            },
+        }
+        self.write_snapshot()
+        self.commands: list[list[str]] = []
+
+    def write_snapshot(self) -> None:
+        self.snapshot.write_text(
+            json.dumps(self.snapshot_value, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+
+    def add_retained_payloads(self) -> None:
+        not_before = "2026-09-02T00:00:00Z"
+        self.snapshot_value["releases"].insert(0, {
+            "version": RETAINED_VERSION,
+            "source_sha": "9" * 40,
+            "source_release_id": 90,
+            "package_release_id": 190,
+            "deb_sha256": digest(RETAINED_DEB_PAYLOAD),
+            "rpm_sha256": digest(b"retained unsigned rpm payload\n"),
+            "state": "index_removed",
+            "not_before": not_before,
+        })
+        self.snapshot_value["retirement"] = {
+            "phase": "indexes_removed",
+            "version": RETAINED_VERSION,
+            "not_before": not_before,
+        }
+        self.snapshot_value["payloads"]["apt"].insert(0, {
+            "version": RETAINED_VERSION,
+            "path": (
+                "apt/pool/main/w/wukongim/"
+                f"wukongim_{RETAINED_VERSION}_linux_amd64.deb"
+            ),
+            "source_sha256": digest(RETAINED_DEB_PAYLOAD),
+            "published_sha256": digest(RETAINED_DEB_PAYLOAD),
+            "indexed": False,
+        })
+        self.snapshot_value["payloads"]["rpm"].insert(0, {
+            "version": RETAINED_VERSION,
+            "path": (
+                "rpm/preview/el/9/x86_64/Packages/"
+                f"wukongim_{RETAINED_VERSION}_linux_amd64.rpm"
+            ),
+            "source_sha256": digest(b"retained unsigned rpm payload\n"),
+            "published_sha256": digest(RETAINED_RPM_PAYLOAD),
+            "indexed": False,
+        })
+        self.write_snapshot()
+
+    def status(self, **overrides):
+        value = {
+            "schema": validator.STATUS_SCHEMA,
+            "apt": True,
+            "rpm": True,
+            "reason": "ready",
+            "audit_release_id": AUDIT_RELEASE_ID,
+            "control_sha": CONTROL_SHA,
+            "snapshot_sha256": digest(self.snapshot.read_bytes()),
+            "operation": "add_release",
+            "target_version": VERSION,
+        }
+        value.update(overrides)
+        return value
+
+    def remote_files(self, status=None):
+        values = {
+            "https://packages.example/status.json": json.dumps(
+                status or self.status()
+            ).encode(),
+            "https://packages.example/keys/apt-preview.asc": APT_CERTIFICATE,
+            "https://packages.example/keys/rpm-preview.asc": RPM_CERTIFICATE,
+        }
+        for family in ("apt", "rpm"):
+            for item in self.snapshot_value["payloads"][family]:
+                payload = {
+                    ("apt", VERSION): DEB_PAYLOAD,
+                    ("rpm", VERSION): RPM_PAYLOAD,
+                    ("apt", RETAINED_VERSION): RETAINED_DEB_PAYLOAD,
+                    ("rpm", RETAINED_VERSION): RETAINED_RPM_PAYLOAD,
+                }[(family, item["version"])]
+                values[f"https://packages.example/{item['path']}"] = payload
+        return values
+
+    @staticmethod
+    def _mount_source(command: list[str], destination: str) -> Path:
+        for index, value in enumerate(command):
+            if value == "--volume":
+                volume = command[index + 1]
+                suffix = f":{destination}:rw"
+                if volume.endswith(suffix):
+                    return Path(volume[: -len(suffix)])
+        raise AssertionError(f"missing {destination} mount in {command}")
+
+    def runner(self, raw_command) -> None:
+        command = list(raw_command)
+        self.commands.append(command)
+        output = self._mount_source(command, "/downloads")
+        if stat.S_IMODE(output.stat().st_mode) != 0o777:
+            raise AssertionError("container output directory is not DAC-writable")
+        image = next(
+            value for value in command
+            if "@sha256:" in value and not value.startswith("WK_")
+        )
+        if image in {value for _, value in validator.APT_CLIENTS}:
+            (output / f"wukongim_{VERSION}_amd64.deb").write_bytes(DEB_PAYLOAD)
+        elif image in {value for _, value in validator.RPM_CLIENTS}:
+            (output / "wukongim.rpm").write_bytes(RPM_PAYLOAD)
+        else:
+            raise AssertionError(f"unexpected image: {image}")
+
+    def local_validate(self, runner=None, expected_version=None):
+        return validator.validate_clients(
+            site_root=self.site,
+            snapshot_path=self.snapshot,
+            base_url=None,
+            apt_public_cert=self.apt_certificate,
+            rpm_public_cert=self.rpm_certificate,
+            expected_version=expected_version,
+            runner=runner or self.runner,
+        )
+
+
+class ValidateProductionPackageClientsTest(unittest.TestCase):
+    def test_local_mode_runs_four_pinned_clients_and_matches_snapshot(self) -> None:
+        with TemporaryDirectory() as temporary:
+            fixture = Fixture(Path(temporary))
+            receipt = fixture.local_validate()
+
+        self.assertEqual(validator.RECEIPT_SCHEMA, receipt["schema"])
+        self.assertEqual("local", receipt["mode"])
+        self.assertEqual(2, len(receipt["apt"]))
+        self.assertEqual(2, len(receipt["rpm"]))
+        self.assertEqual(4, len(fixture.commands))
+        self.assertIsNone(receipt["expected_version"])
+        self.assertFalse(receipt["expected_version_verified"])
+        self.assertNotIn("base_url", receipt)
+        self.assertRegex(receipt["snapshot_sha256"], r"^[0-9a-f]{64}$")
+        for family, payload in (("apt", DEB_PAYLOAD), ("rpm", RPM_PAYLOAD)):
+            for result in receipt[family]:
+                self.assertEqual(digest(payload), result["download"]["sha256"])
+                self.assertEqual([VERSION], result["download"]["snapshot_versions"])
+                self.assertIn("--network", fixture.commands.pop(0))
+
+    def test_expected_add_release_version_must_be_the_downloaded_candidate(self) -> None:
+        target_version = "3.1.0-rc.2"
+        target_deb = b"authenticated target deb payload\n"
+        target_rpm = b"authenticated target rpm payload\n"
+        with TemporaryDirectory() as temporary:
+            fixture = Fixture(Path(temporary))
+            fixture.snapshot_value["releases"].append({
+                "version": target_version,
+                "source_sha": "b" * 40,
+                "source_release_id": 101,
+                "package_release_id": 201,
+                "deb_sha256": digest(target_deb),
+                "rpm_sha256": digest(b"unsigned target rpm payload\n"),
+                "state": "active",
+                "not_before": None,
+            })
+            fixture.snapshot_value["payloads"]["apt"].append({
+                "version": target_version,
+                "path": (
+                    "apt/pool/main/w/wukongim/"
+                    f"wukongim_{target_version}_linux_amd64.deb"
+                ),
+                "source_sha256": digest(target_deb),
+                "published_sha256": digest(target_deb),
+                "indexed": True,
+            })
+            fixture.snapshot_value["payloads"]["rpm"].append({
+                "version": target_version,
+                "path": (
+                    "rpm/preview/el/9/x86_64/Packages/"
+                    f"wukongim_{target_version}_linux_amd64.rpm"
+                ),
+                "source_sha256": digest(b"unsigned target rpm payload\n"),
+                "published_sha256": digest(target_rpm),
+                "indexed": True,
+            })
+            fixture.write_snapshot()
+
+            with self.assertRaisesRegex(
+                validator.ClientValidationError,
+                f"downloaded a version other than expected {re.escape(target_version)}",
+            ):
+                fixture.local_validate(expected_version=target_version)
+
+    def test_expected_version_success_is_recorded_in_receipt(self) -> None:
+        with TemporaryDirectory() as temporary:
+            fixture = Fixture(Path(temporary))
+            receipt = fixture.local_validate(expected_version=VERSION)
+        self.assertEqual(VERSION, receipt["expected_version"])
+        self.assertTrue(receipt["expected_version_verified"])
+        for family in ("apt", "rpm"):
+            self.assertTrue(all(
+                item["download"]["snapshot_versions"] == [VERSION]
+                for item in receipt[family]
+            ))
+
+    def test_expected_version_requires_exact_indexed_snapshot_entry(self) -> None:
+        with TemporaryDirectory() as temporary:
+            fixture = Fixture(Path(temporary))
+            with self.assertRaisesRegex(
+                validator.ClientValidationError,
+                "does not contain exactly expected version",
+            ):
+                fixture.local_validate(expected_version="3.1.0-rc.2")
+            self.assertEqual([], fixture.commands)
+
+    def test_commands_are_digest_pinned_hardened_and_download_only(self) -> None:
+        with TemporaryDirectory() as temporary:
+            fixture = Fixture(Path(temporary))
+            downloads = Path(temporary) / "downloads"
+            downloads.mkdir()
+            clients = (
+                ("apt", validator.APT_CLIENTS, fixture.apt_certificate),
+                ("rpm", validator.RPM_CLIENTS, fixture.rpm_certificate),
+            )
+            for family, values, certificate in clients:
+                for _, image in values:
+                    self.assertRegex(image, r"^[^@]+@sha256:[0-9a-f]{64}$")
+                    command = validator._client_command(
+                        image, downloads, certificate, family, fixture.site, None
+                    )
+                    rendered = "\n".join(command)
+                    self.assertIn("--read-only", command)
+                    self.assertIn("--cap-drop", command)
+                    self.assertIn("no-new-privileges", command)
+                    self.assertIn("--network", command)
+                    self.assertIn("none", command)
+                    self.assertNotRegex(rendered, r"apt-get\s+install(?:\s|$)")
+                    if family == "apt":
+                        self.assertIn("dpkg-query -W", rendered)
+                        self.assertEqual(2, rendered.count("dpkg-query -W"))
+                        self.assertIn("apt-get \"${apt_options[@]}\" update", rendered)
+                        self.assertIn("apt-get \"${apt_options[@]}\" download", rendered)
+                        self.assertIn("signed-by=/keys/apt-preview.asc", rendered)
+                    else:
+                        self.assertIn("repo_gpgcheck=1", rendered)
+                        self.assertEqual(2, rendered.count("rpm -q wukongim"))
+                        self.assertIn("dnf \"${dnf_options[@]}\" makecache", rendered)
+                        self.assertIn("install --downloadonly", rendered)
+                        self.assertIn("--downloaddir=/downloads wukongim", rendered)
+                        self.assertIn("rpmkeys --dbpath /tmp/rpmdb --checksig", rendered)
+                        self.assertNotIn("repoquery", rendered)
+                        self.assertNotIn("curl ", rendered)
+
+    def test_remote_mode_pins_endpoint_keys_and_uses_https_clients(self) -> None:
+        with TemporaryDirectory() as temporary:
+            fixture = Fixture(Path(temporary))
+            ca_bundle = Path(temporary) / "ca-certificates.crt"
+            ca_bundle.write_bytes(b"host ca\n")
+            status = {
+                "schema": validator.STATUS_SCHEMA,
+                "apt": True,
+                "rpm": True,
+                "reason": "ready",
+                "audit_release_id": 4242,
+                "control_sha": "1" * 40,
+                "snapshot_sha256": "2" * 64,
+                "operation": "add_release",
+                "target_version": VERSION,
+            }
+            fetched: list[str] = []
+
+            def fetcher(url: str, maximum: int) -> bytes:
+                fetched.append(url)
+                values = {
+                    "https://packages.example/status.json": json.dumps(status).encode(),
+                    "https://packages.example/keys/apt-preview.asc": APT_CERTIFICATE,
+                    "https://packages.example/keys/rpm-preview.asc": RPM_CERTIFICATE,
+                }
+                self.assertLessEqual(len(values[url]), maximum)
+                return values[url]
+
+            with mock.patch.object(validator, "_host_ca_bundle", return_value=ca_bundle):
+                receipt = validator.validate_clients(
+                    site_root=None,
+                    snapshot_path=None,
+                    base_url="https://packages.example/",
+                    apt_public_cert=fixture.apt_certificate,
+                    rpm_public_cert=fixture.rpm_certificate,
+                    runner=fixture.runner,
+                    fetcher=fetcher,
+                )
+
+        self.assertEqual("remote", receipt["mode"])
+        self.assertEqual("https://packages.example", receipt["base_url"])
+        self.assertEqual(4242, receipt["audit_release_id"])
+        self.assertEqual("1" * 40, receipt["control_sha"])
+        self.assertFalse(receipt["snapshot_verified"])
+        self.assertTrue(receipt["status_revalidated"])
+        self.assertEqual(4, len(fetched))
+        self.assertEqual(2, fetched.count("https://packages.example/status.json"))
+        for command in fixture.commands:
+            self.assertNotIn("--network", command)
+            rendered = "\n".join(command)
+            self.assertIn("https://packages.example/", rendered)
+        apt_commands = [
+            command for command in fixture.commands
+            if any(image in command for _, image in validator.APT_CLIENTS)
+        ]
+        self.assertEqual(2, len(apt_commands))
+        self.assertTrue(all(str(ca_bundle) in "\n".join(item) for item in apt_commands))
+
+    def test_remote_snapshot_closes_over_indexed_and_retained_payloads(self) -> None:
+        with TemporaryDirectory() as temporary:
+            fixture = Fixture(Path(temporary))
+            fixture.add_retained_payloads()
+            ca_bundle = Path(temporary) / "ca-certificates.crt"
+            ca_bundle.write_bytes(b"host ca\n")
+            files = fixture.remote_files()
+            fetched: list[str] = []
+
+            def fetcher(url: str, maximum: int) -> bytes:
+                fetched.append(url)
+                value = files[url]
+                self.assertLessEqual(len(value), maximum)
+                return value
+
+            with mock.patch.object(validator, "_host_ca_bundle", return_value=ca_bundle):
+                receipt = validator.validate_clients(
+                    site_root=None,
+                    snapshot_path=fixture.snapshot,
+                    base_url="https://packages.example/",
+                    apt_public_cert=fixture.apt_certificate,
+                    rpm_public_cert=fixture.rpm_certificate,
+                    runner=fixture.runner,
+                    fetcher=fetcher,
+                )
+            snapshot_digest = digest(fixture.snapshot.read_bytes())
+
+        self.assertTrue(receipt["snapshot_verified"])
+        self.assertTrue(receipt["status_revalidated"])
+        self.assertEqual(snapshot_digest, receipt["snapshot_sha256"])
+        retained_urls = {
+            f"https://packages.example/{item['path']}"
+            for family in ("apt", "rpm")
+            for item in fixture.snapshot_value["payloads"][family]
+            if item["indexed"] is False
+        }
+        self.assertTrue(retained_urls.issubset(fetched))
+        payload_urls = [url for url in fetched if "/apt/pool/" in url or "/Packages/" in url]
+        self.assertEqual(4, len(payload_urls))
+        for family in ("apt", "rpm"):
+            for result in receipt[family]:
+                self.assertEqual([VERSION], result["download"]["snapshot_versions"])
+
+    def test_remote_status_bytes_must_remain_exact_through_client_downloads(self) -> None:
+        with TemporaryDirectory() as temporary:
+            fixture = Fixture(Path(temporary))
+            files = fixture.remote_files()
+            initial_status = files["https://packages.example/status.json"]
+            changed_status = json.dumps(
+                fixture.status(reason="replaced"), sort_keys=True
+            ).encode()
+            status_reads = 0
+
+            def fetcher(url: str, maximum: int) -> bytes:
+                nonlocal status_reads
+                if url == "https://packages.example/status.json":
+                    status_reads += 1
+                    return initial_status if status_reads == 1 else changed_status
+                return files[url]
+
+            ca_bundle = Path(temporary) / "ca-certificates.crt"
+            ca_bundle.write_bytes(b"host ca\n")
+            with mock.patch.object(validator, "_host_ca_bundle", return_value=ca_bundle):
+                with self.assertRaisesRegex(
+                    validator.ClientValidationError,
+                    "status.json changed during client validation",
+                ):
+                    validator.validate_clients(
+                        site_root=None,
+                        snapshot_path=fixture.snapshot,
+                        base_url="https://packages.example",
+                        apt_public_cert=fixture.apt_certificate,
+                        rpm_public_cert=fixture.rpm_certificate,
+                        runner=fixture.runner,
+                        fetcher=fetcher,
+                    )
+
+            self.assertEqual(2, status_reads)
+            self.assertEqual(4, len(fixture.commands))
+
+    def test_remote_snapshot_rejects_missing_and_tampered_payloads(self) -> None:
+        with TemporaryDirectory() as temporary:
+            fixture = Fixture(Path(temporary))
+            fixture.add_retained_payloads()
+            files = fixture.remote_files()
+            retained_path = fixture.snapshot_value["payloads"]["apt"][0]["path"]
+            retained_url = f"https://packages.example/{retained_path}"
+
+            def missing_fetcher(url: str, maximum: int) -> bytes:
+                if url == retained_url:
+                    raise validator.ClientValidationError("public endpoint read failed: 404")
+                return files[url]
+
+            with self.assertRaisesRegex(
+                validator.ClientValidationError, "public endpoint read failed"
+            ):
+                validator.validate_clients(
+                    site_root=None,
+                    snapshot_path=fixture.snapshot,
+                    base_url="https://packages.example",
+                    apt_public_cert=fixture.apt_certificate,
+                    rpm_public_cert=fixture.rpm_certificate,
+                    runner=mock.Mock(),
+                    fetcher=missing_fetcher,
+                )
+
+            def tampered_fetcher(url: str, maximum: int) -> bytes:
+                if url == retained_url:
+                    return b"tampered retained payload"
+                return files[url]
+
+            with self.assertRaisesRegex(
+                validator.ClientValidationError,
+                "remote apt payload .* digest differs from reviewed snapshot",
+            ):
+                validator.validate_clients(
+                    site_root=None,
+                    snapshot_path=fixture.snapshot,
+                    base_url="https://packages.example",
+                    apt_public_cert=fixture.apt_certificate,
+                    rpm_public_cert=fixture.rpm_certificate,
+                    runner=mock.Mock(),
+                    fetcher=tampered_fetcher,
+                )
+
+    def test_remote_snapshot_path_must_exist_before_docker(self) -> None:
+        with TemporaryDirectory() as temporary:
+            fixture = Fixture(Path(temporary))
+            files = fixture.remote_files()
+            runner = mock.Mock()
+            with self.assertRaisesRegex(
+                validator.ClientValidationError, "cannot open reviewed snapshot"
+            ):
+                validator.validate_clients(
+                    site_root=None,
+                    snapshot_path=Path(temporary) / "missing-snapshot.json",
+                    base_url="https://packages.example",
+                    apt_public_cert=fixture.apt_certificate,
+                    rpm_public_cert=fixture.rpm_certificate,
+                    runner=runner,
+                    fetcher=lambda url, maximum: files[url],
+                )
+            runner.assert_not_called()
+
+    def test_remote_snapshot_rejects_unsafe_path_before_docker(self) -> None:
+        with TemporaryDirectory() as temporary:
+            fixture = Fixture(Path(temporary))
+            fixture.snapshot_value["payloads"]["apt"][0]["path"] = (
+                "apt/pool/main/w/wukongim/../../escape.deb"
+            )
+            fixture.write_snapshot()
+            files = fixture.remote_files()
+            runner = mock.Mock()
+
+            with self.assertRaisesRegex(validator.ClientValidationError, "path is unsafe"):
+                validator.validate_clients(
+                    site_root=None,
+                    snapshot_path=fixture.snapshot,
+                    base_url="https://packages.example",
+                    apt_public_cert=fixture.apt_certificate,
+                    rpm_public_cert=fixture.rpm_certificate,
+                    runner=runner,
+                    fetcher=lambda url, maximum: files[url],
+                )
+            runner.assert_not_called()
+
+    def test_remote_snapshot_identity_must_exactly_match_status(self) -> None:
+        cases = (
+            ("snapshot_sha256", {"snapshot_sha256": "f" * 64}, "SHA-256 differs"),
+            ("audit_release_id", {"audit_release_id": 4243}, "audit_release_id differs"),
+            ("control_sha", {"control_sha": "9" * 40}, "control_sha differs"),
+        )
+        for name, overrides, pattern in cases:
+            with self.subTest(name=name), TemporaryDirectory() as temporary:
+                fixture = Fixture(Path(temporary))
+                status = fixture.status(**overrides)
+                files = fixture.remote_files(status)
+                with self.assertRaisesRegex(validator.ClientValidationError, pattern):
+                    validator.validate_clients(
+                        site_root=None,
+                        snapshot_path=fixture.snapshot,
+                        base_url="https://packages.example",
+                        apt_public_cert=fixture.apt_certificate,
+                        rpm_public_cert=fixture.rpm_certificate,
+                        runner=mock.Mock(),
+                        fetcher=lambda url, maximum: files[url],
+                    )
+
+    def test_remote_snapshot_requires_canonical_strict_reviewed_key_facts(self) -> None:
+        with TemporaryDirectory() as temporary:
+            fixture = Fixture(Path(temporary))
+            fixture.snapshot_value["public_keys"]["apt"]["size"] += 1
+            fixture.write_snapshot()
+            files = fixture.remote_files()
+            with self.assertRaisesRegex(
+                validator.ClientValidationError,
+                "public-key size differs from the reviewed certificate",
+            ):
+                validator.validate_clients(
+                    site_root=None,
+                    snapshot_path=fixture.snapshot,
+                    base_url="https://packages.example",
+                    apt_public_cert=fixture.apt_certificate,
+                    rpm_public_cert=fixture.rpm_certificate,
+                    runner=mock.Mock(),
+                    fetcher=lambda url, maximum: files[url],
+                )
+
+            fixture.snapshot_value["public_keys"]["apt"]["size"] -= 1
+            fixture.snapshot.write_text(
+                json.dumps(fixture.snapshot_value, indent=2), encoding="utf-8"
+            )
+            status = fixture.status(snapshot_sha256=digest(fixture.snapshot.read_bytes()))
+            files = fixture.remote_files(status)
+            with self.assertRaisesRegex(
+                validator.ClientValidationError, "canonical JSON encoding"
+            ):
+                validator.validate_clients(
+                    site_root=None,
+                    snapshot_path=fixture.snapshot,
+                    base_url="https://packages.example",
+                    apt_public_cert=fixture.apt_certificate,
+                    rpm_public_cert=fixture.rpm_certificate,
+                    runner=mock.Mock(),
+                    fetcher=lambda url, maximum: files[url],
+                )
+
+    def test_remote_snapshot_download_must_be_an_indexed_digest(self) -> None:
+        with TemporaryDirectory() as temporary:
+            fixture = Fixture(Path(temporary))
+            fixture.add_retained_payloads()
+            files = fixture.remote_files()
+
+            def retained_runner(raw_command) -> None:
+                command = list(raw_command)
+                output = fixture._mount_source(command, "/downloads")
+                image = next(value for value in command if "@sha256:" in value)
+                if image in {value for _, value in validator.APT_CLIENTS}:
+                    (output / "retained.deb").write_bytes(RETAINED_DEB_PAYLOAD)
+                else:
+                    (output / "retained.rpm").write_bytes(RETAINED_RPM_PAYLOAD)
+
+            with self.assertRaisesRegex(
+                validator.ClientValidationError, "absent from the indexed snapshot"
+            ):
+                validator.validate_clients(
+                    site_root=None,
+                    snapshot_path=fixture.snapshot,
+                    base_url="https://packages.example",
+                    apt_public_cert=fixture.apt_certificate,
+                    rpm_public_cert=fixture.rpm_certificate,
+                    runner=retained_runner,
+                    fetcher=lambda url, maximum: files[url],
+                )
+
+    def test_local_mode_rejects_download_absent_from_indexed_snapshot(self) -> None:
+        with TemporaryDirectory() as temporary:
+            fixture = Fixture(Path(temporary))
+
+            def tampered_runner(raw_command) -> None:
+                command = list(raw_command)
+                output = fixture._mount_source(command, "/downloads")
+                (output / "tampered.deb").write_bytes(b"tampered")
+
+            with self.assertRaisesRegex(
+                validator.ClientValidationError, "absent from the indexed snapshot"
+            ):
+                fixture.local_validate(tampered_runner)
+
+    def test_remote_mode_rejects_key_substitution_before_starting_docker(self) -> None:
+        with TemporaryDirectory() as temporary:
+            fixture = Fixture(Path(temporary))
+            status = json.dumps({
+                "schema": validator.STATUS_SCHEMA,
+                "apt": True,
+                "rpm": True,
+                "reason": "ready",
+                "audit_release_id": 9,
+                "control_sha": "1" * 40,
+                "snapshot_sha256": "2" * 64,
+            }).encode()
+            runner = mock.Mock()
+
+            def fetcher(url: str, maximum: int) -> bytes:
+                if url.endswith("status.json"):
+                    return status
+                if url.endswith("apt-preview.asc"):
+                    return b"substituted certificate"
+                return RPM_CERTIFICATE
+
+            with self.assertRaisesRegex(
+                validator.ClientValidationError, "remote apt public certificate differs"
+            ):
+                validator.validate_clients(
+                    site_root=None,
+                    snapshot_path=None,
+                    base_url="https://packages.example",
+                    apt_public_cert=fixture.apt_certificate,
+                    rpm_public_cert=fixture.rpm_certificate,
+                    runner=runner,
+                    fetcher=fetcher,
+                )
+            runner.assert_not_called()
+
+    def test_rejects_missing_indexed_family_and_unsafe_payload_path(self) -> None:
+        with TemporaryDirectory() as temporary:
+            fixture = Fixture(Path(temporary))
+            fixture.snapshot_value["payloads"]["apt"][0]["indexed"] = False
+            fixture.write_snapshot()
+            with self.assertRaisesRegex(
+                validator.ClientValidationError, "no indexed apt payload"
+            ):
+                fixture.local_validate()
+
+            fixture.snapshot_value["payloads"]["apt"][0]["indexed"] = True
+            fixture.snapshot_value["payloads"]["apt"][0]["path"] = "apt/pool/../../escape.deb"
+            fixture.write_snapshot()
+            with self.assertRaisesRegex(validator.ClientValidationError, "unsafe"):
+                fixture.local_validate()
+
+    def test_container_failure_is_fail_closed_and_contextual(self) -> None:
+        with TemporaryDirectory() as temporary:
+            fixture = Fixture(Path(temporary))
+
+            def failing_runner(raw_command) -> None:
+                raise subprocess.CalledProcessError(17, list(raw_command))
+
+            with self.assertRaisesRegex(
+                validator.ClientValidationError,
+                "ubuntu-24.04 clean APT client failed",
+            ):
+                fixture.local_validate(failing_runner)
+
+    def test_mode_and_https_contracts_are_fail_closed(self) -> None:
+        with TemporaryDirectory() as temporary:
+            fixture = Fixture(Path(temporary))
+            cases = (
+                {
+                    "site_root": fixture.site,
+                    "snapshot_path": None,
+                    "base_url": None,
+                    "pattern": "snapshot is required",
+                },
+                {
+                    "site_root": None,
+                    "snapshot_path": None,
+                    "base_url": None,
+                    "pattern": "exactly one",
+                },
+                {
+                    "site_root": fixture.site,
+                    "snapshot_path": fixture.snapshot,
+                    "base_url": "https://packages.example",
+                    "pattern": "exactly one",
+                },
+                {
+                    "site_root": None,
+                    "snapshot_path": None,
+                    "base_url": "http://packages.example",
+                    "pattern": "absolute HTTPS",
+                },
+            )
+            for case in cases:
+                with self.subTest(pattern=case["pattern"]):
+                    with self.assertRaisesRegex(
+                        validator.ClientValidationError, case["pattern"]
+                    ):
+                        validator.validate_clients(
+                            site_root=case["site_root"],
+                            snapshot_path=case["snapshot_path"],
+                            base_url=case["base_url"],
+                            apt_public_cert=fixture.apt_certificate,
+                            rpm_public_cert=fixture.rpm_certificate,
+                            runner=mock.Mock(),
+                            fetcher=mock.Mock(),
+                        )
+
+    def test_pinned_image_inventory_is_exact_and_unique(self) -> None:
+        clients = validator.APT_CLIENTS + validator.RPM_CLIENTS
+        self.assertEqual(
+            ["ubuntu-24.04", "debian-13", "rocky-linux-9", "alma-linux-9"],
+            [name for name, _ in clients],
+        )
+        images = [image for _, image in clients]
+        self.assertEqual(len(images), len(set(images)))
+        for image in images:
+            self.assertIsNotNone(re.fullmatch(r"[^@]+@sha256:[0-9a-f]{64}", image))
+
+
+if __name__ == "__main__":
+    unittest.main()

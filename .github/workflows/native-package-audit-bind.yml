@@ -1,0 +1,143 @@
+name: Safety Automation - Bind Native Package Audit Draft
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_id:
+        description: Exact positive numeric audit Release id already reviewed into control
+        required: true
+        type: string
+      expected_previous_control_sha:
+        description: Exact protected main commit used when the empty draft was reserved
+        required: true
+        type: string
+      expected_main_sha:
+        description: Exact protected packages/main commit containing the reviewed Release id
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: packages-pages
+  cancel-in-progress: false
+
+jobs:
+  bind:
+    name: Rebind one empty audit draft to reviewed control
+    if: >-
+      github.repository == 'WuKongIM/packages' &&
+      github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: native-package-preview-audit
+    permissions:
+      contents: read
+    steps:
+      - name: Check out exact protected control
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          fetch-tags: false
+          persist-credentials: false
+
+      - name: Mint package publisher token
+        id: publisher-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ secrets.WK_PACKAGE_PUBLISHER_APP_CLIENT_ID }}
+          private-key: ${{ secrets.WK_PACKAGE_PUBLISHER_APP_PRIVATE_KEY }}
+          owner: WuKongIM
+          repositories: packages
+          permission-administration: read
+          permission-contents: write
+
+      - name: Fence current main, manifest id, and previous ancestry
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.publisher-token.outputs.token }}
+          RELEASE_ID: ${{ inputs.release_id }}
+          EXPECTED_PREVIOUS_CONTROL_SHA: ${{ inputs.expected_previous_control_sha }}
+          EXPECTED_MAIN_SHA: ${{ inputs.expected_main_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$EXPECTED_PREVIOUS_CONTROL_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$EXPECTED_MAIN_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$EXPECTED_MAIN_SHA" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git fetch --no-tags origin main
+          test "$(git rev-parse FETCH_HEAD)" = "$GITHUB_SHA"
+          test "$(gh api repos/WuKongIM/packages/immutable-releases --jq .enabled)" = true
+          git cat-file -e "${EXPECTED_PREVIOUS_CONTROL_SHA}^{commit}"
+          git merge-base --is-ancestor "$EXPECTED_PREVIOUS_CONTROL_SHA" "$GITHUB_SHA"
+          jq -e --argjson id "$RELEASE_ID" \
+            '.channels.preview.publication.audit_release_id == $id' \
+            manifests/channels.json >/dev/null
+          ./tests/contract.sh
+          jq -e '.enabled == true' manifests/preview-signing.json >/dev/null || {
+            echo 'production signing control is not provisioned' >&2
+            exit 78
+          }
+          jq -e '.enabled == true' manifests/signing-toolchain.json >/dev/null || {
+            echo 'production signing toolchain is not provisioned' >&2
+            exit 78
+          }
+
+      - name: Bind only target_commitish on exact empty draft
+        id: binding
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.publisher-token.outputs.token }}
+          RELEASE_ID: ${{ inputs.release_id }}
+          EXPECTED_PREVIOUS_CONTROL_SHA: ${{ inputs.expected_previous_control_sha }}
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/audit-draft-binding.json"
+          ./scripts/bind-audit-release.py \
+            --release-id "$RELEASE_ID" \
+            --expected-previous-control-sha "$EXPECTED_PREVIOUS_CONTROL_SHA" \
+            --expected-control-sha "$GITHUB_SHA" \
+            --token-env GH_TOKEN >"$evidence"
+          jq -e \
+            --argjson id "$RELEASE_ID" \
+            --arg sha "$GITHUB_SHA" \
+            '.release_id == $id and .control_sha == $sha and
+             .audit_tag_reserved == true and
+             .empty_draft_revalidated == true' \
+            "$evidence" >/dev/null
+          cat "$evidence" >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Resolve exact bound empty draft by numeric id
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.publisher-token.outputs.token }}
+          RELEASE_ID: ${{ inputs.release_id }}
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/audit-draft-resolution.json"
+          ./scripts/resolve-audit-release.py \
+            --release-id "$RELEASE_ID" \
+            --expected-control-sha "$GITHUB_SHA" \
+            --expected-tag-state exact \
+            --output-dir "$RUNNER_TEMP/audit-draft-assets" \
+            --token-env GH_TOKEN >"$evidence"
+          jq -e \
+            --argjson id "$RELEASE_ID" \
+            --arg sha "$GITHUB_SHA" \
+            '.release_id == $id and .control_sha == $sha and
+             .classification == "empty_draft" and .draft == true and
+             .immutable == false and .asset_count == 0' \
+            "$evidence" >/dev/null
+          {
+            echo '### Native package audit draft bound to reviewed control'
+            echo
+            echo "- Release id: \`$RELEASE_ID\`"
+            echo "- Control commit: \`$GITHUB_SHA\`"
+            echo '- The non-version audit tag was reserved; no asset, package, signature, product version tag, or Pages content was published.'
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Reject tracked-tree mutation
+        if: always()
+        run: git diff --exit-code HEAD --

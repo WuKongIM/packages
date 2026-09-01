@@ -1,0 +1,1796 @@
+name: Safety Automation - Publish Native Package Snapshot
+
+on:
+  workflow_dispatch:
+    inputs:
+      expected_main_sha:
+        description: Exact protected packages/main commit containing the reviewed publication
+        required: true
+        type: string
+      audit_release_id:
+        description: Positive numeric package audit Release id reviewed in channels.json
+        required: true
+        type: string
+
+permissions: {}
+
+# Pages is a whole-site deployment. Draft creation, publication, recovery, and
+# bootstrap deployment therefore share the same non-cancelling serialization
+# domain; a newer run must never interrupt a signer or replace an older site.
+concurrency:
+  group: packages-pages
+  cancel-in-progress: false
+
+jobs:
+  control:
+    name: Fence reviewed control and classify numeric audit Release
+    if: >-
+      github.repository == 'WuKongIM/packages' &&
+      github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: native-package-preview-audit
+    permissions:
+      contents: read
+    outputs:
+      audit_release_id: ${{ steps.resolve.outputs.audit_release_id }}
+      base_audit_release_id: ${{ steps.resolve.outputs.base_audit_release_id }}
+      classification: ${{ steps.resolve.outputs.classification }}
+      operation: ${{ steps.resolve.outputs.operation }}
+      target_version: ${{ steps.resolve.outputs.target_version }}
+      source_release_id: ${{ steps.resolve.outputs.source_release_id }}
+      toolchain_image: ${{ steps.resolve.outputs.toolchain_image }}
+      toolchain_digest: ${{ steps.resolve.outputs.toolchain_digest }}
+      toolchain_workflow_sha: ${{ steps.resolve.outputs.toolchain_workflow_sha }}
+    steps:
+      - name: Check out exact protected publication control
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Mint read-scoped package publisher token
+        id: publisher-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ secrets.WK_PACKAGE_PUBLISHER_APP_CLIENT_ID }}
+          private-key: ${{ secrets.WK_PACKAGE_PUBLISHER_APP_PRIVATE_KEY }}
+          owner: WuKongIM
+          repositories: packages
+          permission-administration: read
+          permission-contents: read
+
+      - name: Validate enabled production contracts and exact current main
+        shell: bash
+        env:
+          EXPECTED_MAIN_SHA: ${{ inputs.expected_main_sha }}
+          REQUESTED_AUDIT_RELEASE_ID: ${{ inputs.audit_release_id }}
+        run: |
+          set -euo pipefail
+          [[ "$EXPECTED_MAIN_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$EXPECTED_MAIN_SHA" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git fetch --no-tags --depth=1 origin main
+          test "$(git rev-parse FETCH_HEAD)" = "$GITHUB_SHA"
+          [[ "$REQUESTED_AUDIT_RELEASE_ID" =~ ^[1-9][0-9]*$ ]]
+
+          ./tests/contract.sh
+          jq -e '.channels.preview.enabled == true and .channels.preview.status == "ready"' \
+            manifests/channels.json >/dev/null
+          jq -e '.enabled == true' manifests/preview-signing.json >/dev/null
+          jq -e '.enabled == true' manifests/signing-toolchain.json >/dev/null
+          jq -e \
+            --argjson requested "$REQUESTED_AUDIT_RELEASE_ID" \
+            '.channels.preview.publication.audit_release_id == $requested and
+             .channels.preview.publication.operation != "none"' \
+            manifests/channels.json >/dev/null
+
+          # Environment and secret names are fixed in workflow code. Reviewed
+          # manifests may disable them, but cannot redirect a signer to a less
+          # protected Environment or cause a different secret to be exposed.
+          jq -e \
+            '.apt.environment == "native-package-preview-apt-signing" and
+             .apt.secret_subkey_env == "WK_APT_PREVIEW_SECRET_SUBKEY_B64" and
+             .apt.passphrase_env == "WK_APT_PREVIEW_PASSPHRASE" and
+             .rpm.environment == "native-package-preview-rpm-signing" and
+             .rpm.secret_subkey_env == "WK_RPM_PREVIEW_SECRET_SUBKEY_B64" and
+             .rpm.passphrase_env == "WK_RPM_PREVIEW_PASSPHRASE"' \
+            manifests/preview-signing.json >/dev/null
+          jq -e \
+            '.image == "ghcr.io/wukongim/native-package-signing-toolchain" and
+             (.digest | type == "string" and test("^sha256:[0-9a-f]{64}$")) and
+             (.workflow_sha | type == "string" and test("^[0-9a-f]{40}$"))' \
+            manifests/signing-toolchain.json >/dev/null
+
+          # These are mandatory production boundaries, not advisory checks.
+          # Until both scripts are reviewed and committed this publisher must
+          # stay fail-closed even if signing keys have been provisioned.
+          test -f scripts/verify-production-package-site.py
+          test -f scripts/validate-production-package-clients.py
+          test -f keys/apt-preview.asc
+          test -f keys/rpm-preview.asc
+
+      - name: Resolve and classify exact numeric audit Release
+        id: resolve
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.publisher-token.outputs.token }}
+          REQUESTED_AUDIT_RELEASE_ID: ${{ inputs.audit_release_id }}
+        run: |
+          set -euo pipefail
+          audit_id="$REQUESTED_AUDIT_RELEASE_ID"
+          release_json="$RUNNER_TEMP/audit-release-api.json"
+          resolution="$RUNNER_TEMP/target-resolution.json"
+          assets="$RUNNER_TEMP/target-release-assets"
+          gh api "repos/WuKongIM/packages/immutable-releases" \
+            | jq -e '.enabled == true' >/dev/null
+          gh api "repos/WuKongIM/packages/releases/$audit_id" >"$release_json"
+          expected_tag="native-package-preview-r${audit_id}"
+          expected_name="WuKongIM preview package snapshot r${audit_id}"
+          jq -e \
+            --argjson id "$audit_id" \
+            --arg tag "$expected_tag" \
+            --arg name "$expected_name" \
+            '.id == $id and .tag_name == $tag and .name == $name and
+             .prerelease == true and
+             ((.draft == true and .immutable == false and .published_at == null) or
+              (.draft == false and .immutable == true and (.published_at | type == "string")))' \
+            "$release_json" >/dev/null
+
+          ./scripts/resolve-audit-release.py \
+            --release-id "$audit_id" \
+            --expected-control-sha "$GITHUB_SHA" \
+            --expected-tag-state exact \
+            --output-dir "$assets" \
+            --token-env GH_TOKEN >"$resolution"
+          jq -e \
+            --argjson id "$audit_id" \
+            --arg tag "$expected_tag" \
+            '.release_id == $id and .tag_name == $tag and
+             .release_revalidated == true and .id_bound_downloads == true' \
+            "$resolution" >/dev/null
+
+          operation="$(jq -er '.channels.preview.publication.operation' manifests/channels.json)"
+          target_version="$(jq -er '.channels.preview.publication.target_version' manifests/channels.json)"
+          base_id="$(jq -r '.channels.preview.publication.base_audit_release_id // empty' manifests/channels.json)"
+          classification="$(jq -er '.classification' "$resolution")"
+          source_id=""
+          if [[ "$operation" == add_release ]]; then
+            source_id="$(jq -er --arg version "$target_version" \
+              '.channels.preview.releases[] | select(.version == $version) | .source_release_id' \
+              manifests/channels.json)"
+            jq -e '.enabled == true and .environment == "native-package-source-read"' \
+              manifests/source-read.json >/dev/null
+          fi
+
+          # Existing assets are accepted only when they were produced by this
+          # still-current reviewed control. This makes partial retries safe and
+          # prevents an old completed draft being repurposed by a new manifest.
+          if [[ "$classification" == complete_draft || "$classification" == immutable_complete ]]; then
+            receipt="$assets/wukongim-preview-r${audit_id}-receipt.json"
+            jq -e --arg sha "$GITHUB_SHA" '.control_sha == $sha' "$receipt" >/dev/null
+          fi
+
+          toolchain_image="$(jq -er '.image' manifests/signing-toolchain.json)"
+          toolchain_digest="$(jq -er '.digest' manifests/signing-toolchain.json)"
+          toolchain_workflow_sha="$(jq -er '.workflow_sha' manifests/signing-toolchain.json)"
+          {
+            echo "audit_release_id=$audit_id"
+            echo "base_audit_release_id=$base_id"
+            echo "classification=$classification"
+            echo "operation=$operation"
+            echo "target_version=$target_version"
+            echo "source_release_id=$source_id"
+            echo "toolchain_image=$toolchain_image"
+            echo "toolchain_digest=$toolchain_digest"
+            echo "toolchain_workflow_sha=$toolchain_workflow_sha"
+          } >>"$GITHUB_OUTPUT"
+
+      - name: Upload exact control bundle
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-package-control-${{ github.sha }}
+          path: |
+            scripts/
+            manifests/
+            keys/
+            tests/contract.sh
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload initial numeric Release state
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-package-target-state-${{ inputs.audit_release_id }}
+          path: |
+            ${{ runner.temp }}/target-resolution.json
+            ${{ runner.temp }}/audit-release-api.json
+            ${{ runner.temp }}/target-release-assets/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+      - name: Reject tracked-tree mutation
+        if: always()
+        run: git diff --exit-code HEAD --
+
+  prepare:
+    name: Plan and prepare isolated unsigned family trees
+    needs:
+      - control
+      - base
+      - trusted_source_tools
+      - source
+    if: >-
+      always() &&
+      needs.control.result == 'success' &&
+      needs.control.outputs.classification == 'empty_draft' &&
+      needs.trusted_source_tools.result == 'success' &&
+      (needs.control.outputs.base_audit_release_id == '' || needs.base.result == 'success') &&
+      (needs.control.outputs.operation != 'add_release' || needs.source.result == 'success')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      attestations: read
+      packages: read
+    steps:
+      - name: Download exact control and trusted source tools
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: native-package-control-${{ github.sha }}
+          path: ${{ runner.temp }}/control
+
+      - name: Download digest-pinned repository builder
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: native-package-source-tools-${{ github.sha }}
+          path: ${{ runner.temp }}/source-tools
+
+      - name: Download verified base snapshot
+        if: needs.control.outputs.base_audit_release_id != ''
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: native-package-base-${{ needs.control.outputs.base_audit_release_id }}
+          path: ${{ runner.temp }}/base-input
+
+      - name: Download verified source assets
+        if: needs.control.outputs.operation == 'add_release'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: native-package-source-${{ needs.control.outputs.source_release_id }}
+          path: ${{ runner.temp }}/source-input
+
+      - name: Verify fixed signing toolchain provenance
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMAGE: ${{ needs.control.outputs.toolchain_image }}
+          DIGEST: ${{ needs.control.outputs.toolchain_digest }}
+          WORKFLOW_SHA: ${{ needs.control.outputs.toolchain_workflow_sha }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          docker pull --platform linux/amd64 "$IMAGE@$DIGEST"
+          gh attestation verify "oci://$IMAGE@$DIGEST" \
+            --repo WuKongIM/packages \
+            --signer-workflow WuKongIM/packages/.github/workflows/native-package-signing-toolchain.yml \
+            --source-ref refs/heads/main \
+            --source-digest "$WORKFLOW_SHA" \
+            --signer-digest "$WORKFLOW_SHA" \
+            --deny-self-hosted-runners \
+            --format json >"$RUNNER_TEMP/prepare-toolchain-attestation.json"
+          docker logout ghcr.io
+
+      - name: Extract verified base, plan transition, and prepare payloads offline
+        shell: bash
+        env:
+          IMAGE: ${{ needs.control.outputs.toolchain_image }}
+          DIGEST: ${{ needs.control.outputs.toolchain_digest }}
+          BASE_AUDIT_RELEASE_ID: ${{ needs.control.outputs.base_audit_release_id }}
+          OPERATION: ${{ needs.control.outputs.operation }}
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/prepare-work"
+          mkdir -p "$work/source-assets" "$work/artifacts/metadata" \
+            "$work/artifacts/apt/tree" "$work/artifacts/rpm/tree"
+          chmod 0777 "$work" "$work/source-assets" "$work/artifacts" \
+            "$work/artifacts/metadata" "$work/artifacts/apt" "$work/artifacts/apt/tree" \
+            "$work/artifacts/rpm" "$work/artifacts/rpm/tree"
+          if [[ "$OPERATION" == add_release ]]; then
+            cp -a "$RUNNER_TEMP/source-input/source-assets/." "$work/source-assets/"
+          fi
+          chmod 0555 "$RUNNER_TEMP/source-tools/scripts/build-native-package-repositories.sh"
+
+          docker run --rm --platform linux/amd64 \
+            --network none --read-only --cap-drop ALL \
+            --security-opt no-new-privileges --pids-limit 256 \
+            --tmpfs /tmp:rw,noexec,nosuid,size=512m \
+            --env BASE_AUDIT_RELEASE_ID \
+            --env GITHUB_SHA \
+            --volume "$RUNNER_TEMP/control:/control:ro" \
+            --volume "$RUNNER_TEMP/source-tools:/source-tools:ro" \
+            --volume "$RUNNER_TEMP/base-input:/base-input:ro" \
+            --volume "$work:/work:rw" \
+            "$IMAGE@$DIGEST" bash -euo pipefail -c '
+              base_args=()
+              plan_base_args=()
+              if [[ -n "$BASE_AUDIT_RELEASE_ID" ]]; then
+                archive="/base-input/base-release/wukongim-preview-r${BASE_AUDIT_RELEASE_ID}-site.tar"
+                python3 /control/scripts/archive-package-snapshot.py extract \
+                  --archive "$archive" --output-dir /work/base-root >/work/base-extract.json
+                base_args=(--base-root /work/base-root)
+                plan_base_args=(--base-snapshot /work/base-root/audit/snapshot.json)
+              fi
+              python3 /control/scripts/plan-package-publication.py \
+                --channels /control/manifests/channels.json \
+                "${plan_base_args[@]}" --control-sha "$GITHUB_SHA" >/work/plan.json
+              python3 /control/scripts/prepare-package-site.py \
+                --channels /control/manifests/channels.json \
+                --plan /work/plan.json "${base_args[@]}" \
+                --source-assets /work/source-assets \
+                --builder /source-tools/scripts/build-native-package-repositories.sh \
+                --output /work/prepared-repository \
+                --inventory /work/inventory.json >/work/preparation.json
+              python3 /control/scripts/derive-rpm-allowlists.py \
+                --inventory /work/inventory.json \
+                --repository-root /work/prepared-repository/rpm/preview/el/9/x86_64 \
+                --new-output /work/rpm-new.json \
+                --signed-output /work/rpm-preserved.json \
+                --active-output /work/rpm-active.json
+              cp -a /work/prepared-repository/apt /work/artifacts/apt/tree/
+              cp -a /work/prepared-repository/rpm /work/artifacts/rpm/tree/
+              cp /work/plan.json /work/inventory.json /work/rpm-new.json \
+                /work/rpm-preserved.json /work/rpm-active.json \
+                /work/preparation.json /work/artifacts/metadata/
+            '
+          if [[ "$OPERATION" == add_release ]]; then
+            cp -a "$RUNNER_TEMP/source-input/source-attestations" \
+              "$work/artifacts/metadata/source-attestations"
+          fi
+
+          # Retirement is a two-run state machine. There is no workflow sleep:
+          # phase one must leave a full 30-minute safety window at execution,
+          # while phase two is forbidden until the base snapshot's not_before.
+          not_before="$(jq -r '.not_before // empty' "$work/plan.json")"
+          if [[ "$OPERATION" == remove_indexes ]]; then
+            test -n "$not_before"
+            (( $(date -u -d "$not_before" +%s) >= $(date +%s) + 1800 ))
+          elif [[ "$OPERATION" == remove_payloads ]]; then
+            test -n "$not_before"
+            (( $(date +%s) >= $(date -u -d "$not_before" +%s) ))
+          fi
+
+      - name: Upload prepared metadata boundary
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-package-prepared-metadata-${{ needs.control.outputs.audit_release_id }}
+          path: ${{ runner.temp }}/prepare-work/artifacts/metadata/
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload unsigned APT-only boundary
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-package-prepared-apt-${{ needs.control.outputs.audit_release_id }}
+          path: ${{ runner.temp }}/prepare-work/artifacts/apt/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+      - name: Upload unsigned RPM-only boundary
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-package-prepared-rpm-${{ needs.control.outputs.audit_release_id }}
+          path: ${{ runner.temp }}/prepare-work/artifacts/rpm/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  apt_sign:
+    name: Sign only the APT family
+    needs:
+      - control
+      - prepare
+    if: needs.control.outputs.classification == 'empty_draft'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: native-package-preview-apt-signing
+    permissions:
+      attestations: read
+      packages: read
+    steps:
+      - name: Download exact signer code and APT-only input
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: native-package-control-${{ github.sha }}
+          path: ${{ runner.temp }}/control
+
+      - name: Download APT-only unsigned tree
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: native-package-prepared-apt-${{ needs.control.outputs.audit_release_id }}
+          path: ${{ runner.temp }}/apt-input
+
+      - name: Verify toolchain before exposing either APT secret
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMAGE: ${{ needs.control.outputs.toolchain_image }}
+          DIGEST: ${{ needs.control.outputs.toolchain_digest }}
+          WORKFLOW_SHA: ${{ needs.control.outputs.toolchain_workflow_sha }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          docker pull --platform linux/amd64 "$IMAGE@$DIGEST"
+          gh attestation verify "oci://$IMAGE@$DIGEST" --repo WuKongIM/packages \
+            --signer-workflow WuKongIM/packages/.github/workflows/native-package-signing-toolchain.yml \
+            --source-ref refs/heads/main --source-digest "$WORKFLOW_SHA" \
+            --signer-digest "$WORKFLOW_SHA" --deny-self-hosted-runners >/dev/null
+          docker logout ghcr.io
+
+      - name: Validate and sign APT in an offline read-only container
+        shell: bash
+        env:
+          IMAGE: ${{ needs.control.outputs.toolchain_image }}
+          DIGEST: ${{ needs.control.outputs.toolchain_digest }}
+          WK_APT_PREVIEW_SECRET_SUBKEY_B64: ${{ secrets.WK_APT_PREVIEW_SECRET_SUBKEY_B64 }}
+          WK_APT_PREVIEW_PASSPHRASE: ${{ secrets.WK_APT_PREVIEW_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          test "$(git ls-remote https://github.com/WuKongIM/packages.git refs/heads/main | cut -f1)" = "$GITHUB_SHA"
+          work="$RUNNER_TEMP/apt-output"
+          mkdir -p "$work/deliver"
+          chmod 0777 "$work" "$work/deliver"
+          docker run --rm --platform linux/amd64 \
+            --network none --read-only --cap-drop ALL \
+            --security-opt no-new-privileges --pids-limit 128 \
+            --tmpfs /tmp:rw,noexec,nosuid,size=256m \
+            --env WK_APT_PREVIEW_SECRET_SUBKEY_B64 \
+            --env WK_APT_PREVIEW_PASSPHRASE \
+            --volume "$RUNNER_TEMP/control:/control:ro" \
+            --volume "$RUNNER_TEMP/apt-input/tree:/input:ro" \
+            --volume "$work:/work:rw" \
+            "$IMAGE@$DIGEST" bash -euo pipefail -c '
+              args=(
+                --family apt --input-root /input --output-root /work/deliver/tree
+                --public-cert /control/keys/apt-preview.asc
+                --secret-subkey-base64-env WK_APT_PREVIEW_SECRET_SUBKEY_B64
+                --passphrase-env WK_APT_PREVIEW_PASSPHRASE
+                --primary-fingerprint "$(jq -er .apt.primary_fingerprint /control/manifests/preview-signing.json)"
+                --signing-subkey-fingerprint "$(jq -er .apt.signing_subkeys.current /control/manifests/preview-signing.json)"
+                --minimum-valid-days "$(jq -er .minimum_valid_days /control/manifests/preview-signing.json)"
+                --rotation-begin-days "$(jq -er .rotation_begin_days /control/manifests/preview-signing.json)"
+                --maximum-lifetime-days "$(jq -er .maximum_subkey_lifetime_days /control/manifests/preview-signing.json)"
+                --apt-release apt/dists/preview/Release
+              )
+              next="$(jq -r .apt.signing_subkeys.next//empty /control/manifests/preview-signing.json)"
+              [[ -z "$next" ]] || args+=(--next-signing-subkey-fingerprint "$next")
+              while read -r historical; do
+                args+=(--historical-signing-subkey-fingerprint "$historical")
+              done < <(jq -r ".apt.signing_subkeys.historical[]" /control/manifests/preview-signing.json)
+              python3 /control/scripts/sign-package-family.py "${args[@]}" >/work/deliver/apt-signing.json
+            '
+          test "$(git ls-remote https://github.com/WuKongIM/packages.git refs/heads/main | cut -f1)" = "$GITHUB_SHA"
+
+      - name: Upload signed APT-only boundary
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-package-signed-apt-${{ needs.control.outputs.audit_release_id }}
+          path: ${{ runner.temp }}/apt-output/deliver/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  rpm_sign:
+    name: Sign only the RPM family
+    needs:
+      - control
+      - prepare
+    if: needs.control.outputs.classification == 'empty_draft'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: native-package-preview-rpm-signing
+    permissions:
+      attestations: read
+      packages: read
+    steps:
+      - name: Download exact signer code
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: native-package-control-${{ github.sha }}
+          path: ${{ runner.temp }}/control
+
+      - name: Download RPM-only unsigned tree
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: native-package-prepared-rpm-${{ needs.control.outputs.audit_release_id }}
+          path: ${{ runner.temp }}/rpm-input
+
+      - name: Download exact RPM allowlists
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: native-package-prepared-metadata-${{ needs.control.outputs.audit_release_id }}
+          path: ${{ runner.temp }}/prepared-metadata
+
+      - name: Verify toolchain before exposing either RPM secret
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMAGE: ${{ needs.control.outputs.toolchain_image }}
+          DIGEST: ${{ needs.control.outputs.toolchain_digest }}
+          WORKFLOW_SHA: ${{ needs.control.outputs.toolchain_workflow_sha }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          docker pull --platform linux/amd64 "$IMAGE@$DIGEST"
+          gh attestation verify "oci://$IMAGE@$DIGEST" --repo WuKongIM/packages \
+            --signer-workflow WuKongIM/packages/.github/workflows/native-package-signing-toolchain.yml \
+            --source-ref refs/heads/main --source-digest "$WORKFLOW_SHA" \
+            --signer-digest "$WORKFLOW_SHA" --deny-self-hosted-runners >/dev/null
+          docker logout ghcr.io
+
+      - name: Validate and sign RPM in an offline read-only container
+        shell: bash
+        env:
+          IMAGE: ${{ needs.control.outputs.toolchain_image }}
+          DIGEST: ${{ needs.control.outputs.toolchain_digest }}
+          WK_RPM_PREVIEW_SECRET_SUBKEY_B64: ${{ secrets.WK_RPM_PREVIEW_SECRET_SUBKEY_B64 }}
+          WK_RPM_PREVIEW_PASSPHRASE: ${{ secrets.WK_RPM_PREVIEW_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          test "$(git ls-remote https://github.com/WuKongIM/packages.git refs/heads/main | cut -f1)" = "$GITHUB_SHA"
+          work="$RUNNER_TEMP/rpm-output"
+          mkdir -p "$work/deliver"
+          chmod 0777 "$work" "$work/deliver"
+          docker run --rm --platform linux/amd64 \
+            --network none --read-only --cap-drop ALL \
+            --security-opt no-new-privileges --pids-limit 128 \
+            --tmpfs /tmp:rw,noexec,nosuid,size=512m \
+            --env WK_RPM_PREVIEW_SECRET_SUBKEY_B64 \
+            --env WK_RPM_PREVIEW_PASSPHRASE \
+            --volume "$RUNNER_TEMP/control:/control:ro" \
+            --volume "$RUNNER_TEMP/rpm-input/tree:/input:ro" \
+            --volume "$RUNNER_TEMP/prepared-metadata:/metadata:ro" \
+            --volume "$work:/work:rw" \
+            "$IMAGE@$DIGEST" bash -euo pipefail -c '
+              args=(
+                --family rpm --input-root /input --output-root /work/deliver/tree
+                --public-cert /control/keys/rpm-preview.asc
+                --secret-subkey-base64-env WK_RPM_PREVIEW_SECRET_SUBKEY_B64
+                --passphrase-env WK_RPM_PREVIEW_PASSPHRASE
+                --primary-fingerprint "$(jq -er .rpm.primary_fingerprint /control/manifests/preview-signing.json)"
+                --signing-subkey-fingerprint "$(jq -er .rpm.signing_subkeys.current /control/manifests/preview-signing.json)"
+                --minimum-valid-days "$(jq -er .minimum_valid_days /control/manifests/preview-signing.json)"
+                --rotation-begin-days "$(jq -er .rotation_begin_days /control/manifests/preview-signing.json)"
+                --maximum-lifetime-days "$(jq -er .maximum_subkey_lifetime_days /control/manifests/preview-signing.json)"
+                --rpm-repository rpm/preview/el/9/x86_64
+                --new-rpm-allowlist /metadata/rpm-new.json
+                --signed-rpm-allowlist /metadata/rpm-preserved.json
+                --active-rpm-allowlist /metadata/rpm-active.json
+              )
+              next="$(jq -r .rpm.signing_subkeys.next//empty /control/manifests/preview-signing.json)"
+              [[ -z "$next" ]] || args+=(--next-signing-subkey-fingerprint "$next")
+              while read -r historical; do
+                args+=(--historical-signing-subkey-fingerprint "$historical")
+              done < <(jq -r ".rpm.signing_subkeys.historical[]" /control/manifests/preview-signing.json)
+              python3 /control/scripts/sign-package-family.py "${args[@]}" >/work/deliver/rpm-signing.json
+            '
+          test "$(git ls-remote https://github.com/WuKongIM/packages.git refs/heads/main | cut -f1)" = "$GITHUB_SHA"
+
+      - name: Upload signed RPM-only boundary
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-package-signed-rpm-${{ needs.control.outputs.audit_release_id }}
+          path: ${{ runner.temp }}/rpm-output/deliver/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  assemble:
+    name: Compose, cryptographically verify, and archive whole site
+    needs:
+      - control
+      - base
+      - trusted_source_tools
+      - prepare
+      - apt_sign
+      - rpm_sign
+    if: >-
+      always() &&
+      needs.control.result == 'success' &&
+      needs.control.outputs.classification == 'empty_draft' &&
+      needs.trusted_source_tools.result == 'success' &&
+      needs.prepare.result == 'success' &&
+      needs.apt_sign.result == 'success' &&
+      needs.rpm_sign.result == 'success' &&
+      (needs.control.outputs.base_audit_release_id == '' || needs.base.result == 'success')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      attestations: read
+      packages: read
+    steps:
+      - name: Download exact control
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: native-package-control-${{ github.sha }}
+          path: ${{ runner.temp }}/control
+
+      - name: Download trusted source verifiers
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: native-package-source-tools-${{ github.sha }}
+          path: ${{ runner.temp }}/source-tools
+
+      - name: Download prepared metadata
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: native-package-prepared-metadata-${{ needs.control.outputs.audit_release_id }}
+          path: ${{ runner.temp }}/metadata
+
+      - name: Download signed APT family
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: native-package-signed-apt-${{ needs.control.outputs.audit_release_id }}
+          path: ${{ runner.temp }}/apt-signed
+
+      - name: Download signed RPM family
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: native-package-signed-rpm-${{ needs.control.outputs.audit_release_id }}
+          path: ${{ runner.temp }}/rpm-signed
+
+      - name: Download verified base for retained-byte checks
+        if: needs.control.outputs.base_audit_release_id != ''
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: native-package-base-${{ needs.control.outputs.base_audit_release_id }}
+          path: ${{ runner.temp }}/base-input
+
+      - name: Verify fixed toolchain provenance
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMAGE: ${{ needs.control.outputs.toolchain_image }}
+          DIGEST: ${{ needs.control.outputs.toolchain_digest }}
+          WORKFLOW_SHA: ${{ needs.control.outputs.toolchain_workflow_sha }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          docker pull --platform linux/amd64 "$IMAGE@$DIGEST"
+          gh attestation verify "oci://$IMAGE@$DIGEST" --repo WuKongIM/packages \
+            --signer-workflow WuKongIM/packages/.github/workflows/native-package-signing-toolchain.yml \
+            --source-ref refs/heads/main --source-digest "$WORKFLOW_SHA" \
+            --signer-digest "$WORKFLOW_SHA" --deny-self-hosted-runners >/dev/null
+          docker logout ghcr.io
+
+      - name: Compose exact site and run mandatory whole-site cryptographic gate
+        shell: bash
+        env:
+          IMAGE: ${{ needs.control.outputs.toolchain_image }}
+          DIGEST: ${{ needs.control.outputs.toolchain_digest }}
+          BASE_AUDIT_RELEASE_ID: ${{ needs.control.outputs.base_audit_release_id }}
+          AUDIT_RELEASE_ID: ${{ needs.control.outputs.audit_release_id }}
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/assemble-work"
+          mkdir -p "$work"
+          chmod 0777 "$work"
+          chmod 0555 \
+            "$RUNNER_TEMP/source-tools/scripts/verify-native-package-repositories.sh" \
+            "$RUNNER_TEMP/source-tools/scripts/verify-native-package-metadata.py"
+          docker run --rm --platform linux/amd64 \
+            --network none --read-only --cap-drop ALL \
+            --security-opt no-new-privileges --pids-limit 256 \
+            --tmpfs /tmp:rw,noexec,nosuid,size=512m \
+            --env BASE_AUDIT_RELEASE_ID \
+            --env AUDIT_RELEASE_ID \
+            --volume "$RUNNER_TEMP/control:/control:ro" \
+            --volume "$RUNNER_TEMP/source-tools:/source-tools:ro" \
+            --volume "$RUNNER_TEMP/metadata:/metadata:ro" \
+            --volume "$RUNNER_TEMP/apt-signed:/apt:ro" \
+            --volume "$RUNNER_TEMP/rpm-signed:/rpm:ro" \
+            --volume "$RUNNER_TEMP/base-input:/base-input:ro" \
+            --volume "$work:/work:rw" \
+            "$IMAGE@$DIGEST" bash -euo pipefail -c '
+              base_args=()
+              if [[ -n "$BASE_AUDIT_RELEASE_ID" ]]; then
+                archive="/base-input/base-release/wukongim-preview-r${BASE_AUDIT_RELEASE_ID}-site.tar"
+                python3 /control/scripts/archive-package-snapshot.py extract \
+                  --archive "$archive" --output-dir /work/base-root >/work/base-extract.json
+                base_args=(--base-root /work/base-root)
+              fi
+              source_args=()
+              if [[ -d /metadata/source-attestations ]]; then
+                source_args=(--source-attestations /metadata/source-attestations)
+              fi
+              python3 /control/scripts/compose-package-site.py \
+                --channels /control/manifests/channels.json \
+                --signing /control/manifests/preview-signing.json \
+                --signing-toolchain /control/manifests/signing-toolchain.json \
+                --apt-public-cert /control/keys/apt-preview.asc \
+                --rpm-public-cert /control/keys/rpm-preview.asc \
+                --plan /metadata/plan.json --inventory /metadata/inventory.json \
+                --apt-tree /apt/tree --apt-receipt /apt/apt-signing.json \
+                --rpm-tree /rpm/tree --rpm-receipt /rpm/rpm-signing.json \
+                "${source_args[@]}" \
+                "${base_args[@]}" --output-root /work/snapshot-root \
+                >/work/composition.json
+              cp /metadata/plan.json /work/snapshot-root/audit/plan.json
+              cp /apt/apt-signing.json /work/snapshot-root/audit/apt-signing.json
+              cp /rpm/rpm-signing.json /work/snapshot-root/audit/rpm-signing.json
+
+              # Blocking production verifier: it must understand retained
+              # payload allowlists and multiple reviewed public subkeys while
+              # still requiring the exact current issuer for every signature.
+              python3 /control/scripts/verify-production-package-site.py \
+                --site-root /work/snapshot-root/site \
+                --snapshot /work/snapshot-root/audit/snapshot.json \
+                --channels /control/manifests/channels.json \
+                --signing /control/manifests/preview-signing.json \
+                --apt-public-cert /control/keys/apt-preview.asc \
+                --rpm-public-cert /control/keys/rpm-preview.asc
+
+              # The older pinned source verifier is a supplemental gate only
+              # when its exact-one-subkey/exact-index-closure model applies.
+              if [[ "$(jq ".retained_versions|length" /metadata/plan.json)" == 0 &&
+                    "$(jq ".apt.signing_subkeys.next == null and (.apt.signing_subkeys.historical|length == 0) and .rpm.signing_subkeys.next == null and (.rpm.signing_subkeys.historical|length == 0)" /control/manifests/preview-signing.json)" == true ]]; then
+                /source-tools/scripts/verify-native-package-repositories.sh \
+                  --repository /work/snapshot-root/site \
+                  --minimum-valid-days "$(jq -er .minimum_valid_days /control/manifests/preview-signing.json)" \
+                  --apt-release apt/dists/preview/Release \
+                  --apt-public-key /control/keys/apt-preview.asc \
+                  --apt-primary-fingerprint "$(jq -er .apt.primary_fingerprint /control/manifests/preview-signing.json)" \
+                  --apt-signing-fingerprint "$(jq -er .apt.signing_subkeys.current /control/manifests/preview-signing.json)" \
+                  --rpm-repository rpm/preview/el/9/x86_64 \
+                  --rpm-public-key /control/keys/rpm-preview.asc \
+                  --rpm-primary-fingerprint "$(jq -er .rpm.primary_fingerprint /control/manifests/preview-signing.json)" \
+                  --rpm-signing-fingerprint "$(jq -er .rpm.signing_subkeys.current /control/manifests/preview-signing.json)"
+              fi
+
+              archive="/work/wukongim-preview-r${AUDIT_RELEASE_ID}-site.tar"
+              receipt="/work/wukongim-preview-r${AUDIT_RELEASE_ID}-receipt.json"
+              python3 /control/scripts/archive-package-snapshot.py create \
+                --source-dir /work/snapshot-root --archive "$archive" \
+                --receipt-output /work/archive-summary.json
+              python3 /control/scripts/package-audit-receipt.py create \
+                --channels /control/manifests/channels.json \
+                --signing /control/manifests/preview-signing.json \
+                --signing-toolchain /control/manifests/signing-toolchain.json \
+                --apt-public-cert /control/keys/apt-preview.asc \
+                --rpm-public-cert /control/keys/rpm-preview.asc \
+                "${source_args[@]}" \
+                --plan /metadata/plan.json \
+                --apt-receipt /apt/apt-signing.json \
+                --rpm-receipt /rpm/rpm-signing.json \
+                --archive "$archive" --output "$receipt" >/work/audit-receipt-create.json
+              python3 /control/scripts/package-audit-receipt.py verify \
+                --channels /control/manifests/channels.json \
+                --signing /control/manifests/preview-signing.json \
+                --signing-toolchain /control/manifests/signing-toolchain.json \
+                --apt-public-cert /control/keys/apt-preview.asc \
+                --rpm-public-cert /control/keys/rpm-preview.asc \
+                "${source_args[@]}" \
+                --plan /metadata/plan.json \
+                --apt-receipt /apt/apt-signing.json \
+                --rpm-receipt /rpm/rpm-signing.json \
+                --archive "$archive" --receipt "$receipt" >/work/audit-receipt-verify.json
+            '
+
+      - name: Validate clean APT and RPM download-only install paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 "$RUNNER_TEMP/control/scripts/validate-production-package-clients.py" \
+            --site-root "$RUNNER_TEMP/assemble-work/snapshot-root/site" \
+            --snapshot "$RUNNER_TEMP/assemble-work/snapshot-root/audit/snapshot.json" \
+            --apt-public-cert "$RUNNER_TEMP/control/keys/apt-preview.asc" \
+            --rpm-public-cert "$RUNNER_TEMP/control/keys/rpm-preview.asc"
+
+      - name: Upload deterministic audit candidate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-package-audit-candidate-${{ needs.control.outputs.audit_release_id }}
+          path: |
+            ${{ runner.temp }}/assemble-work/wukongim-preview-r${{ needs.control.outputs.audit_release_id }}-site.tar
+            ${{ runner.temp }}/assemble-work/wukongim-preview-r${{ needs.control.outputs.audit_release_id }}-receipt.json
+            ${{ runner.temp }}/assemble-work/composition.json
+            ${{ runner.temp }}/assemble-work/archive-summary.json
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  recover:
+    name: Recover or revalidate existing exact audit assets
+    needs: control
+    if: >-
+      needs.control.outputs.classification != 'empty_draft'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      attestations: read
+      packages: read
+    steps:
+      - name: Download exact control
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: native-package-control-${{ github.sha }}
+          path: ${{ runner.temp }}/control
+
+      - name: Download existing numeric Release state
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: native-package-target-state-${{ needs.control.outputs.audit_release_id }}
+          path: ${{ runner.temp }}/target-state
+
+      - name: Verify toolchain provenance
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMAGE: ${{ needs.control.outputs.toolchain_image }}
+          DIGEST: ${{ needs.control.outputs.toolchain_digest }}
+          WORKFLOW_SHA: ${{ needs.control.outputs.toolchain_workflow_sha }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          docker pull --platform linux/amd64 "$IMAGE@$DIGEST"
+          gh attestation verify "oci://$IMAGE@$DIGEST" --repo WuKongIM/packages \
+            --signer-workflow WuKongIM/packages/.github/workflows/native-package-signing-toolchain.yml \
+            --source-ref refs/heads/main --source-digest "$WORKFLOW_SHA" \
+            --signer-digest "$WORKFLOW_SHA" --deny-self-hosted-runners >/dev/null
+          docker logout ghcr.io
+
+      - name: Regenerate only a missing receipt and verify exact existing archive
+        shell: bash
+        env:
+          IMAGE: ${{ needs.control.outputs.toolchain_image }}
+          DIGEST: ${{ needs.control.outputs.toolchain_digest }}
+          AUDIT_RELEASE_ID: ${{ needs.control.outputs.audit_release_id }}
+          CLASSIFICATION: ${{ needs.control.outputs.classification }}
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/recovery-work"
+          mkdir -p "$work"
+          chmod 0777 "$work"
+          archive="$RUNNER_TEMP/target-state/target-release-assets/wukongim-preview-r${AUDIT_RELEASE_ID}-site.tar"
+          existing_receipt="$RUNNER_TEMP/target-state/target-release-assets/wukongim-preview-r${AUDIT_RELEASE_ID}-receipt.json"
+          test -f "$archive"
+          cp "$archive" "$work/"
+          if [[ "$CLASSIFICATION" != archive_only_draft ]]; then
+            test -f "$existing_receipt"
+            cp "$existing_receipt" "$work/"
+          fi
+          docker run --rm --platform linux/amd64 \
+            --network none --read-only --cap-drop ALL \
+            --security-opt no-new-privileges --pids-limit 256 \
+            --tmpfs /tmp:rw,noexec,nosuid,size=512m \
+            --env AUDIT_RELEASE_ID --env CLASSIFICATION \
+            --volume "$RUNNER_TEMP/control:/control:ro" \
+            --volume "$work:/work:rw" \
+            "$IMAGE@$DIGEST" bash -euo pipefail -c '
+              archive="/work/wukongim-preview-r${AUDIT_RELEASE_ID}-site.tar"
+              receipt="/work/wukongim-preview-r${AUDIT_RELEASE_ID}-receipt.json"
+              python3 /control/scripts/archive-package-snapshot.py extract \
+                --archive "$archive" --output-dir /work/snapshot-root >/work/archive-summary.json
+              common=(
+                --channels /control/manifests/channels.json
+                --signing /control/manifests/preview-signing.json
+                --signing-toolchain /control/manifests/signing-toolchain.json
+                --apt-public-cert /control/keys/apt-preview.asc
+                --rpm-public-cert /control/keys/rpm-preview.asc
+                --plan /work/snapshot-root/audit/plan.json
+                --apt-receipt /work/snapshot-root/audit/apt-signing.json
+                --rpm-receipt /work/snapshot-root/audit/rpm-signing.json
+                --archive "$archive"
+              )
+              if [[ -d /work/snapshot-root/audit/source-attestations ]]; then
+                common+=(--source-attestations /work/snapshot-root/audit/source-attestations)
+              fi
+              if [[ "$CLASSIFICATION" == archive_only_draft ]]; then
+                python3 /control/scripts/package-audit-receipt.py create \
+                  "${common[@]}" --output "$receipt" >/work/audit-receipt-create.json
+              fi
+              python3 /control/scripts/package-audit-receipt.py verify \
+                "${common[@]}" --receipt "$receipt" >/work/audit-receipt-verify.json
+              python3 /control/scripts/verify-production-package-site.py \
+                --site-root /work/snapshot-root/site \
+                --snapshot /work/snapshot-root/audit/snapshot.json \
+                --channels /control/manifests/channels.json \
+                --signing /control/manifests/preview-signing.json \
+                --apt-public-cert /control/keys/apt-preview.asc \
+                --rpm-public-cert /control/keys/rpm-preview.asc
+            '
+
+      - name: Revalidate clean client download-only install paths from recovered site
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 "$RUNNER_TEMP/control/scripts/validate-production-package-clients.py" \
+            --site-root "$RUNNER_TEMP/recovery-work/snapshot-root/site" \
+            --snapshot "$RUNNER_TEMP/recovery-work/snapshot-root/audit/snapshot.json" \
+            --apt-public-cert "$RUNNER_TEMP/control/keys/apt-preview.asc" \
+            --rpm-public-cert "$RUNNER_TEMP/control/keys/rpm-preview.asc"
+
+      - name: Upload recovered deterministic audit candidate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-package-audit-candidate-${{ needs.control.outputs.audit_release_id }}
+          path: |
+            ${{ runner.temp }}/recovery-work/wukongim-preview-r${{ needs.control.outputs.audit_release_id }}-site.tar
+            ${{ runner.temp }}/recovery-work/wukongim-preview-r${{ needs.control.outputs.audit_release_id }}-receipt.json
+            ${{ runner.temp }}/recovery-work/archive-summary.json
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  seal_draft:
+    name: Fill without overwrite and seal exact audit draft
+    needs:
+      - control
+      - assemble
+      - recover
+    if: >-
+      always() &&
+      needs.control.result == 'success' &&
+      needs.control.outputs.classification != 'immutable_complete' &&
+      ((needs.control.outputs.classification == 'empty_draft' && needs.assemble.result == 'success') ||
+       (needs.control.outputs.classification != 'empty_draft' && needs.recover.result == 'success'))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: native-package-preview-audit
+    permissions:
+      contents: read
+    steps:
+      - name: Download exact control
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: native-package-control-${{ github.sha }}
+          path: ${{ runner.temp }}/control
+
+      - name: Download verified deterministic candidate
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: native-package-audit-candidate-${{ needs.control.outputs.audit_release_id }}
+          path: ${{ runner.temp }}/candidate
+
+      - name: Mint write-scoped package publisher token
+        id: publisher-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ secrets.WK_PACKAGE_PUBLISHER_APP_CLIENT_ID }}
+          private-key: ${{ secrets.WK_PACKAGE_PUBLISHER_APP_PRIVATE_KEY }}
+          owner: WuKongIM
+          repositories: packages
+          permission-administration: read
+          permission-contents: write
+
+      - name: Fence main and retirement clock immediately before write
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.publisher-token.outputs.token }}
+          OPERATION: ${{ needs.control.outputs.operation }}
+        run: |
+          set -euo pipefail
+          test "$(gh api repos/WuKongIM/packages/git/ref/heads/main --jq .object.sha)" = "$GITHUB_SHA"
+          plan="$RUNNER_TEMP/plan.json"
+          archive="$RUNNER_TEMP/candidate/wukongim-preview-r${{ needs.control.outputs.audit_release_id }}-site.tar"
+          python3 "$RUNNER_TEMP/control/scripts/archive-package-snapshot.py" extract \
+            --archive "$archive" --output-dir "$RUNNER_TEMP/seal-root" >/dev/null
+          cp "$RUNNER_TEMP/seal-root/audit/plan.json" "$plan"
+          not_before="$(jq -r '.not_before // empty' "$plan")"
+          if [[ "$OPERATION" == remove_indexes ]]; then
+            (( $(date -u -d "$not_before" +%s) >= $(date +%s) + 1800 ))
+          elif [[ "$OPERATION" == remove_payloads ]]; then
+            (( $(date +%s) >= $(date -u -d "$not_before" +%s) ))
+          fi
+
+      - name: Reverify receipt then seal numeric Release idempotently
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.publisher-token.outputs.token }}
+          AUDIT_RELEASE_ID: ${{ needs.control.outputs.audit_release_id }}
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/candidate/wukongim-preview-r${AUDIT_RELEASE_ID}-site.tar"
+          receipt="$RUNNER_TEMP/candidate/wukongim-preview-r${AUDIT_RELEASE_ID}-receipt.json"
+          source_args=()
+          if [[ -d "$RUNNER_TEMP/seal-root/audit/source-attestations" ]]; then
+            source_args+=(--source-attestations "$RUNNER_TEMP/seal-root/audit/source-attestations")
+          fi
+          python3 "$RUNNER_TEMP/control/scripts/package-audit-receipt.py" verify \
+            --channels "$RUNNER_TEMP/control/manifests/channels.json" \
+            --signing "$RUNNER_TEMP/control/manifests/preview-signing.json" \
+            --signing-toolchain "$RUNNER_TEMP/control/manifests/signing-toolchain.json" \
+            --apt-public-cert "$RUNNER_TEMP/control/keys/apt-preview.asc" \
+            --rpm-public-cert "$RUNNER_TEMP/control/keys/rpm-preview.asc" \
+            "${source_args[@]}" \
+            --plan "$RUNNER_TEMP/seal-root/audit/plan.json" \
+            --apt-receipt "$RUNNER_TEMP/seal-root/audit/apt-signing.json" \
+            --rpm-receipt "$RUNNER_TEMP/seal-root/audit/rpm-signing.json" \
+            --archive "$archive" --receipt "$receipt" >/dev/null
+          # The writer is deliberately numeric-ID bound and has no delete,
+          # replace, rename, or clobber primitive. It uploads archive first,
+          # receipt second, then polls for enforced immutable publication.
+          python3 "$RUNNER_TEMP/control/scripts/seal-audit-release.py" \
+            --release-id "$AUDIT_RELEASE_ID" \
+            --expected-control-sha "$GITHUB_SHA" \
+            --archive "$archive" --receipt "$receipt" \
+            --token-env GH_TOKEN >"$RUNNER_TEMP/seal-result.json"
+          jq -e '.final_classification == "immutable_complete" and .immutable == true' \
+            "$RUNNER_TEMP/seal-result.json" >/dev/null
+
+  immutable_passthrough:
+    name: Reverify already immutable exact audit Release
+    needs:
+      - control
+      - recover
+    if: >-
+      needs.control.outputs.classification == 'immutable_complete' &&
+      needs.recover.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: native-package-preview-audit
+    permissions:
+      contents: read
+    steps:
+      - name: Download exact control and candidate
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: native-package-control-${{ github.sha }}
+          path: ${{ runner.temp }}/control
+
+      - name: Download recovered candidate
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: native-package-audit-candidate-${{ needs.control.outputs.audit_release_id }}
+          path: ${{ runner.temp }}/candidate
+
+      - name: Mint read-scoped package publisher token
+        id: publisher-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ secrets.WK_PACKAGE_PUBLISHER_APP_CLIENT_ID }}
+          private-key: ${{ secrets.WK_PACKAGE_PUBLISHER_APP_PRIVATE_KEY }}
+          owner: WuKongIM
+          repositories: packages
+          permission-administration: read
+          permission-contents: read
+
+      - name: Re-resolve immutable bytes with a read-scoped audit token
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.publisher-token.outputs.token }}
+          AUDIT_RELEASE_ID: ${{ needs.control.outputs.audit_release_id }}
+        run: |
+          set -euo pipefail
+          python3 "$RUNNER_TEMP/control/scripts/seal-audit-release.py" \
+            --release-id "$AUDIT_RELEASE_ID" \
+            --expected-control-sha "$GITHUB_SHA" \
+            --archive "$RUNNER_TEMP/candidate/wukongim-preview-r${AUDIT_RELEASE_ID}-site.tar" \
+            --receipt "$RUNNER_TEMP/candidate/wukongim-preview-r${AUDIT_RELEASE_ID}-receipt.json" \
+            --token-env GH_TOKEN >"$RUNNER_TEMP/immutable-result.json"
+          jq -e \
+            '.initial_classification == "immutable_complete" and
+             .final_classification == "immutable_complete" and .immutable == true' \
+            "$RUNNER_TEMP/immutable-result.json" >/dev/null
+
+  sealed:
+    name: Require exactly one successful sealing path
+    needs:
+      - control
+      - seal_draft
+      - immutable_passthrough
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Accept draft seal or immutable read-only retry, never neither
+        shell: bash
+        env:
+          CLASSIFICATION: ${{ needs.control.outputs.classification }}
+          DRAFT_RESULT: ${{ needs.seal_draft.result }}
+          IMMUTABLE_RESULT: ${{ needs.immutable_passthrough.result }}
+        run: |
+          set -euo pipefail
+          if [[ "$CLASSIFICATION" == immutable_complete ]]; then
+            test "$IMMUTABLE_RESULT" = success
+            test "$DRAFT_RESULT" = skipped
+          else
+            test "$DRAFT_RESULT" = success
+            test "$IMMUTABLE_RESULT" = skipped
+          fi
+
+  pages_artifact:
+    name: Rebuild Pages artifact only from immutable numeric Release
+    needs:
+      - control
+      - sealed
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      attestations: read
+      contents: read
+      packages: read
+    outputs:
+      deploy_needed: ${{ steps.live.outputs.deploy_needed }}
+      operation: ${{ steps.live.outputs.operation }}
+      not_before: ${{ steps.live.outputs.not_before }}
+      status_sha256: ${{ steps.live.outputs.status_sha256 }}
+      apt_release_sha256: ${{ steps.live.outputs.apt_release_sha256 }}
+      rpm_repomd_sha256: ${{ steps.live.outputs.rpm_repomd_sha256 }}
+      apt_key_sha256: ${{ steps.live.outputs.apt_key_sha256 }}
+      rpm_key_sha256: ${{ steps.live.outputs.rpm_key_sha256 }}
+    steps:
+      - name: Check out exact current control
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Fence main and download immutable audit assets by numeric id
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          AUDIT_RELEASE_ID: ${{ needs.control.outputs.audit_release_id }}
+        run: |
+          set -euo pipefail
+          test "$(git ls-remote origin refs/heads/main | cut -f1)" = "$GITHUB_SHA"
+          ./scripts/resolve-audit-release.py \
+            --release-id "$AUDIT_RELEASE_ID" \
+            --expected-control-sha "$GITHUB_SHA" \
+            --expected-tag-state exact \
+            --output-dir "$RUNNER_TEMP/immutable-assets" \
+            --token-env GH_TOKEN >"$RUNNER_TEMP/immutable-resolution.json"
+          jq -e '.classification == "immutable_complete" and .immutable == true' \
+            "$RUNNER_TEMP/immutable-resolution.json" >/dev/null
+          ./scripts/archive-package-snapshot.py extract \
+            --archive "$RUNNER_TEMP/immutable-assets/wukongim-preview-r${AUDIT_RELEASE_ID}-site.tar" \
+            --output-dir "$RUNNER_TEMP/pages-root" >/dev/null
+          source_args=()
+          if [[ -d "$RUNNER_TEMP/pages-root/audit/source-attestations" ]]; then
+            source_args+=(--source-attestations "$RUNNER_TEMP/pages-root/audit/source-attestations")
+          fi
+          ./scripts/package-audit-receipt.py verify \
+            --channels manifests/channels.json --signing manifests/preview-signing.json \
+            --signing-toolchain manifests/signing-toolchain.json \
+            --apt-public-cert keys/apt-preview.asc --rpm-public-cert keys/rpm-preview.asc \
+            "${source_args[@]}" \
+            --plan "$RUNNER_TEMP/pages-root/audit/plan.json" \
+            --apt-receipt "$RUNNER_TEMP/pages-root/audit/apt-signing.json" \
+            --rpm-receipt "$RUNNER_TEMP/pages-root/audit/rpm-signing.json" \
+            --archive "$RUNNER_TEMP/immutable-assets/wukongim-preview-r${AUDIT_RELEASE_ID}-site.tar" \
+            --receipt "$RUNNER_TEMP/immutable-assets/wukongim-preview-r${AUDIT_RELEASE_ID}-receipt.json" \
+            >/dev/null
+
+      - name: Verify toolchain, immutable site, and clean download-only clients
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMAGE: ${{ needs.control.outputs.toolchain_image }}
+          DIGEST: ${{ needs.control.outputs.toolchain_digest }}
+          WORKFLOW_SHA: ${{ needs.control.outputs.toolchain_workflow_sha }}
+          OPERATION: ${{ needs.control.outputs.operation }}
+          TARGET_VERSION: ${{ needs.control.outputs.target_version }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          docker pull --platform linux/amd64 "$IMAGE@$DIGEST"
+          gh attestation verify "oci://$IMAGE@$DIGEST" --repo WuKongIM/packages \
+            --signer-workflow WuKongIM/packages/.github/workflows/native-package-signing-toolchain.yml \
+            --source-ref refs/heads/main --source-digest "$WORKFLOW_SHA" \
+            --signer-digest "$WORKFLOW_SHA" --deny-self-hosted-runners >/dev/null
+          docker logout ghcr.io
+          docker run --rm --platform linux/amd64 \
+            --network none --read-only --cap-drop ALL \
+            --security-opt no-new-privileges --pids-limit 256 \
+            --tmpfs /tmp:rw,noexec,nosuid,size=256m \
+            --volume "$GITHUB_WORKSPACE:/control:ro" \
+            --volume "$RUNNER_TEMP/pages-root:/snapshot:ro" \
+            "$IMAGE@$DIGEST" \
+            python3 /control/scripts/verify-production-package-site.py \
+              --site-root /snapshot/site --snapshot /snapshot/audit/snapshot.json \
+              --channels /control/manifests/channels.json \
+              --signing /control/manifests/preview-signing.json \
+              --apt-public-cert /control/keys/apt-preview.asc \
+              --rpm-public-cert /control/keys/rpm-preview.asc
+          client_target_args=()
+          if [[ "$OPERATION" == add_release ]]; then
+            client_target_args+=(--expected-version "$TARGET_VERSION")
+          fi
+          python3 scripts/validate-production-package-clients.py \
+            --site-root "$RUNNER_TEMP/pages-root/site" \
+            --snapshot "$RUNNER_TEMP/pages-root/audit/snapshot.json" \
+            --apt-public-cert keys/apt-preview.asc \
+            --rpm-public-cert keys/rpm-preview.asc \
+            "${client_target_args[@]}"
+
+      - name: Fence current live whole-site identity
+        id: live
+        shell: bash
+        env:
+          AUDIT_RELEASE_ID: ${{ needs.control.outputs.audit_release_id }}
+          BASE_AUDIT_RELEASE_ID: ${{ needs.control.outputs.base_audit_release_id }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          site="$RUNNER_TEMP/pages-root/site"
+          status="$site/status.json"
+          jq -e \
+            --argjson id "$AUDIT_RELEASE_ID" --arg sha "$GITHUB_SHA" \
+            '.schema == "wukongim.native_package_repository_status/v2" and
+             .audit_release_id == $id and .control_sha == $sha and
+             .apt == true and .rpm == true and .reason == "ready"' \
+            "$status" >/dev/null
+          remote="$RUNNER_TEMP/live-status.json"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error \
+            --max-time 30 --max-filesize 1048576 \
+            https://packages.githubim.com/status.json >"$remote"
+          deploy_needed=true
+          if jq -e \
+            --argjson id "$AUDIT_RELEASE_ID" \
+            '.schema == "wukongim.native_package_repository_status/v2" and .audit_release_id == $id' \
+            "$remote" >/dev/null; then
+            cmp -s "$remote" "$status"
+            deploy_needed=false
+          elif [[ -n "$BASE_AUDIT_RELEASE_ID" ]] && jq -e \
+            --argjson id "$BASE_AUDIT_RELEASE_ID" \
+            '.schema == "wukongim.native_package_repository_status/v2" and .audit_release_id == $id' \
+            "$remote" >/dev/null; then
+            base_control_sha="$(jq -er '.control_sha | select(test("^[0-9a-f]{40}$"))' "$remote")"
+            base_snapshot_sha="$(jq -er '.snapshot_sha256 | select(test("^[0-9a-f]{64}$"))' "$remote")"
+            tag="native-package-preview-r${BASE_AUDIT_RELEASE_ID}"
+            gh api "repos/WuKongIM/packages/git/ref/tags/$tag" \
+              | jq -e --arg sha "$base_control_sha" --arg ref "refs/tags/$tag" \
+                '.ref == $ref and .object.type == "commit" and .object.sha == $sha' \
+                >/dev/null
+            receipt_id="$(gh api "repos/WuKongIM/packages/releases/$BASE_AUDIT_RELEASE_ID" \
+              --jq '.assets[] | select(.name == "wukongim-preview-r'"$BASE_AUDIT_RELEASE_ID"'-receipt.json") | .id')"
+            [[ "$receipt_id" =~ ^[1-9][0-9]*$ ]]
+            gh api -H 'Accept: application/octet-stream' \
+              "repos/WuKongIM/packages/releases/assets/$receipt_id" >"$RUNNER_TEMP/live-base-receipt.json"
+            jq -e --arg sha "$base_control_sha" --arg snapshot "$base_snapshot_sha" \
+              '.control_sha == $sha and .archive.snapshot_sha256 == $snapshot' \
+              "$RUNNER_TEMP/live-base-receipt.json" >/dev/null
+            deploy_needed=true
+          elif [[ -z "$BASE_AUDIT_RELEASE_ID" ]] && jq -e \
+            '.schema == "wukongim.native_package_repository_status/v1" and
+             .apt == false and .rpm == false and .reason == "signing_not_provisioned"' \
+            "$remote" >/dev/null; then
+            deploy_needed=true
+          else
+            echo 'live Pages snapshot is neither reviewed base, exact target, nor first bootstrap' >&2
+            exit 1
+          fi
+
+          operation="$(jq -er '.operation' "$RUNNER_TEMP/pages-root/audit/plan.json")"
+          not_before="$(jq -r '.not_before // empty' "$RUNNER_TEMP/pages-root/audit/plan.json")"
+          {
+            echo "deploy_needed=$deploy_needed"
+            echo "operation=$operation"
+            echo "not_before=$not_before"
+            echo "status_sha256=$(sha256sum "$status" | cut -d' ' -f1)"
+            echo "apt_release_sha256=$(sha256sum "$site/apt/dists/preview/Release" | cut -d' ' -f1)"
+            echo "rpm_repomd_sha256=$(sha256sum "$site/rpm/preview/el/9/x86_64/repodata/repomd.xml" | cut -d' ' -f1)"
+            echo "apt_key_sha256=$(sha256sum "$site/keys/apt-preview.asc" | cut -d' ' -f1)"
+            echo "rpm_key_sha256=$(sha256sum "$site/keys/rpm-preview.asc" | cut -d' ' -f1)"
+          } >>"$GITHUB_OUTPUT"
+
+      - name: Configure Pages
+        if: steps.live.outputs.deploy_needed == 'true'
+        uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5
+
+      - name: Upload exact whole-site Pages artifact
+        if: steps.live.outputs.deploy_needed == 'true'
+        uses: actions/upload-pages-artifact@7b1f4a764d45c48632c6b24a0339c27f5614fb0b # v4
+        with:
+          path: ${{ runner.temp }}/pages-root/site
+
+      - name: Upload reviewed snapshot for post-deployment closure
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-package-public-snapshot-${{ needs.control.outputs.audit_release_id }}
+          path: ${{ runner.temp }}/pages-root/audit/snapshot.json
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Reject tracked-tree mutation
+        if: always()
+        run: git diff --exit-code HEAD --
+
+  deploy:
+    name: Deploy exact immutable Pages snapshot
+    needs:
+      - control
+      - pages_artifact
+    if: needs.pages_artifact.outputs.deploy_needed == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+      pages: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Re-fence main and retirement clock after Environment approval
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OPERATION: ${{ needs.pages_artifact.outputs.operation }}
+          NOT_BEFORE: ${{ needs.pages_artifact.outputs.not_before }}
+        run: |
+          set -euo pipefail
+          test "$(gh api repos/WuKongIM/packages/git/ref/heads/main --jq .object.sha)" = "$GITHUB_SHA"
+          if [[ "$OPERATION" == remove_indexes ]]; then
+            test -n "$NOT_BEFORE"
+            (( $(date -u -d "$NOT_BEFORE" +%s) >= $(date +%s) + 1800 ))
+          elif [[ "$OPERATION" == remove_payloads ]]; then
+            test -n "$NOT_BEFORE"
+            (( $(date +%s) >= $(date -u -d "$NOT_BEFORE" +%s) ))
+          fi
+
+      - name: Deploy Pages artifact
+        id: deployment
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4
+
+      - name: Re-fence main after Pages deployment
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$(gh api repos/WuKongIM/packages/git/ref/heads/main --jq .object.sha)" = "$GITHUB_SHA"
+
+  postverify:
+    name: Verify public domain matches exact immutable target
+    needs:
+      - control
+      - pages_artifact
+      - deploy
+    if: >-
+      always() &&
+      needs.pages_artifact.result == 'success' &&
+      (needs.pages_artifact.outputs.deploy_needed != 'true' || needs.deploy.result == 'success')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - name: Check out exact client validator
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Download reviewed immutable snapshot identity
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: native-package-public-snapshot-${{ needs.control.outputs.audit_release_id }}
+          path: ${{ runner.temp }}/public-snapshot
+
+      - name: Fence main before public verification
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$(gh api repos/WuKongIM/packages/git/ref/heads/main --jq .object.sha)" = "$GITHUB_SHA"
+
+      - name: Compare public critical bytes with immutable target
+        shell: bash
+        env:
+          STATUS_SHA256: ${{ needs.pages_artifact.outputs.status_sha256 }}
+          APT_RELEASE_SHA256: ${{ needs.pages_artifact.outputs.apt_release_sha256 }}
+          RPM_REPOMD_SHA256: ${{ needs.pages_artifact.outputs.rpm_repomd_sha256 }}
+          APT_KEY_SHA256: ${{ needs.pages_artifact.outputs.apt_key_sha256 }}
+          RPM_KEY_SHA256: ${{ needs.pages_artifact.outputs.rpm_key_sha256 }}
+        run: |
+          set -euo pipefail
+          fetch_and_check() {
+            local relative="$1" expected="$2" output="$RUNNER_TEMP/public-$(basename "$relative")"
+            for attempt in {1..10}; do
+              if curl --proto '=https' --tlsv1.2 --fail --silent --show-error \
+                --max-time 30 --max-filesize 16777216 \
+                "https://packages.githubim.com/$relative" >"$output" &&
+                 [[ "$(sha256sum "$output" | cut -d' ' -f1)" == "$expected" ]]; then
+                return 0
+              fi
+              sleep 3
+            done
+            echo "public file did not converge to immutable target: $relative" >&2
+            return 1
+          }
+          fetch_and_check status.json "$STATUS_SHA256"
+          fetch_and_check apt/dists/preview/Release "$APT_RELEASE_SHA256"
+          fetch_and_check rpm/preview/el/9/x86_64/repodata/repomd.xml "$RPM_REPOMD_SHA256"
+          fetch_and_check keys/apt-preview.asc "$APT_KEY_SHA256"
+          fetch_and_check keys/rpm-preview.asc "$RPM_KEY_SHA256"
+
+      - name: Validate production endpoint with clean download-only clients
+        shell: bash
+        env:
+          AUDIT_RELEASE_ID: ${{ needs.control.outputs.audit_release_id }}
+          OPERATION: ${{ needs.control.outputs.operation }}
+          TARGET_VERSION: ${{ needs.control.outputs.target_version }}
+        run: |
+          set -euo pipefail
+          snapshot="$RUNNER_TEMP/public-snapshot/snapshot.json"
+          snapshot_sha256="$(sha256sum "$snapshot" | cut -d' ' -f1)"
+          client_target_args=()
+          if [[ "$OPERATION" == add_release ]]; then
+            client_target_args+=(--expected-version "$TARGET_VERSION")
+          fi
+          python3 scripts/validate-production-package-clients.py \
+            --base-url https://packages.githubim.com \
+            --snapshot "$snapshot" \
+            --apt-public-cert keys/apt-preview.asc \
+            --rpm-public-cert keys/rpm-preview.asc \
+            "${client_target_args[@]}" \
+            >"$RUNNER_TEMP/public-client-validation.json"
+          jq -e \
+            --argjson id "$AUDIT_RELEASE_ID" \
+            --arg control "$GITHUB_SHA" \
+            --arg snapshot "$snapshot_sha256" \
+            --arg operation "$OPERATION" \
+            --arg target "$TARGET_VERSION" \
+            '.mode == "remote" and .audit_release_id == $id and
+             .control_sha == $control and .snapshot_sha256 == $snapshot and
+             .snapshot_verified == true and .status_revalidated == true and
+             (.apt | length) == 2 and (.rpm | length) == 2 and
+             (if $operation == "add_release" then
+                .expected_version == $target and .expected_version_verified == true and
+                all(.apt[].download.snapshot_versions; . == [$target]) and
+                all(.rpm[].download.snapshot_versions; . == [$target])
+              else
+                .expected_version == null and .expected_version_verified == false
+              end)' \
+            "$RUNNER_TEMP/public-client-validation.json" >/dev/null
+
+      - name: Upload public endpoint verification evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-package-public-verification-${{ needs.control.outputs.audit_release_id }}
+          path: ${{ runner.temp }}/public-client-validation.json
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Re-fence main after public verification
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$(gh api repos/WuKongIM/packages/git/ref/heads/main --jq .object.sha)" = "$GITHUB_SHA"
+
+  base:
+    name: Resolve and verify immutable base snapshot
+    needs: control
+    if: >-
+      needs.control.outputs.classification == 'empty_draft' &&
+      needs.control.outputs.base_audit_release_id != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      attestations: read
+      contents: read
+      packages: read
+    steps:
+      - name: Check out exact current verifier control with history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve immutable base by numeric Release id
+        shell: bash
+        env:
+          BASE_AUDIT_RELEASE_ID: ${{ needs.control.outputs.base_audit_release_id }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/base-input"
+          expected_tag="native-package-preview-r${BASE_AUDIT_RELEASE_ID}"
+          git fetch --no-tags origin "refs/tags/$expected_tag"
+          base_control_sha="$(git rev-parse 'FETCH_HEAD^{commit}')"
+          [[ "$base_control_sha" =~ ^[0-9a-f]{40}$ ]]
+          ./scripts/resolve-audit-release.py \
+            --release-id "$BASE_AUDIT_RELEASE_ID" \
+            --expected-control-sha "$base_control_sha" \
+            --expected-tag-state exact \
+            --output-dir "$RUNNER_TEMP/base-input/base-release" \
+            --token-env GH_TOKEN >"$RUNNER_TEMP/base-input/base-resolution.json"
+          jq -e \
+            --argjson id "$BASE_AUDIT_RELEASE_ID" \
+            '.release_id == $id and .classification == "immutable_complete" and
+             .draft == false and .immutable == true' \
+            "$RUNNER_TEMP/base-input/base-resolution.json" >/dev/null
+
+          archive="$RUNNER_TEMP/base-input/base-release/wukongim-preview-r${BASE_AUDIT_RELEASE_ID}-site.tar"
+          receipt="$RUNNER_TEMP/base-input/base-release/wukongim-preview-r${BASE_AUDIT_RELEASE_ID}-receipt.json"
+          ./scripts/archive-package-snapshot.py extract \
+            --archive "$archive" \
+            --output-dir "$RUNNER_TEMP/base-input/base-root" \
+            >"$RUNNER_TEMP/base-input/base-archive-summary.json"
+          test "$(jq -er '.control_sha | select(test("^[0-9a-f]{40}$"))' "$receipt")" = "$base_control_sha"
+          git cat-file -e "${base_control_sha}^{commit}"
+          mkdir -p "$RUNNER_TEMP/base-input/base-control/manifests" "$RUNNER_TEMP/base-input/base-control/keys"
+          git show "$base_control_sha:manifests/channels.json" \
+            >"$RUNNER_TEMP/base-input/base-control/manifests/channels.json"
+          git show "$base_control_sha:manifests/preview-signing.json" \
+            >"$RUNNER_TEMP/base-input/base-control/manifests/preview-signing.json"
+          git show "$base_control_sha:manifests/signing-toolchain.json" \
+            >"$RUNNER_TEMP/base-input/base-control/manifests/signing-toolchain.json"
+          git show "$base_control_sha:keys/apt-preview.asc" \
+            >"$RUNNER_TEMP/base-input/base-control/keys/apt-preview.asc"
+          git show "$base_control_sha:keys/rpm-preview.asc" \
+            >"$RUNNER_TEMP/base-input/base-control/keys/rpm-preview.asc"
+
+          source_args=()
+          if [[ -d "$RUNNER_TEMP/base-input/base-root/audit/source-attestations" ]]; then
+            source_args+=(--source-attestations "$RUNNER_TEMP/base-input/base-root/audit/source-attestations")
+          fi
+          ./scripts/package-audit-receipt.py verify \
+            --channels "$RUNNER_TEMP/base-input/base-control/manifests/channels.json" \
+            --signing "$RUNNER_TEMP/base-input/base-control/manifests/preview-signing.json" \
+            --signing-toolchain "$RUNNER_TEMP/base-input/base-control/manifests/signing-toolchain.json" \
+            --apt-public-cert "$RUNNER_TEMP/base-input/base-control/keys/apt-preview.asc" \
+            --rpm-public-cert "$RUNNER_TEMP/base-input/base-control/keys/rpm-preview.asc" \
+            "${source_args[@]}" \
+            --plan "$RUNNER_TEMP/base-input/base-root/audit/plan.json" \
+            --apt-receipt "$RUNNER_TEMP/base-input/base-root/audit/apt-signing.json" \
+            --rpm-receipt "$RUNNER_TEMP/base-input/base-root/audit/rpm-signing.json" \
+            --archive "$archive" \
+            --receipt "$receipt" \
+            >"$RUNNER_TEMP/base-input/base-receipt-verification.json"
+
+          test "$(git rev-parse 'FETCH_HEAD^{commit}')" = "$base_control_sha"
+
+      - name: Verify toolchain provenance before base cryptographic validation
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMAGE: ${{ needs.control.outputs.toolchain_image }}
+          DIGEST: ${{ needs.control.outputs.toolchain_digest }}
+          WORKFLOW_SHA: ${{ needs.control.outputs.toolchain_workflow_sha }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          docker pull --platform linux/amd64 "$IMAGE@$DIGEST"
+          gh attestation verify "oci://$IMAGE@$DIGEST" \
+            --repo WuKongIM/packages \
+            --signer-workflow WuKongIM/packages/.github/workflows/native-package-signing-toolchain.yml \
+            --source-ref refs/heads/main \
+            --source-digest "$WORKFLOW_SHA" \
+            --signer-digest "$WORKFLOW_SHA" \
+            --deny-self-hosted-runners \
+            --format json >"$RUNNER_TEMP/base-input/toolchain-attestation.json"
+          docker logout ghcr.io
+
+      - name: Cryptographically verify base before it can enter planning
+        shell: bash
+        env:
+          IMAGE: ${{ needs.control.outputs.toolchain_image }}
+          DIGEST: ${{ needs.control.outputs.toolchain_digest }}
+        run: |
+          set -euo pipefail
+          docker run --rm --platform linux/amd64 \
+            --network none --read-only --cap-drop ALL \
+            --security-opt no-new-privileges --pids-limit 256 \
+            --tmpfs /tmp:rw,noexec,nosuid,size=256m \
+            --volume "$GITHUB_WORKSPACE:/current:ro" \
+            --volume "$RUNNER_TEMP/base-input:/base:ro" \
+            "$IMAGE@$DIGEST" \
+            python3 /current/scripts/verify-production-package-site.py \
+              --site-root /base/base-root/site \
+              --snapshot /base/base-root/audit/snapshot.json \
+              --channels /base/base-control/manifests/channels.json \
+              --signing /base/base-control/manifests/preview-signing.json \
+              --apt-public-cert /base/base-control/keys/apt-preview.asc \
+              --rpm-public-cert /base/base-control/keys/rpm-preview.asc
+
+      - name: Upload verified base snapshot boundary
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-package-base-${{ needs.control.outputs.base_audit_release_id }}
+          path: ${{ runner.temp }}/base-input/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+      - name: Reject tracked-tree mutation
+        if: always()
+        run: git diff --exit-code HEAD --
+
+  trusted_source_tools:
+    name: Fetch exact digest-pinned source repository tools
+    needs: control
+    if: needs.control.outputs.classification == 'empty_draft'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Check out exact publication control
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Download only reviewed tool files from exact source commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          commit="$(jq -er '.commit | select(test("^[0-9a-f]{40}$"))' manifests/trusted-toolchain.json)"
+          root="$RUNNER_TEMP/source-toolchain"
+          mkdir -p "$root"
+          jq -e \
+            '.repository == "WuKongIM/WuKongIM" and
+             (.files["scripts/build-native-package-repositories.sh"] | test("^[0-9a-f]{64}$")) and
+             (.files["scripts/verify-native-package-repositories.sh"] | test("^[0-9a-f]{64}$")) and
+             (.files["scripts/verify-native-package-metadata.py"] | test("^[0-9a-f]{64}$"))' \
+            manifests/trusted-toolchain.json >/dev/null
+          production_tools=(
+            scripts/build-native-package-repositories.sh
+            scripts/verify-native-package-repositories.sh
+            scripts/verify-native-package-metadata.py
+          )
+          for relative in "${production_tools[@]}"; do
+            expected="$(jq -er --arg relative "$relative" \
+              '.files[$relative] | select(test("^[0-9a-f]{64}$"))' \
+              manifests/trusted-toolchain.json)"
+            [[ "$relative" =~ ^scripts/[0-9A-Za-z._-]+$ ]]
+            [[ "$expected" =~ ^[0-9a-f]{64}$ ]]
+            mkdir -p "$root/$(dirname "$relative")"
+            curl --fail --silent --show-error --location \
+              --proto '=https' --proto-redir '=https' --tlsv1.2 \
+              --connect-timeout 10 --max-time 30 --max-filesize 1048576 \
+              --retry 3 --retry-all-errors \
+              --output "$root/$relative" \
+              "https://raw.githubusercontent.com/WuKongIM/WuKongIM/${commit}/${relative}"
+            test "$(sha256sum "$root/$relative" | cut -d' ' -f1)" = "$expected"
+            chmod 0555 "$root/$relative"
+          done
+          cp manifests/trusted-toolchain.json "$root/trusted-toolchain.json"
+
+      - name: Upload trusted source-tool boundary
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-package-source-tools-${{ github.sha }}
+          path: ${{ runner.temp }}/source-toolchain/
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Reject tracked-tree mutation
+        if: always()
+        run: git diff --exit-code HEAD --
+
+  source:
+    name: Resolve and verify immutable source package assets
+    needs: control
+    if: >-
+      needs.control.outputs.classification == 'empty_draft' &&
+      needs.control.outputs.operation == 'add_release'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    environment: native-package-source-read
+    permissions:
+      attestations: read
+      contents: read
+      packages: read
+    steps:
+      - name: Check out exact validated control
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Revalidate current main before using source-read credentials
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git ls-remote origin refs/heads/main | cut -f1)" = "$GITHUB_SHA"
+          ./tests/contract.sh
+
+      - name: Mint least-privilege source repository token
+        id: source-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ secrets.WK_SOURCE_READ_APP_CLIENT_ID }}
+          private-key: ${{ secrets.WK_SOURCE_READ_APP_PRIVATE_KEY }}
+          owner: WuKongIM
+          repositories: WuKongIM
+          permission-contents: read
+          permission-attestations: read
+
+      - name: Resolve exact immutable source Release and attestations
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.source-token.outputs.token }}
+          SOURCE_RELEASE_ID: ${{ needs.control.outputs.source_release_id }}
+          TARGET_VERSION: ${{ needs.control.outputs.target_version }}
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/source-input"
+          mkdir -p "$root/source-assets" "$root/source-attestations"
+          ./scripts/resolve-source-release.py \
+            --release-id "$SOURCE_RELEASE_ID" \
+            --output-dir "$root/source-assets/$SOURCE_RELEASE_ID" \
+            --token-env GH_TOKEN >"$root/source-release.json"
+          jq -e \
+            --argjson id "$SOURCE_RELEASE_ID" \
+            --arg version "$TARGET_VERSION" \
+            '.release_id == $id and .version == $version and
+             .prerelease == true and .asset_count == 7 and
+             (.source_sha | test("^[0-9a-f]{40}$"))' \
+            "$root/source-release.json" >/dev/null
+          ./scripts/verify-source-attestations.py \
+            --receipt "$root/source-release.json" \
+            --asset-dir "$root/source-assets/$SOURCE_RELEASE_ID" \
+            --evidence-dir "$root/source-attestations" \
+            >/dev/null
+          test "$(find "$root/source-attestations" -mindepth 1 -maxdepth 1 \
+            -type f -printf x | wc -c)" -eq 8
+          test -z "$(find "$root/source-attestations" -mindepth 1 -maxdepth 1 \
+            ! -type f -print -quit)"
+
+      - name: Verify fixed toolchain and inspect unsigned package identities
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMAGE: ${{ needs.control.outputs.toolchain_image }}
+          DIGEST: ${{ needs.control.outputs.toolchain_digest }}
+          WORKFLOW_SHA: ${{ needs.control.outputs.toolchain_workflow_sha }}
+          SOURCE_RELEASE_ID: ${{ needs.control.outputs.source_release_id }}
+          TARGET_VERSION: ${{ needs.control.outputs.target_version }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          docker pull --platform linux/amd64 "$IMAGE@$DIGEST"
+          gh attestation verify "oci://$IMAGE@$DIGEST" \
+            --repo WuKongIM/packages \
+            --signer-workflow WuKongIM/packages/.github/workflows/native-package-signing-toolchain.yml \
+            --source-ref refs/heads/main \
+            --source-digest "$WORKFLOW_SHA" \
+            --signer-digest "$WORKFLOW_SHA" \
+            --deny-self-hosted-runners \
+            --format json >"$RUNNER_TEMP/source-input/toolchain-attestation.json"
+          source_dir="$RUNNER_TEMP/source-input/source-assets/$SOURCE_RELEASE_ID"
+          docker run --rm --platform linux/amd64 \
+            --network none --read-only --cap-drop ALL \
+            --security-opt no-new-privileges --pids-limit 128 \
+            --tmpfs /tmp:rw,noexec,nosuid,size=64m \
+            --env TARGET_VERSION \
+            --volume "$source_dir:/source:ro" \
+            "$IMAGE@$DIGEST" bash -euo pipefail -c '
+              deb="/source/wukongim_${TARGET_VERSION}_linux_amd64.deb"
+              rpm_package="/source/wukongim_${TARGET_VERSION}_linux_amd64.rpm"
+              deb_version="${TARGET_VERSION/-/~}"
+              rpm_version="${deb_version//-/_}"
+              test "$(dpkg-deb --field "$deb" Package)" = wukongim
+              test "$(dpkg-deb --field "$deb" Architecture)" = amd64
+              test "$(dpkg-deb --field "$deb" Version)" = "$deb_version"
+              test "$(rpm -qp --queryformat "%{NAME}" "$rpm_package")" = wukongim
+              test "$(rpm -qp --queryformat "%{ARCH}" "$rpm_package")" = x86_64
+              test "$(rpm -qp --queryformat "%{VERSION}" "$rpm_package")" = "$rpm_version"
+              test "$(rpm -qp --queryformat "%{RELEASE}" "$rpm_package")" = 1
+              test "$(rpm -qp --queryformat "%{SIGPGP:pgpsig}" "$rpm_package")" = "(none)"
+              test "$(rpm -qp --queryformat "%{SIGGPG:pgpsig}" "$rpm_package")" = "(none)"
+            '
+          docker logout ghcr.io
+
+      - name: Upload verified opaque source boundary
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-package-source-${{ needs.control.outputs.source_release_id }}
+          path: ${{ runner.temp }}/source-input/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+      - name: Reject tracked-tree mutation
+        if: always()
+        run: git diff --exit-code HEAD --

@@ -12,19 +12,21 @@ import subprocess
 import sys
 import tempfile
 from datetime import datetime
+import time
 from pathlib import Path
 from typing import Any
 
 
-CHANNELS_SCHEMA = "wukongim.native_package_channels/v2"
-SIGNING_SCHEMA = "wukongim.native_package_signing/v1"
+CHANNELS_SCHEMA = "wukongim.native_package_channels/v3"
+SIGNING_SCHEMA = "wukongim.native_package_signing/v3"
+SIGNING_TOOLCHAIN_SCHEMA = "wukongim.native_package_signing_toolchain/v1"
 TOOLCHAIN_SCHEMA = "wukongim.native_package_toolchain/v1"
 SOURCE_READ_SCHEMA = "wukongim.native_package_source_read/v1"
 SOURCE_REPOSITORY = "WuKongIM/WuKongIM"
 SITE_LIMIT_BYTES = 750 * 1024 * 1024
 SITE_WARNING_BYTES = 600 * 1024 * 1024
 MAX_ONLINE_VERSIONS = 4
-SIGNING_ENVIRONMENT = "native-package-preview-signing"
+SIGNING_TOOLCHAIN_IMAGE = "ghcr.io/wukongim/native-package-signing-toolchain"
 
 SEMVER_PRERELEASE = re.compile(
     r"^(?:0|[1-9][0-9]*)\."
@@ -37,6 +39,8 @@ LOWER_SHA = re.compile(r"^[0-9a-f]{40}$")
 LOWER_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 UPPER_FINGERPRINT = re.compile(r"^[0-9A-F]{40}$")
 UTC_TIMESTAMP = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")
+RPM_RSA_ALGORITHM = "1"
+RPM_RSA_BITS = frozenset({"3072", "4096"})
 
 CHANNEL_FIELDS = {
     "schema",
@@ -47,9 +51,15 @@ CHANNEL_FIELDS = {
     "architectures",
     "channels",
 }
-PREVIEW_FIELDS = {"enabled", "status", "releases", "retirement"}
+PREVIEW_FIELDS = {"enabled", "status", "releases", "retirement", "publication"}
 STABLE_FIELDS = {"enabled", "status", "releases"}
 RETIREMENT_FIELDS = {"phase", "version", "not_before"}
+PUBLICATION_FIELDS = {
+    "audit_release_id",
+    "base_audit_release_id",
+    "operation",
+    "target_version",
+}
 RELEASE_FIELDS = {
     "version",
     "source_sha",
@@ -63,7 +73,6 @@ RELEASE_FIELDS = {
 SIGNING_FIELDS = {
     "schema",
     "enabled",
-    "environment",
     "minimum_valid_days",
     "rotation_begin_days",
     "maximum_subkey_lifetime_days",
@@ -71,11 +80,20 @@ SIGNING_FIELDS = {
     "rpm",
 }
 KEY_FIELDS = {
+    "environment",
     "public_key",
     "primary_fingerprint",
-    "signing_subkey_fingerprint",
+    "signing_subkeys",
     "secret_subkey_env",
     "passphrase_env",
+}
+SIGNING_SUBKEY_FIELDS = {"current", "next", "historical"}
+SIGNING_TOOLCHAIN_FIELDS = {
+    "schema",
+    "enabled",
+    "image",
+    "digest",
+    "workflow_sha",
 }
 TRUSTED_TOOL_FILES = {
     "scripts/build-native-package-repositories.sh",
@@ -153,6 +171,77 @@ def validate_release(value: Any, index: int) -> dict[str, Any]:
     return release
 
 
+def validate_publication(
+    value: Any,
+    releases: list[dict[str, Any]],
+    retirement: dict[str, Any],
+) -> dict[str, Any]:
+    publication = exact_fields(value, PUBLICATION_FIELDS, "preview publication")
+    operation = publication["operation"]
+    require(
+        operation in {"none", "add_release", "remove_indexes", "remove_payloads"},
+        "preview publication.operation must be none, add_release, remove_indexes, "
+        "or remove_payloads",
+    )
+
+    audit_release_id = publication["audit_release_id"]
+    base_audit_release_id = publication["base_audit_release_id"]
+    target_version = publication["target_version"]
+    if operation == "none":
+        require(
+            audit_release_id is None
+            and base_audit_release_id is None
+            and target_version is None,
+            "publication none requires null audit_release_id, base_audit_release_id, "
+            "and target_version",
+        )
+        require(not releases and retirement["phase"] == "none",
+                "publication none requires no releases or retirement")
+        return publication
+
+    positive_integer(audit_release_id, "preview publication.audit_release_id")
+    require(
+        isinstance(target_version, str) and SEMVER_PRERELEASE.fullmatch(target_version),
+        "preview publication.target_version must be strict prerelease SemVer",
+    )
+    matching = [release for release in releases if release["version"] == target_version]
+
+    if operation == "add_release":
+        require(retirement["phase"] == "none",
+                "add_release is forbidden while retirement is in progress")
+        require(len(matching) == 1 and matching[0]["state"] == "active",
+                "add_release target must be exactly one active preview release")
+        require(matching[0]["package_release_id"] == audit_release_id,
+                "add_release audit_release_id must match the target package_release_id")
+        if len(releases) == 1:
+            require(base_audit_release_id is None,
+                    "the first add_release requires a null base_audit_release_id")
+        else:
+            positive_integer(base_audit_release_id,
+                             "preview publication.base_audit_release_id")
+            require(base_audit_release_id != audit_release_id,
+                    "publication audit and base audit Release IDs must differ")
+    elif operation == "remove_indexes":
+        positive_integer(base_audit_release_id, "preview publication.base_audit_release_id")
+        require(base_audit_release_id != audit_release_id,
+                "publication audit and base audit Release IDs must differ")
+        require(len(matching) == 1 and matching[0]["state"] == "index_removed",
+                "remove_indexes target must be exactly one index_removed preview release")
+        require(
+            retirement["phase"] == "indexes_removed"
+            and retirement["version"] == target_version,
+            "remove_indexes target must match the indexes_removed retirement",
+        )
+    else:
+        positive_integer(base_audit_release_id, "preview publication.base_audit_release_id")
+        require(base_audit_release_id != audit_release_id,
+                "publication audit and base audit Release IDs must differ")
+        require(not matching, "remove_payloads target must be absent from preview releases")
+        require(retirement["phase"] == "none",
+                "remove_payloads requires retirement.phase none")
+    return publication
+
+
 def validate_channels(root: Path) -> dict[str, Any]:
     channels = exact_fields(load_json(root / "manifests/channels.json"), CHANNEL_FIELDS, "channels manifest")
     require(channels["schema"] == CHANNELS_SCHEMA, f"channels schema must be {CHANNELS_SCHEMA}")
@@ -199,6 +288,8 @@ def validate_channels(root: Path) -> dict[str, Any]:
     else:
         raise ContractError("preview retirement.phase must be none or indexes_removed")
 
+    validate_publication(preview["publication"], releases, retirement)
+
     require(type(stable["enabled"]) is bool and stable["enabled"] is False,
             "stable publishing must remain disabled on GitHub Pages")
     require(stable["status"] == "object_storage_required",
@@ -207,8 +298,43 @@ def validate_channels(root: Path) -> dict[str, Any]:
     return channels
 
 
+def _key_timestamp(record: list[str], index: int, label: str, *, optional: bool = False) -> int | None:
+    require(len(record) > index, f"{label} omits its timestamp")
+    value = record[index]
+    if optional and value == "":
+        return None
+    require(value.isascii() and value.isdigit() and int(value) > 0,
+            f"{label} has an invalid timestamp")
+    return int(value)
+
+
+def _validate_sign_only(record: list[str], label: str) -> None:
+    capabilities = record[11] if len(record) > 11 else ""
+    require("s" in capabilities and not any(capability in capabilities for capability in "cea"),
+            f"{label} must be sign-only")
+
+
+def _validate_rpm_rsa_key(record: list[str], label: str) -> None:
+    require(
+        len(record) > 3 and record[3] == RPM_RSA_ALGORITHM,
+        f"{label} must use GnuPG public-key algorithm 1 (RSA)",
+    )
+    require(
+        len(record) > 2 and record[2] in RPM_RSA_BITS,
+        f"{label} RSA key must be exactly 3072 or 4096 bits",
+    )
+
+
 def validate_public_certificate(
-    path: Path, primary_fingerprint: str, signing_subkey_fingerprint: str
+    path: Path,
+    primary_fingerprint: str,
+    signing_subkeys: dict[str, Any],
+    *,
+    family: str,
+    minimum_valid_days: int,
+    rotation_begin_days: int,
+    maximum_lifetime_days: int,
+    now: int | None = None,
 ) -> None:
     try:
         contents = path.read_bytes()
@@ -243,8 +369,13 @@ def validate_public_certificate(
     require(not any(record[0] in {"sec", "ssb"} for record in records),
             f"{path.name} must not contain OpenPGP secret-key packets")
     keys = [record for record in records if record[0] in {"pub", "sub"}]
-    require([record[0] for record in keys] == ["pub", "sub"],
-            f"{path.name} must contain exactly one public primary and one public subkey")
+    expected_subkeys = [
+        signing_subkeys["current"],
+        signing_subkeys["next"],
+        *signing_subkeys["historical"],
+    ]
+    require([record[0] for record in keys] == ["pub"] + ["sub"] * len(expected_subkeys),
+            f"{path.name} public key topology does not match reviewed signing subkeys")
 
     fingerprints: list[tuple[str, str]] = []
     pending_type: str | None = None
@@ -257,19 +388,70 @@ def validate_public_certificate(
                     f"{path.name} contains an invalid OpenPGP fingerprint")
             fingerprints.append((pending_type, record[9]))
             pending_type = None
-    require(fingerprints == [
-        ("pub", primary_fingerprint),
-        ("sub", signing_subkey_fingerprint),
-    ], f"{path.name} fingerprints do not match the reviewed manifest")
+    require(fingerprints and fingerprints[0] == ("pub", primary_fingerprint),
+            f"{path.name} primary fingerprint does not match the reviewed manifest")
+    actual_subkey_fingerprints = [fingerprint for record_type, fingerprint in fingerprints[1:]
+                                  if record_type == "sub"]
+    require(len(actual_subkey_fingerprints) == len(expected_subkeys)
+            and set(actual_subkey_fingerprints) == set(expected_subkeys),
+            f"{path.name} subkey fingerprints do not match the reviewed manifest")
 
     # GnuPG appends uppercase aggregate capabilities from subkeys to the
     # primary record. Lowercase letters describe the packet's own capability.
     primary_capabilities = keys[0][11] if len(keys[0]) > 11 else ""
-    subkey_capabilities = keys[1][11] if len(keys[1]) > 11 else ""
     require("c" in primary_capabilities and not any(capability in primary_capabilities for capability in "sea"),
             f"{path.name} primary key must be certify-only")
-    require("s" in subkey_capabilities and not any(capability in subkey_capabilities for capability in "cea"),
-            f"{path.name} reviewed subkey must be sign-only")
+    if family == "rpm":
+        _validate_rpm_rsa_key(keys[0], f"{path.name} primary key")
+    current_time = int(time.time()) if now is None else now
+    minimum_seconds = minimum_valid_days * 86400
+    maximum_seconds = maximum_lifetime_days * 86400
+    runway_seconds = rotation_begin_days * 86400
+    subkey_records = dict(zip(actual_subkey_fingerprints, keys[1:], strict=True))
+    for fingerprint, record in subkey_records.items():
+        _validate_sign_only(record, f"{path.name} subkey {fingerprint}")
+        if family == "rpm":
+            _validate_rpm_rsa_key(record, f"{path.name} subkey {fingerprint}")
+        created = _key_timestamp(record, 5, f"{path.name} subkey {fingerprint}")
+        expires = _key_timestamp(record, 6, f"{path.name} subkey {fingerprint}", optional=True)
+        assert created is not None
+        require(expires is not None, f"{path.name} subkey {fingerprint} must expire")
+        require(expires - created <= maximum_seconds,
+                f"{path.name} subkey {fingerprint} lifetime exceeds reviewed policy")
+
+    current = subkey_records[signing_subkeys["current"]]
+    current_created = _key_timestamp(current, 5, f"{path.name} current signing subkey")
+    current_expires = _key_timestamp(current, 6, f"{path.name} current signing subkey", optional=True)
+    assert current_created is not None and current_expires is not None
+    require(current[1] not in {"d", "e", "i", "r"} and current_created <= current_time,
+            f"{path.name} current signing subkey is not usable")
+    require(current_expires - current_time >= minimum_seconds,
+            f"{path.name} current signing subkey has less than required validity")
+
+    successor = subkey_records[signing_subkeys["next"]]
+    successor_created = _key_timestamp(successor, 5, f"{path.name} next signing subkey")
+    successor_expires = _key_timestamp(successor, 6, f"{path.name} next signing subkey", optional=True)
+    assert successor_created is not None and successor_expires is not None
+    require(successor[1] not in {"d", "e", "r"},
+            f"{path.name} next signing subkey is disabled, expired, or revoked")
+    require(successor[1] != "i" or successor_created > current_time,
+            f"{path.name} next signing subkey is invalid")
+    require(successor_expires >= current_expires + runway_seconds,
+            f"{path.name} next signing subkey does not extend the rotation runway")
+
+    for fingerprint in signing_subkeys["historical"]:
+        record = subkey_records[fingerprint]
+        created = _key_timestamp(
+            record, 5, f"{path.name} historical subkey {fingerprint}"
+        )
+        expires = _key_timestamp(record, 6, f"{path.name} historical subkey {fingerprint}", optional=True)
+        assert created is not None and expires is not None
+        require(record[1] not in {"d", "i"}
+                and "D" not in (record[11] if len(record) > 11 else "")
+                and created <= current_time,
+                f"{path.name} historical signing subkey is not a former usable current")
+        require(expires <= current_expires,
+                f"{path.name} historical signing subkey expires after the current subkey")
 
 
 def validate_signing(root: Path) -> dict[str, Any]:
@@ -277,40 +459,60 @@ def validate_signing(root: Path) -> dict[str, Any]:
                            "preview signing manifest")
     require(signing["schema"] == SIGNING_SCHEMA, f"signing schema must be {SIGNING_SCHEMA}")
     require(type(signing["enabled"]) is bool, "signing.enabled must be boolean")
-    require(signing["environment"] == SIGNING_ENVIRONMENT,
-            f"signing.environment must be {SIGNING_ENVIRONMENT}")
     require(signing["minimum_valid_days"] == 30, "minimum_valid_days must remain 30")
     require(signing["rotation_begin_days"] == 45, "rotation_begin_days must remain 45")
     require(signing["maximum_subkey_lifetime_days"] == 180,
             "maximum_subkey_lifetime_days must remain 180")
 
     fingerprints: list[str] = []
-    certificates: list[tuple[Path, str, str]] = []
+    certificates: list[tuple[str, Path, str, dict[str, Any]]] = []
     expected = {
         "apt": (
+            "native-package-preview-apt-signing",
             "keys/apt-preview.asc",
             "WK_APT_PREVIEW_SECRET_SUBKEY_B64",
             "WK_APT_PREVIEW_PASSPHRASE",
         ),
         "rpm": (
+            "native-package-preview-rpm-signing",
             "keys/rpm-preview.asc",
             "WK_RPM_PREVIEW_SECRET_SUBKEY_B64",
             "WK_RPM_PREVIEW_PASSPHRASE",
         ),
     }
-    for family, (public_key, secret_env, passphrase_env) in expected.items():
+    for family, (environment, public_key, secret_env, passphrase_env) in expected.items():
         key = exact_fields(signing[family], KEY_FIELDS, f"signing.{family}")
+        require(key["environment"] == environment,
+                f"signing.{family}.environment must be {environment}")
         require(key["public_key"] == public_key, f"signing.{family}.public_key must be {public_key}")
         require(key["secret_subkey_env"] == secret_env,
                 f"signing.{family}.secret_subkey_env must be {secret_env}")
         require(key["passphrase_env"] == passphrase_env,
                 f"signing.{family}.passphrase_env must be {passphrase_env}")
         if signing["enabled"]:
-            for field in ("primary_fingerprint", "signing_subkey_fingerprint"):
-                value = key[field]
+            primary = key["primary_fingerprint"]
+            require(isinstance(primary, str) and UPPER_FINGERPRINT.fullmatch(primary),
+                    f"signing.{family}.primary_fingerprint must be an uppercase 40-hex fingerprint")
+            subkeys = exact_fields(key["signing_subkeys"], SIGNING_SUBKEY_FIELDS,
+                                   f"signing.{family}.signing_subkeys")
+            for field in ("current", "next"):
+                value = subkeys[field]
                 require(isinstance(value, str) and UPPER_FINGERPRINT.fullmatch(value),
-                        f"signing.{family}.{field} must be an uppercase 40-hex fingerprint")
-                fingerprints.append(value)
+                        f"signing.{family}.signing_subkeys.{field} must be an uppercase 40-hex fingerprint")
+            historical = subkeys["historical"]
+            require(isinstance(historical, list),
+                    f"signing.{family}.signing_subkeys.historical must be an array")
+            require(all(isinstance(value, str) and UPPER_FINGERPRINT.fullmatch(value)
+                        for value in historical),
+                    f"signing.{family}.signing_subkeys.historical must contain uppercase fingerprints")
+            require(len(historical) == len(set(historical)),
+                    f"signing.{family}.signing_subkeys.historical must not contain duplicates")
+            require(historical == sorted(historical),
+                    f"signing.{family}.signing_subkeys.historical must be sorted")
+            family_fingerprints = [primary, subkeys["current"], subkeys["next"], *historical]
+            require(len(family_fingerprints) == len(set(family_fingerprints)),
+                    f"signing.{family} fingerprints must all be distinct")
+            fingerprints.extend(family_fingerprints)
             key_path = root / public_key
             try:
                 key_mode = key_path.lstat()
@@ -319,17 +521,25 @@ def validate_signing(root: Path) -> dict[str, Any]:
             require(stat.S_ISREG(key_mode.st_mode) and key_mode.st_nlink == 1,
                     f"{public_key} must be a single-link regular file")
             certificates.append((
+                family,
                 key_path,
-                key["primary_fingerprint"],
-                key["signing_subkey_fingerprint"],
+                primary,
+                subkeys,
             ))
         else:
-            require(key["primary_fingerprint"] is None and key["signing_subkey_fingerprint"] is None,
-                    f"signing.{family} fingerprints must be null while signing is disabled")
+            subkeys = exact_fields(key["signing_subkeys"], SIGNING_SUBKEY_FIELDS,
+                                   f"signing.{family}.signing_subkeys")
+            require(key["primary_fingerprint"] is None
+                    and subkeys == {"current": None, "next": None, "historical": []},
+                    f"signing.{family} fingerprints must be empty while signing is disabled")
 
     if signing["enabled"]:
-        require(len(set(fingerprints)) == 4,
-                "APT and RPM primary and signing-subkey fingerprints must all be distinct")
+        require(len(set(fingerprints)) == len(fingerprints),
+                "APT and RPM signing fingerprints must all be distinct")
+        require(len({value[-16:] for value in fingerprints}) == len(fingerprints),
+                "APT and RPM signing fingerprints must have globally distinct 16-hex key IDs")
+        require(len({value[-8:] for value in fingerprints}) == len(fingerprints),
+                "APT and RPM signing fingerprints must have globally distinct 8-hex key IDs")
         expected_key_files = {"README.md", "apt-preview.asc", "rpm-preview.asc"}
     else:
         expected_key_files = {"README.md"}
@@ -340,9 +550,50 @@ def validate_signing(root: Path) -> dict[str, Any]:
         metadata = path.lstat()
         require(stat.S_ISREG(metadata.st_mode) and metadata.st_nlink == 1,
                 f"keys/{name} must be a single-link regular file")
-    for path, primary_fingerprint, signing_subkey_fingerprint in certificates:
-        validate_public_certificate(path, primary_fingerprint, signing_subkey_fingerprint)
+    for family, path, primary_fingerprint, signing_subkeys in certificates:
+        validate_public_certificate(
+            path,
+            primary_fingerprint,
+            signing_subkeys,
+            family=family,
+            minimum_valid_days=signing["minimum_valid_days"],
+            rotation_begin_days=signing["rotation_begin_days"],
+            maximum_lifetime_days=signing["maximum_subkey_lifetime_days"],
+        )
     return signing
+
+
+def validate_signing_toolchain(root: Path) -> dict[str, Any]:
+    toolchain = exact_fields(
+        load_json(root / "manifests/signing-toolchain.json"),
+        SIGNING_TOOLCHAIN_FIELDS,
+        "signing toolchain manifest",
+    )
+    require(
+        toolchain["schema"] == SIGNING_TOOLCHAIN_SCHEMA,
+        f"signing toolchain schema must be {SIGNING_TOOLCHAIN_SCHEMA}",
+    )
+    require(type(toolchain["enabled"]) is bool,
+            "signing toolchain.enabled must be boolean")
+    require(toolchain["image"] == SIGNING_TOOLCHAIN_IMAGE,
+            f"signing toolchain.image must be {SIGNING_TOOLCHAIN_IMAGE}")
+    if toolchain["enabled"]:
+        require(
+            isinstance(toolchain["digest"], str)
+            and re.fullmatch(r"sha256:[0-9a-f]{64}", toolchain["digest"]),
+            "enabled signing toolchain.digest must be sha256:<64 lowercase hex>",
+        )
+        require(
+            isinstance(toolchain["workflow_sha"], str)
+            and LOWER_SHA.fullmatch(toolchain["workflow_sha"]),
+            "enabled signing toolchain.workflow_sha must be a lowercase 40-hex commit",
+        )
+    else:
+        require(
+            toolchain["digest"] is None and toolchain["workflow_sha"] is None,
+            "disabled signing toolchain requires null digest and workflow_sha",
+        )
+    return toolchain
 
 
 def validate_toolchain(root: Path) -> dict[str, Any]:
@@ -433,6 +684,40 @@ def validate_tracked_inputs(root: Path) -> None:
 
 
 def validate_bootstrap_site(root: Path, channels: dict[str, Any], signing: dict[str, Any]) -> None:
+    preview = channels["channels"]["preview"]
+    retirement = preview["retirement"]
+    publication = preview["publication"]
+    if not signing["enabled"]:
+        require(
+            not preview["enabled"]
+            and preview["status"] == "signing_not_provisioned"
+            and preview["releases"] == [],
+            "disabled signing requires a disabled signing_not_provisioned preview with no releases",
+        )
+        require(
+            retirement["phase"] == "none" and publication["operation"] == "none",
+            "disabled signing forbids retirement and publication operations",
+        )
+    elif not preview["enabled"]:
+        require(
+            preview["status"] == "awaiting_first_release" and preview["releases"] == [],
+            "provisioned signing with disabled preview requires awaiting_first_release "
+            "and no releases",
+        )
+        require(
+            retirement["phase"] == "none" and publication["operation"] == "none",
+            "awaiting_first_release forbids retirement and publication operations",
+        )
+    else:
+        require(
+            preview["status"] == "ready" and bool(preview["releases"]),
+            "enabled preview requires ready status and at least one release",
+        )
+        require(
+            any(release["state"] == "active" for release in preview["releases"]),
+            "enabled preview requires at least one active release",
+        )
+
     site = root / "site"
     files = sorted(path.relative_to(site).as_posix() for path in site.rglob("*") if path.is_file())
     require(files == ["index.html", "status.json"],
@@ -443,18 +728,10 @@ def validate_bootstrap_site(root: Path, channels: dict[str, Any], signing: dict[
         "schema": "wukongim.native_package_repository_status/v1",
         "apt": False,
         "rpm": False,
-        "reason": "signing_not_provisioned",
-    }, "bootstrap status must remain signing_not_provisioned")
+        "reason": preview["status"],
+    }, "bootstrap status must match the reviewed preview status")
     total = sum((site / relative).stat().st_size for relative in files)
     require(total <= channels["site_limit_bytes"], "bootstrap site exceeds the hard Pages limit")
-
-    preview = channels["channels"]["preview"]
-    if signing["enabled"]:
-        require(preview["enabled"] and preview["status"] == "ready" and preview["releases"],
-                "enabled signing requires an enabled, ready preview channel with a release")
-    else:
-        require(not preview["enabled"] and preview["status"] == "signing_not_provisioned",
-                "disabled signing requires a disabled signing_not_provisioned preview channel")
 
 
 def parse_args() -> argparse.Namespace:
@@ -471,6 +748,7 @@ def main() -> int:
         validate_tracked_inputs(root)
         channels = validate_channels(root)
         signing = validate_signing(root)
+        validate_signing_toolchain(root)
         validate_toolchain(root)
         validate_source_read(root)
         validate_bootstrap_site(root, channels, signing)

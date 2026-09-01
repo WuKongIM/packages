@@ -7,6 +7,7 @@ import subprocess
 import sys
 import unittest
 from contextlib import contextmanager
+from functools import lru_cache
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any, Iterator
@@ -19,18 +20,38 @@ VALIDATOR = ROOT / "scripts" / "validate-control.py"
 def preview_release(
     *,
     version: str = "3.1.0-rc.1",
+    source_sha: str = "1" * 40,
+    source_release_id: int = 1001,
+    package_release_id: int = 2001,
+    deb_sha256: str = "2" * 64,
+    rpm_sha256: str = "3" * 64,
     state: str = "active",
     not_before: str | None = None,
 ) -> dict[str, Any]:
     return {
         "version": version,
-        "source_sha": "1" * 40,
-        "source_release_id": 1001,
-        "package_release_id": 2001,
-        "deb_sha256": "2" * 64,
-        "rpm_sha256": "3" * 64,
+        "source_sha": source_sha,
+        "source_release_id": source_release_id,
+        "package_release_id": package_release_id,
+        "deb_sha256": deb_sha256,
+        "rpm_sha256": rpm_sha256,
         "state": state,
         "not_before": not_before,
+    }
+
+
+def publication(
+    operation: str = "none",
+    *,
+    audit_release_id: int | None = None,
+    base_audit_release_id: int | None = None,
+    target_version: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "audit_release_id": audit_release_id,
+        "base_audit_release_id": base_audit_release_id,
+        "operation": operation,
+        "target_version": target_version,
     }
 
 
@@ -54,6 +75,37 @@ def write_manifest(root: Path, name: str, value: dict[str, Any]) -> None:
     )
 
 
+def write_bootstrap_reason(root: Path, reason: str) -> None:
+    status = json.loads((root / "site" / "status.json").read_text(encoding="utf-8"))
+    status["reason"] = reason
+    (root / "site" / "status.json").write_text(
+        json.dumps(status, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
+def configure_ready_preview(
+    root: Path,
+    releases: list[dict[str, Any]],
+    requested_publication: dict[str, Any],
+    *,
+    retirement: dict[str, Any] | None = None,
+) -> None:
+    channels = load_manifest(root, "channels.json")
+    preview = channels["channels"]["preview"]
+    preview["enabled"] = True
+    preview["status"] = "ready"
+    preview["releases"] = releases
+    preview["publication"] = requested_publication
+    preview["retirement"] = retirement or {
+        "phase": "none",
+        "version": None,
+        "not_before": None,
+    }
+    write_manifest(root, "channels.json", channels)
+    write_bootstrap_reason(root, "ready")
+
+
 def run_gpg(home: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [
@@ -74,16 +126,20 @@ def run_gpg(home: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
     )
 
 
+@lru_cache(maxsize=None)
 def generate_signing_certificate(
     family: str,
     *,
+    key_algorithm: str,
     subkey_usage: str = "sign",
-) -> tuple[str, str, str, str]:
+    next_expiration: str = "180d",
+    historical_expiration: str | None = None,
+) -> tuple[str, str, str, str | None, str, str]:
     with TemporaryDirectory() as temporary:
         home = Path(temporary)
         os.chmod(home, 0o700)
         identity = f"WuKongIM {family.upper()} Preview Test <{family}@example.invalid>"
-        run_gpg(home, "--quick-generate-key", identity, "rsa2048", "cert", "90d")
+        run_gpg(home, "--quick-generate-key", identity, key_algorithm, "cert", "90d")
         initial = run_gpg(home, "--with-colons", "--fingerprint", identity)
         primary_fingerprint = next(
             line.split(":")[9]
@@ -94,10 +150,27 @@ def generate_signing_certificate(
             home,
             "--quick-add-key",
             primary_fingerprint,
-            "rsa2048",
+            key_algorithm,
             subkey_usage,
             "90d",
         )
+        run_gpg(
+            home,
+            "--quick-add-key",
+            primary_fingerprint,
+            key_algorithm,
+            "sign",
+            next_expiration,
+        )
+        if historical_expiration is not None:
+            run_gpg(
+                home,
+                "--quick-add-key",
+                primary_fingerprint,
+                key_algorithm,
+                "sign",
+                historical_expiration,
+            )
         listing = run_gpg(
             home,
             "--with-colons",
@@ -110,39 +183,66 @@ def generate_signing_certificate(
             for line in listing.stdout.splitlines()
             if line.startswith("fpr:")
         ]
-        if len(fingerprints) != 2:
-            raise AssertionError(f"expected primary and subkey fingerprints: {listing.stdout}")
+        expected_count = 4 if historical_expiration is not None else 3
+        if len(fingerprints) != expected_count:
+            raise AssertionError(
+                f"expected primary and reviewed subkey fingerprints: {listing.stdout}"
+            )
         public_certificate = run_gpg(home, "--armor", "--export", primary_fingerprint).stdout
         secret_certificate = run_gpg(
             home, "--armor", "--export-secret-keys", primary_fingerprint
         ).stdout
-        return fingerprints[0], fingerprints[1], public_certificate, secret_certificate
+        historical = fingerprints[3] if historical_expiration is not None else None
+        return (
+            fingerprints[0], fingerprints[1], fingerprints[2], historical,
+            public_certificate, secret_certificate,
+        )
 
 
 def enable_signing(
     root: Path,
     *,
     apt_subkey_usage: str = "sign",
+    apt_next_expiration: str = "180d",
+    apt_historical_expiration: str | None = None,
+    rpm_key_algorithm: str = "rsa3072",
+    preview_ready: bool = False,
 ) -> dict[str, str]:
     channels = load_manifest(root, "channels.json")
     preview = channels["channels"]["preview"]
-    preview["enabled"] = True
-    preview["status"] = "ready"
-    preview["releases"] = [preview_release()]
+    preview["enabled"] = preview_ready
+    preview["status"] = "ready" if preview_ready else "awaiting_first_release"
+    preview["releases"] = [preview_release()] if preview_ready else []
+    if preview_ready:
+        preview["publication"] = publication(
+            "add_release",
+            audit_release_id=2001,
+            target_version="3.1.0-rc.1",
+        )
     write_manifest(root, "channels.json", channels)
+    write_bootstrap_reason(root, preview["status"])
 
     signing = load_manifest(root, "preview-signing.json")
     signing["enabled"] = True
     secret_certificates: dict[str, str] = {}
     for family in ("apt", "rpm"):
-        primary, subkey, public_certificate, secret_certificate = (
+        primary, current, next_subkey, historical, public_certificate, secret_certificate = (
             generate_signing_certificate(
                 family,
+                key_algorithm="rsa2048" if family == "apt" else rpm_key_algorithm,
                 subkey_usage=apt_subkey_usage if family == "apt" else "sign",
+                next_expiration=apt_next_expiration if family == "apt" else "180d",
+                historical_expiration=(
+                    apt_historical_expiration if family == "apt" else None
+                ),
             )
         )
         signing[family]["primary_fingerprint"] = primary
-        signing[family]["signing_subkey_fingerprint"] = subkey
+        signing[family]["signing_subkeys"] = {
+            "current": current,
+            "next": next_subkey,
+            "historical": [historical] if historical is not None else [],
+        }
         (root / signing[family]["public_key"]).write_text(
             public_certificate,
             encoding="ascii",
@@ -203,13 +303,22 @@ class ValidateControlTest(unittest.TestCase):
             preview["enabled"] = True
             preview["status"] = "ready"
             preview["releases"] = [preview_release()]
+            preview["publication"] = publication(
+                "add_release",
+                audit_release_id=2001,
+                target_version="3.1.0-rc.1",
+            )
             write_manifest(root, "channels.json", channels)
 
             signing = load_manifest(root, "preview-signing.json")
             signing["enabled"] = True
             for family in ("apt", "rpm"):
                 signing[family]["primary_fingerprint"] = "A" * 40
-                signing[family]["signing_subkey_fingerprint"] = "A" * 40
+                signing[family]["signing_subkeys"] = {
+                    "current": "A" * 40,
+                    "next": "A" * 40,
+                    "historical": [],
+                }
                 (root / signing[family]["public_key"]).write_text(
                     f"{family} public key fixture\n",
                     encoding="utf-8",
@@ -218,7 +327,7 @@ class ValidateControlTest(unittest.TestCase):
 
             self.assert_rejected(
                 root,
-                "APT and RPM primary and signing-subkey fingerprints must all be distinct",
+                "signing.apt fingerprints must all be distinct",
             )
 
     def test_rejects_extra_binary_key_file_while_signing_is_disabled(self) -> None:
@@ -255,6 +364,52 @@ class ValidateControlTest(unittest.TestCase):
             self.assertEqual(0, result.returncode, result.stderr)
             self.assertIn("publication control validation passed", result.stdout)
 
+    def test_rejects_non_rsa_rpm_public_certificate(self) -> None:
+        with copied_control_root() as root:
+            enable_signing(root, rpm_key_algorithm="ed25519")
+
+            self.assert_rejected(root, "public-key algorithm 1 (RSA)")
+
+    def test_rejects_rsa2048_rpm_public_certificate(self) -> None:
+        with copied_control_root() as root:
+            enable_signing(root, rpm_key_algorithm="rsa2048")
+
+            self.assert_rejected(root, "RSA key must be exactly 3072 or 4096 bits")
+
+    def test_accepts_ready_preview_after_signing_is_provisioned(self) -> None:
+        with copied_control_root() as root:
+            enable_signing(root, preview_ready=True)
+
+            result = self.run_validator(root)
+
+            self.assertEqual(0, result.returncode, result.stderr)
+
+    def test_rejects_shared_or_renamed_signing_environment(self) -> None:
+        cases = (
+            ("apt", "native-package-preview-signing"),
+            ("rpm", "native-package-preview-apt-signing"),
+        )
+        for family, environment in cases:
+            with self.subTest(family=family), copied_control_root() as root:
+                signing = load_manifest(root, "preview-signing.json")
+                signing[family]["environment"] = environment
+                write_manifest(root, "preview-signing.json", signing)
+
+                self.assert_rejected(
+                    root,
+                    f"signing.{family}.environment must be native-package-preview-{family}-signing",
+                )
+
+    def test_rejects_bootstrap_reason_that_does_not_match_preview_state(self) -> None:
+        with copied_control_root() as root:
+            enable_signing(root)
+            write_bootstrap_reason(root, "signing_not_provisioned")
+
+            self.assert_rejected(
+                root,
+                "bootstrap status must match the reviewed preview status",
+            )
+
     def test_rejects_secret_key_packets_disguised_as_public_certificate(self) -> None:
         with copied_control_root() as root:
             secret_certificates = enable_signing(root)
@@ -279,8 +434,41 @@ class ValidateControlTest(unittest.TestCase):
 
             self.assert_rejected(
                 root,
-                "apt-preview.asc reviewed subkey must be sign-only",
+                "must be sign-only",
             )
+
+    def test_rejects_next_subkey_without_rotation_runway(self) -> None:
+        with copied_control_root() as root:
+            enable_signing(root, apt_next_expiration="100d")
+
+            self.assert_rejected(
+                root,
+                "next signing subkey does not extend the rotation runway",
+            )
+
+    def test_accepts_still_valid_former_current_as_historical(self) -> None:
+        with copied_control_root() as root:
+            enable_signing(root, apt_historical_expiration="60d")
+
+            result = self.run_validator(root)
+
+            self.assertEqual(0, result.returncode, result.stderr)
+
+    def test_rejects_historical_subkey_that_expires_after_current(self) -> None:
+        with copied_control_root() as root:
+            enable_signing(root, apt_historical_expiration="120d")
+
+            self.assert_rejected(root, "historical signing subkey expires after the current")
+
+    def test_rejects_distinct_fingerprints_with_colliding_key_ids(self) -> None:
+        with copied_control_root() as root:
+            enable_signing(root)
+            signing = load_manifest(root, "preview-signing.json")
+            apt_current = signing["apt"]["signing_subkeys"]["current"]
+            signing["rpm"]["signing_subkeys"]["next"] = "0" * 24 + apt_current[-16:]
+            write_manifest(root, "preview-signing.json", signing)
+
+            self.assert_rejected(root, "globally distinct 16-hex key IDs")
 
     def test_rejects_inconsistent_second_stage_retirement_fields(self) -> None:
         removed_at = "2026-10-01T00:00:00Z"
@@ -303,6 +491,204 @@ class ValidateControlTest(unittest.TestCase):
                 preview["retirement"][field] = value
                 write_manifest(root, "channels.json", channels)
 
+                self.assert_rejected(root, diagnostic)
+
+    def test_accepts_each_reviewed_publication_operation_shape(self) -> None:
+        removed_at = "2026-10-01T00:00:00Z"
+        first = preview_release()
+        second = preview_release(
+            version="3.1.0-rc.2",
+            source_sha="4" * 40,
+            source_release_id=1002,
+            package_release_id=2002,
+            deb_sha256="5" * 64,
+            rpm_sha256="6" * 64,
+        )
+        removed_first = {**first, "state": "index_removed", "not_before": removed_at}
+        cases = (
+            (
+                "add_first_release",
+                [first],
+                publication(
+                    "add_release",
+                    audit_release_id=2001,
+                    target_version="3.1.0-rc.1",
+                ),
+                None,
+            ),
+            (
+                "add_later_release",
+                [first, second],
+                publication(
+                    "add_release",
+                    audit_release_id=2002,
+                    base_audit_release_id=2001,
+                    target_version="3.1.0-rc.2",
+                ),
+                None,
+            ),
+            (
+                "remove_indexes",
+                [removed_first, second],
+                publication(
+                    "remove_indexes",
+                    audit_release_id=3001,
+                    base_audit_release_id=2002,
+                    target_version="3.1.0-rc.1",
+                ),
+                {
+                    "phase": "indexes_removed",
+                    "version": "3.1.0-rc.1",
+                    "not_before": removed_at,
+                },
+            ),
+            (
+                "remove_payloads",
+                [second],
+                publication(
+                    "remove_payloads",
+                    audit_release_id=3002,
+                    base_audit_release_id=3001,
+                    target_version="3.1.0-rc.1",
+                ),
+                None,
+            ),
+        )
+        with copied_control_root() as root:
+            enable_signing(root)
+            for name, releases, requested_publication, retirement in cases:
+                with self.subTest(operation=name):
+                    configure_ready_preview(
+                        root,
+                        releases,
+                        requested_publication,
+                        retirement=retirement,
+                    )
+                    result = self.run_validator(root)
+                    self.assertEqual(0, result.returncode, result.stderr)
+
+    def test_rejects_malformed_publication_operations(self) -> None:
+        removed_at = "2026-10-01T00:00:00Z"
+        first = preview_release()
+        second = preview_release(
+            version="3.1.0-rc.2",
+            source_sha="4" * 40,
+            source_release_id=1002,
+            package_release_id=2002,
+            deb_sha256="5" * 64,
+            rpm_sha256="6" * 64,
+        )
+        removed_first = {**first, "state": "index_removed", "not_before": removed_at}
+        indexed_retirement = {
+            "phase": "indexes_removed",
+            "version": "3.1.0-rc.1",
+            "not_before": removed_at,
+        }
+        cases = (
+            (
+                "none_with_release",
+                [first],
+                publication(),
+                None,
+                "publication none requires no releases or retirement",
+            ),
+            (
+                "none_with_id",
+                [first],
+                publication(audit_release_id=2001),
+                None,
+                "publication none requires null",
+            ),
+            (
+                "first_add_with_base",
+                [first],
+                publication(
+                    "add_release",
+                    audit_release_id=2001,
+                    base_audit_release_id=1999,
+                    target_version="3.1.0-rc.1",
+                ),
+                None,
+                "first add_release requires a null base_audit_release_id",
+            ),
+            (
+                "add_with_wrong_audit",
+                [first],
+                publication(
+                    "add_release",
+                    audit_release_id=2999,
+                    target_version="3.1.0-rc.1",
+                ),
+                None,
+                "audit_release_id must match the target package_release_id",
+            ),
+            (
+                "later_add_without_base",
+                [first, second],
+                publication(
+                    "add_release",
+                    audit_release_id=2002,
+                    target_version="3.1.0-rc.2",
+                ),
+                None,
+                "base_audit_release_id must be a positive integer",
+            ),
+            (
+                "remove_indexes_wrong_target",
+                [removed_first, second],
+                publication(
+                    "remove_indexes",
+                    audit_release_id=3001,
+                    base_audit_release_id=2002,
+                    target_version="3.1.0-rc.2",
+                ),
+                indexed_retirement,
+                "remove_indexes target must be exactly one index_removed preview release",
+            ),
+            (
+                "remove_payloads_still_present",
+                [first, second],
+                publication(
+                    "remove_payloads",
+                    audit_release_id=3002,
+                    base_audit_release_id=3001,
+                    target_version="3.1.0-rc.1",
+                ),
+                None,
+                "remove_payloads target must be absent from preview releases",
+            ),
+            (
+                "reused_audit_id",
+                [second],
+                publication(
+                    "remove_payloads",
+                    audit_release_id=3001,
+                    base_audit_release_id=3001,
+                    target_version="3.1.0-rc.1",
+                ),
+                None,
+                "publication audit and base audit Release IDs must differ",
+            ),
+            (
+                "invalid_target_version",
+                [first],
+                publication(
+                    "add_release",
+                    audit_release_id=2001,
+                    target_version="v3.1.0-rc.1",
+                ),
+                None,
+                "target_version must be strict prerelease SemVer",
+            ),
+        )
+        for name, releases, requested_publication, retirement, diagnostic in cases:
+            with self.subTest(operation=name), copied_control_root() as root:
+                configure_ready_preview(
+                    root,
+                    releases,
+                    requested_publication,
+                    retirement=retirement,
+                )
                 self.assert_rejected(root, diagnostic)
 
     def test_rejects_extra_tracked_site_file(self) -> None:
@@ -332,6 +718,56 @@ class ValidateControlTest(unittest.TestCase):
             write_manifest(root, "channels.json", channels)
 
             self.assert_rejected(root, "stable publishing must remain disabled on GitHub Pages")
+
+    def test_accepts_digest_pinned_signing_toolchain(self) -> None:
+        with copied_control_root() as root:
+            toolchain = load_manifest(root, "signing-toolchain.json")
+            toolchain.update({
+                "enabled": True,
+                "digest": "sha256:" + "a" * 64,
+                "workflow_sha": "b" * 40,
+            })
+            write_manifest(root, "signing-toolchain.json", toolchain)
+
+            result = self.run_validator(root)
+
+            self.assertEqual(0, result.returncode, result.stderr)
+
+    def test_rejects_unreviewed_signing_toolchain_controls(self) -> None:
+        cases = (
+            (
+                "renamed_image",
+                {"image": "ghcr.io/wukongim/other"},
+                "signing toolchain.image must be ghcr.io/wukongim/native-package-signing-toolchain",
+            ),
+            (
+                "disabled_with_digest",
+                {"digest": "sha256:" + "a" * 64},
+                "disabled signing toolchain requires null digest and workflow_sha",
+            ),
+            (
+                "enabled_without_digest",
+                {"enabled": True, "workflow_sha": "b" * 40},
+                "enabled signing toolchain.digest must be sha256:<64 lowercase hex>",
+            ),
+            (
+                "enabled_with_tag_like_digest",
+                {"enabled": True, "digest": "latest", "workflow_sha": "b" * 40},
+                "enabled signing toolchain.digest must be sha256:<64 lowercase hex>",
+            ),
+            (
+                "enabled_without_workflow_sha",
+                {"enabled": True, "digest": "sha256:" + "a" * 64},
+                "enabled signing toolchain.workflow_sha must be a lowercase 40-hex commit",
+            ),
+        )
+        for name, changes, diagnostic in cases:
+            with self.subTest(case=name), copied_control_root() as root:
+                toolchain = load_manifest(root, "signing-toolchain.json")
+                toolchain.update(changes)
+                write_manifest(root, "signing-toolchain.json", toolchain)
+
+                self.assert_rejected(root, diagnostic)
 
 
 if __name__ == "__main__":
