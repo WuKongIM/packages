@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MANIFEST="$ROOT_DIR/manifests/channels.json"
+AUDIT_ACCESS_MANIFEST="$ROOT_DIR/manifests/audit-access.json"
 WORKFLOW="$ROOT_DIR/.github/workflows/pages.yml"
 DRILL_WORKFLOW="$ROOT_DIR/.github/workflows/native-package-repository-drill.yml"
 SOURCE_PREFLIGHT="$ROOT_DIR/.github/workflows/source-release-preflight.yml"
@@ -22,6 +23,27 @@ jq -e '
   .max_online_versions == 4 and
   .architectures == ["amd64"]
 ' "$MANIFEST" >/dev/null
+
+jq -e '
+  .schema == "wukongim.native_package_audit_access/v1" and
+  (.enabled | type) == "boolean" and
+  .reader == {
+    environment: "native-package-preview-audit-read",
+    app_client_id_secret: "WK_PACKAGE_AUDIT_READER_APP_CLIENT_ID",
+    app_private_key_secret: "WK_PACKAGE_AUDIT_READER_APP_PRIVATE_KEY",
+    owner: "WuKongIM",
+    repositories: ["packages"],
+    permissions: {administration: "read"}
+  } and
+  .writer == {
+    environment: "native-package-preview-audit",
+    app_client_id_secret: "WK_PACKAGE_PUBLISHER_APP_CLIENT_ID",
+    app_private_key_secret: "WK_PACKAGE_PUBLISHER_APP_PRIVATE_KEY",
+    owner: "WuKongIM",
+    repositories: ["packages"],
+    permissions: {administration: "read", contents: "write"}
+  }
+' "$AUDIT_ACCESS_MANIFEST" >/dev/null
 
 grep -Fq 'permissions: {}' "$WORKFLOW"
 grep -Fq 'pages: write' "$WORKFLOW"
@@ -115,6 +137,7 @@ PY
 grep -Fq 'concurrency:' "$AUDIT_DRAFT_WORKFLOW"
 grep -Fq 'group: packages-pages' "$AUDIT_DRAFT_WORKFLOW"
 grep -Fq 'cancel-in-progress: false' "$AUDIT_DRAFT_WORKFLOW"
+grep -Fq 'Validate reviewed audit access before credentials' "$AUDIT_DRAFT_WORKFLOW"
 grep -Fq 'environment: native-package-preview-audit' "$AUDIT_DRAFT_WORKFLOW"
 grep -Fq 'contents: write' "$AUDIT_DRAFT_WORKFLOW"
 grep -Fq 'actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1' "$AUDIT_DRAFT_WORKFLOW"
@@ -139,6 +162,7 @@ fi
 
 grep -Fq 'group: packages-pages' "$AUDIT_BIND_WORKFLOW"
 grep -Fq 'cancel-in-progress: false' "$AUDIT_BIND_WORKFLOW"
+grep -Fq 'Validate reviewed audit access before credentials' "$AUDIT_BIND_WORKFLOW"
 grep -Fq 'environment: native-package-preview-audit' "$AUDIT_BIND_WORKFLOW"
 grep -Fq 'contents: write' "$AUDIT_BIND_WORKFLOW"
 grep -Fq 'actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1' "$AUDIT_BIND_WORKFLOW"
@@ -166,24 +190,33 @@ fi
 
 grep -Fq 'group: packages-pages' "$PUBLISH_WORKFLOW"
 grep -Fq 'cancel-in-progress: false' "$PUBLISH_WORKFLOW"
+grep -Fq 'Validate reviewed audit access before credentials' "$PUBLISH_WORKFLOW"
 grep -Fq 'environment: native-package-preview-apt-signing' "$PUBLISH_WORKFLOW"
 grep -Fq 'environment: native-package-preview-rpm-signing' "$PUBLISH_WORKFLOW"
-grep -Fq 'environment: native-package-preview-audit' "$PUBLISH_WORKFLOW"
+grep -Eq '^[[:space:]]+environment: native-package-preview-audit-read$' "$PUBLISH_WORKFLOW"
+grep -Eq '^[[:space:]]+environment: native-package-preview-audit$' "$PUBLISH_WORKFLOW"
 grep -Fq 'environment: native-package-source-read' "$PUBLISH_WORKFLOW"
 grep -Fq 'name: github-pages' "$PUBLISH_WORKFLOW"
 grep -Fq 'actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1' "$PUBLISH_WORKFLOW"
 grep -Fq 'permission-contents: read' "$PUBLISH_WORKFLOW"
 grep -Fq 'permission-attestations: read' "$PUBLISH_WORKFLOW"
-if (( $(grep -cF 'client-id: ${{ secrets.WK_PACKAGE_PUBLISHER_APP_CLIENT_ID }}' "$PUBLISH_WORKFLOW") != 3 ||
-      $(grep -cF 'private-key: ${{ secrets.WK_PACKAGE_PUBLISHER_APP_PRIVATE_KEY }}' "$PUBLISH_WORKFLOW") != 3 ||
+if (( $(grep -cF 'client-id: ${{ secrets.WK_PACKAGE_AUDIT_READER_APP_CLIENT_ID }}' "$PUBLISH_WORKFLOW") != 2 ||
+      $(grep -cF 'private-key: ${{ secrets.WK_PACKAGE_AUDIT_READER_APP_PRIVATE_KEY }}' "$PUBLISH_WORKFLOW") != 2 ||
+      $(grep -cF 'environment: native-package-preview-audit-read' "$PUBLISH_WORKFLOW") != 2 ||
+      $(grep -cF 'IMMUTABLE_POLICY_TOKEN: ${{ steps.audit-reader-token.outputs.token }}' "$PUBLISH_WORKFLOW") != 2 ||
+      $(grep -cF 'client-id: ${{ secrets.WK_PACKAGE_PUBLISHER_APP_CLIENT_ID }}' "$PUBLISH_WORKFLOW") != 1 ||
+      $(grep -cF 'private-key: ${{ secrets.WK_PACKAGE_PUBLISHER_APP_PRIVATE_KEY }}' "$PUBLISH_WORKFLOW") != 1 ||
       $(grep -cF 'permission-administration: read' "$PUBLISH_WORKFLOW") != 3 ||
-      $(grep -cF 'GH_TOKEN: ${{ steps.publisher-token.outputs.token }}' "$PUBLISH_WORKFLOW") != 4 ||
-      $(grep -cF 'environment: native-package-preview-audit' "$PUBLISH_WORKFLOW") != 3 )); then
-  echo 'publisher audit control, writer, and replay jobs must use scoped package App tokens' >&2
+      $(grep -cF 'GH_TOKEN: ${{ steps.publisher-token.outputs.token }}' "$PUBLISH_WORKFLOW") != 2 ||
+      $(grep -cE '^[[:space:]]+environment: native-package-preview-audit$' "$PUBLISH_WORKFLOW") != 1 )); then
+  echo 'publisher reader and writer jobs must use isolated package App credentials' >&2
   exit 1
 fi
+grep -Fq 'WK_PACKAGE_AUDIT_READER_APP_CLIENT_ID' "$ROOT_DIR/docs/release-contract.md"
 grep -Fq 'WK_PACKAGE_PUBLISHER_APP_CLIENT_ID' "$ROOT_DIR/docs/release-contract.md"
+grep -Fq 'Administration read permission only' "$ROOT_DIR/docs/release-contract.md"
 grep -Fq 'Administration read and Contents' "$ROOT_DIR/docs/release-contract.md"
+grep -Fq 'distinct private keys' "$ROOT_DIR/docs/release-contract.md"
 grep -Fq 'verify-production-package-site.py' "$PUBLISH_WORKFLOW"
 grep -Fq 'validate-production-package-clients.py' "$PUBLISH_WORKFLOW"
 grep -Fq 'seal-audit-release.py' "$PUBLISH_WORKFLOW"
@@ -220,21 +253,176 @@ if (( resolve_count == 0 || resolve_count != exact_tag_count )); then
   exit 1
 fi
 
-python3 - "$PUBLISH_WORKFLOW" <<'PY'
+python3 - "$ROOT_DIR/.github/workflows" "$PUBLISH_WORKFLOW" <<'PY'
 import pathlib
 import re
 import sys
 
-text = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
-jobs = {}
-current = None
-for line in text.splitlines():
-    match = re.match(r"^  ([a-zA-Z0-9_-]+):$", line)
-    if match:
-        current = match.group(1)
-        jobs[current] = []
-    elif current is not None:
-        jobs[current].append(line)
+workflow_root = pathlib.Path(sys.argv[1])
+publish_path = pathlib.Path(sys.argv[2])
+
+
+def parse_jobs(path):
+    jobs = {}
+    current = None
+    in_jobs = False
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if line == "jobs:":
+            in_jobs = True
+            continue
+        if not in_jobs:
+            continue
+        match = re.match(r"^  ([a-zA-Z0-9_-]+):$", line)
+        if match:
+            current = match.group(1)
+            jobs[current] = []
+        elif current is not None:
+            jobs[current].append(line)
+    return jobs
+
+
+def has_environment(body, name):
+    return re.search(
+        rf"^\s+environment:\s+{re.escape(name)}\s*$", body, re.MULTILINE
+    ) is not None
+
+
+workflow_jobs = {
+    path.name: parse_jobs(path) for path in sorted(workflow_root.glob("*.yml"))
+}
+all_jobs = {
+    (workflow, job): "\n".join(lines)
+    for workflow, jobs in workflow_jobs.items()
+    for job, lines in jobs.items()
+}
+
+reader_expected = {
+    ("native-package-publish.yml", "control"),
+    ("native-package-publish.yml", "immutable_passthrough"),
+}
+reader_jobs = {
+    identity
+    for identity, body in all_jobs.items()
+    if has_environment(body, "native-package-preview-audit-read")
+    or "WK_PACKAGE_AUDIT_READER_APP_CLIENT_ID" in body
+    or "WK_PACKAGE_AUDIT_READER_APP_PRIVATE_KEY" in body
+}
+if reader_jobs != reader_expected:
+    raise SystemExit(
+        f"package Audit Reader credentials escaped exact read jobs: {sorted(reader_jobs)}"
+    )
+
+writer_expected = {
+    ("native-package-audit-draft.yml", "prepare"),
+    ("native-package-audit-bind.yml", "bind"),
+    ("native-package-publish.yml", "seal_draft"),
+}
+writer_jobs = {
+    identity
+    for identity, body in all_jobs.items()
+    if has_environment(body, "native-package-preview-audit")
+    or "WK_PACKAGE_PUBLISHER_APP_CLIENT_ID" in body
+    or "WK_PACKAGE_PUBLISHER_APP_PRIVATE_KEY" in body
+}
+if writer_jobs != writer_expected:
+    raise SystemExit(
+        f"package Publisher credentials escaped exact write jobs: {sorted(writer_jobs)}"
+    )
+
+credential_jobs = reader_expected | writer_expected
+for identity in credential_jobs:
+    body = all_jobs[identity]
+    gate = "Validate reviewed audit access before credentials"
+    mint = "actions/create-github-app-token@"
+    if body.count(gate) != 1 or body.count("validate-control.py") != 1:
+        raise SystemExit(f"credential job {identity} lacks one audit-access validator gate")
+    if body.count("audit-access.json") != 1 or ".enabled == true" not in body:
+        raise SystemExit(f"credential job {identity} lacks fail-closed audit enablement")
+    if body.index(gate) > body.index(mint):
+        raise SystemExit(f"credential job {identity} validates audit access after minting")
+
+for identity in reader_expected:
+    body = all_jobs[identity]
+    if not has_environment(body, "native-package-preview-audit-read"):
+        raise SystemExit(f"Audit Reader job {identity} lacks its protected Environment")
+    reader_client = "client-id: ${{ secrets.WK_PACKAGE_AUDIT_READER_APP_CLIENT_ID }}"
+    reader_key = "private-key: ${{ secrets.WK_PACKAGE_AUDIT_READER_APP_PRIVATE_KEY }}"
+    if body.count(reader_client) != 1 or body.count(reader_key) != 1:
+        raise SystemExit(f"Audit Reader job {identity} must pass each secret only to token minting")
+    if "WK_PACKAGE_PUBLISHER_APP_" in body:
+        raise SystemExit(f"Audit Reader job {identity} can access the Publisher private key")
+    app_permissions = re.findall(
+        r"^\s+permission-([a-z-]+):\s+(\S+)\s*$", body, re.MULTILINE
+    )
+    if app_permissions != [("administration", "read")]:
+        raise SystemExit(f"Audit Reader job {identity} must request Administration read only")
+    if body.count("contents: read") != 1:
+        raise SystemExit(f"Audit Reader job {identity} must retain job-token Contents read")
+    if body.count("GH_TOKEN: ${{ github.token }}") != 1:
+        raise SystemExit(f"Audit Reader job {identity} must use its job token for contents")
+    if body.count(
+        "IMMUTABLE_POLICY_TOKEN: ${{ steps.audit-reader-token.outputs.token }}"
+    ) != 1:
+        raise SystemExit(f"Audit Reader job {identity} must isolate its policy token")
+
+control_reader = all_jobs[("native-package-publish.yml", "control")]
+if control_reader.count("            site/") != 1:
+    raise SystemExit("publisher control artifact must carry the bootstrap site for validation")
+if control_reader.count('gh api "repos/WuKongIM/packages/immutable-releases"') != 1:
+    raise SystemExit("publisher control must read immutable policy exactly once")
+if control_reader.count('GH_TOKEN="$IMMUTABLE_POLICY_TOKEN"') != 1:
+    raise SystemExit("publisher control must scope the policy token to its policy read")
+immutable_reader = all_jobs[("native-package-publish.yml", "immutable_passthrough")]
+if immutable_reader.count("--policy-token-env IMMUTABLE_POLICY_TOKEN") != 1:
+    raise SystemExit("immutable replay must pass a separate policy token to the sealer")
+
+for identity in writer_expected:
+    body = all_jobs[identity]
+    if not has_environment(body, "native-package-preview-audit"):
+        raise SystemExit(f"Publisher job {identity} lacks its protected Environment")
+    writer_client = "client-id: ${{ secrets.WK_PACKAGE_PUBLISHER_APP_CLIENT_ID }}"
+    writer_key = "private-key: ${{ secrets.WK_PACKAGE_PUBLISHER_APP_PRIVATE_KEY }}"
+    if body.count(writer_client) != 1 or body.count(writer_key) != 1:
+        raise SystemExit(f"Publisher job {identity} must pass each secret only to token minting")
+    if "WK_PACKAGE_AUDIT_READER_APP_" in body:
+        raise SystemExit(f"Publisher job {identity} can access the Audit Reader private key")
+    app_permissions = re.findall(
+        r"^\s+permission-([a-z-]+):\s+(\S+)\s*$", body, re.MULTILINE
+    )
+    if app_permissions != [("administration", "read"), ("contents", "write")]:
+        raise SystemExit(f"Publisher job {identity} lacks exact write token permissions")
+
+for identity in credential_jobs:
+    body = all_jobs[identity]
+    if body.count("owner: WuKongIM") != 1 or body.count("repositories: packages") != 1:
+        raise SystemExit(f"credential job {identity} must mint only for WuKongIM/packages")
+    if "skip-token-revoke: true" in body:
+        raise SystemExit(f"credential job {identity} must revoke its installation token")
+
+if sum(
+    has_environment(body, "native-package-preview-audit-read")
+    for body in all_jobs.values()
+) != 2:
+    raise SystemExit("Audit Reader Environment must appear in exactly two workflow jobs")
+if sum(
+    has_environment(body, "native-package-preview-audit")
+    for body in all_jobs.values()
+) != 3:
+    raise SystemExit("Publisher Environment must appear in exactly three workflow jobs")
+for secret in (
+    "WK_PACKAGE_AUDIT_READER_APP_CLIENT_ID",
+    "WK_PACKAGE_AUDIT_READER_APP_PRIVATE_KEY",
+):
+    if sum(body.count(secret) for body in all_jobs.values()) != 2:
+        raise SystemExit(f"{secret} must appear in exactly two workflow jobs")
+for secret in (
+    "WK_PACKAGE_PUBLISHER_APP_CLIENT_ID",
+    "WK_PACKAGE_PUBLISHER_APP_PRIVATE_KEY",
+):
+    if sum(body.count(secret) for body in all_jobs.values()) != 3:
+        raise SystemExit(f"{secret} must appear in exactly three workflow jobs")
+
+jobs = workflow_jobs[publish_path.name]
 for job, lines in jobs.items():
     body = "\n".join(lines)
     apt = "secrets.WK_APT_PREVIEW_" in body

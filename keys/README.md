@@ -38,6 +38,11 @@ production certificate must already include its next subkey. Private primary
 keys, private subkeys, passphrases, revocation certificates, and test keys
 remain forbidden here.
 
+Production APT and RPM secret subkeys and passphrases may exist only as the
+fixed secrets in their corresponding protected signing Environment. They must
+not be copied to repository-level or organization-level secrets, or into the
+other package-family Environment.
+
 The publisher copies these exact certificate bytes to the stable public paths
 `/keys/apt-preview.asc` and `/keys/rpm-preview.asc` and records their SHA-256,
 size, and topology in the snapshot and audit receipt. No keyring package exists

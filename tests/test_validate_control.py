@@ -278,6 +278,72 @@ class ValidateControlTest(unittest.TestCase):
 
             self.assert_rejected(root, "duplicate JSON key: schema")
 
+    def test_accepts_exact_disabled_audit_access_boundary(self) -> None:
+        with copied_control_root() as root:
+            audit_access = load_manifest(root, "audit-access.json")
+            self.assertIs(audit_access["enabled"], False)
+
+            result = self.run_validator(root)
+
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertIn("publication control validation passed", result.stdout)
+
+    def test_rejects_unreviewed_or_shared_audit_access_controls(self) -> None:
+        cases = (
+            (
+                "extra field",
+                lambda value: value.update({"unexpected": True}),
+                "audit-access manifest fields must be exactly",
+            ),
+            (
+                "non-boolean enablement",
+                lambda value: value.update({"enabled": "false"}),
+                "audit-access enabled must be boolean",
+            ),
+            (
+                "reader environment",
+                lambda value: value["reader"].update(
+                    {"environment": "native-package-preview-audit"}
+                ),
+                "audit-access reader environment must be",
+            ),
+            (
+                "reader contents permission",
+                lambda value: value["reader"]["permissions"].update(
+                    {"contents": "read"}
+                ),
+                "audit-access reader permissions fields must be exactly",
+            ),
+            (
+                "writer read-only contents",
+                lambda value: value["writer"]["permissions"].update(
+                    {"contents": "read"}
+                ),
+                "writer App permissions must be Administration read and Contents write",
+            ),
+            (
+                "wrong repository",
+                lambda value: value["reader"].update(
+                    {"repositories": ["WuKongIM"]}
+                ),
+                "reader App must be limited to WuKongIM/packages",
+            ),
+            (
+                "shared source private key secret",
+                lambda value: value["reader"].update(
+                    {"app_private_key_secret": "WK_SOURCE_READ_APP_PRIVATE_KEY"}
+                ),
+                "secret names must all be distinct",
+            ),
+        )
+        for name, mutate, diagnostic in cases:
+            with self.subTest(case=name), copied_control_root() as root:
+                audit_access = load_manifest(root, "audit-access.json")
+                mutate(audit_access)
+                write_manifest(root, "audit-access.json", audit_access)
+
+                self.assert_rejected(root, diagnostic)
+
     def test_rejects_stable_or_malformed_preview_version(self) -> None:
         cases = (
             ("3.1.0", "strict prerelease SemVer"),

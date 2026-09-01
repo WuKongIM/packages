@@ -31,10 +31,17 @@ never committed to Git.
   payloads are not trust anchors.
 - `manifests/source-read.json` keeps cross-repository verification disabled
   until a source-only GitHub App and protected Environment are provisioned.
-- Immutable Release policy checks and audit Release/tag writes use a separate
-  package-only GitHub App. Its credentials live only in the protected audit
-  Environment; read paths mint read-scoped tokens and only the three audit
-  writer paths request Contents write.
+- `manifests/audit-access.json` keeps both package audit Apps fail-closed until
+  their exact installations, isolated Environments, secrets, and permissions
+  are provisioned and a separate reviewed change enables the manifest. Every
+  reader or writer job checks it before minting an App token.
+- Immutable Release policy reads and audit Release/tag writes use separate
+  package-only GitHub Apps. The Immutable Policy Reader credentials live only
+  in the protected read Environment and have no Contents permission; ordinary
+  Release, tag, and asset reads use the workflow token. The Publisher
+  credentials live only in the protected write Environment and are exposed
+  only to the three audit writer jobs. All three App private keys are distinct
+  and remain isolated to their own Environment.
 - `manifests/trusted-toolchain.json` pins the exact source commit and SHA-256
   bytes of the repository builder, supplemental legacy verifiers, and TEST
   ONLY drill. Production signing, snapshot composition, and final verification

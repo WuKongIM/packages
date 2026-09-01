@@ -290,10 +290,10 @@ def _require_current_control_and_reserved_tag(
         raise SealError(str(error)) from error
 
 
-def _require_immutable_releases_enabled(writer: GitHubWriter) -> None:
+def _require_immutable_releases_enabled(reader: resolver.GitHubReader) -> None:
     """Fail closed unless repository-enforced immutable Releases are enabled."""
     try:
-        policy = writer.api_json(
+        policy = reader.api_json(
             f"repos/{resolver.AUDIT_REPOSITORY}/immutable-releases"
         )
     except resolver.ResolutionError as error:
@@ -341,6 +341,7 @@ def seal_audit_release(
     api_base_url: str,
     download_base_url: str,
     token: str | None,
+    policy_token: str | None = None,
     max_polls: int = 20,
     poll_seconds: float = 2.0,
 ) -> dict[str, Any]:
@@ -358,6 +359,10 @@ def seal_audit_release(
         raise SealError("poll seconds must not be negative")
     if not isinstance(token, str) or not token:
         raise SealError("a GitHub token is required to seal an audit Release")
+    if policy_token is not None and (
+        not isinstance(policy_token, str) or not policy_token
+    ):
+        raise SealError("policy token must be a non-empty string when provided")
 
     archive_name, receipt_name = resolver.expected_asset_names(release_id)
     local = {
@@ -369,13 +374,16 @@ def seal_audit_release(
         ),
     }
     writer = GitHubWriter(api_base_url, download_base_url, token)
+    policy_reader = resolver.GitHubReader(
+        api_base_url, download_base_url, policy_token or token
+    )
     raw, current = _snapshot(writer, release_id, expected_control_sha)
     _assert_remote_matches(current, local)
     initial_classification = current["classification"]
     _require_current_control_and_reserved_tag(
         writer, current["tag_name"], expected_control_sha
     )
-    _require_immutable_releases_enabled(writer)
+    _require_immutable_releases_enabled(policy_reader)
 
     if current["draft"]:
         upload_template = raw.get("upload_url")
@@ -385,12 +393,12 @@ def seal_audit_release(
             _require_current_control_and_reserved_tag(
                 writer, current["tag_name"], expected_control_sha
             )
-            _require_immutable_releases_enabled(writer)
+            _require_immutable_releases_enabled(policy_reader)
             writer.upload_asset(upload_template, release_id, local[name])
             _require_current_control_and_reserved_tag(
                 writer, current["tag_name"], expected_control_sha
             )
-            _require_immutable_releases_enabled(writer)
+            _require_immutable_releases_enabled(policy_reader)
             raw, current = _snapshot(writer, release_id, expected_control_sha)
             _assert_remote_matches(current, local)
         if current["classification"] != resolver.COMPLETE_DRAFT:
@@ -416,7 +424,7 @@ def seal_audit_release(
         # This is the last policy read before publication.  GitHub provides no
         # conditional Release PATCH, so the response and the repository policy
         # are checked again immediately after the write as detection fences.
-        _require_immutable_releases_enabled(writer)
+        _require_immutable_releases_enabled(policy_reader)
         patch_response = writer.patch_release(
             release_id,
             {"draft": False, "prerelease": True, "make_latest": "false"},
@@ -434,7 +442,7 @@ def seal_audit_release(
                 "audit Release publication response is not immutable and complete"
             )
         _assert_remote_matches(patched, local)
-        _require_immutable_releases_enabled(writer)
+        _require_immutable_releases_enabled(policy_reader)
         _require_current_control_and_reserved_tag(
             writer, patched["tag_name"], expected_control_sha
         )
@@ -513,12 +521,23 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--api-base-url", default="https://api.github.com")
     parser.add_argument("--download-base-url", default=None)
     parser.add_argument("--token-env", default="GITHUB_TOKEN")
+    parser.add_argument("--policy-token-env", default=None)
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     token = os.environ.get(args.token_env) if args.token_env else None
+    policy_token = (
+        os.environ.get(args.policy_token_env) if args.policy_token_env else None
+    )
+    if args.policy_token_env and not policy_token:
+        print(
+            "audit Release sealing failed: configured policy token environment "
+            "variable is unset",
+            file=sys.stderr,
+        )
+        return 1
     try:
         result = seal_audit_release(
             release_id=args.release_id,
@@ -528,6 +547,7 @@ def main(argv: list[str] | None = None) -> int:
             api_base_url=args.api_base_url,
             download_base_url=args.download_base_url or args.api_base_url,
             token=token,
+            policy_token=policy_token,
         )
     except (SealError, resolver.ResolutionError) as error:
         print(f"audit Release sealing failed: {error}", file=sys.stderr)

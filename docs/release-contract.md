@@ -17,23 +17,47 @@ data and never execute files from them.
 capacity bounds, and any in-progress retirement. `manifests/preview-signing.json`
 fixes the protected Environment, public-key paths, fingerprints, secret names,
 and key-lifetime policy. `manifests/source-read.json` keeps cross-repository
-access disabled until a GitHub App restricted to source Contents and
-Attestations read access has been provisioned. These manifests reject unknown
-fields and duplicate JSON keys. Workflow inputs, repository variables,
-dispatch payloads, and release titles must not override reviewed values.
+access disabled until the private `WuKongIM Source Release Reader` GitHub App
+has been installed only on `WuKongIM/WuKongIM` with Contents and Attestations
+read access. Its client ID and private key exist only in the protected
+`native-package-source-read` Environment as `WK_SOURCE_READ_APP_CLIENT_ID` and
+`WK_SOURCE_READ_APP_PRIVATE_KEY`. These manifests reject unknown fields and
+duplicate JSON keys. Workflow inputs, repository variables, dispatch payloads,
+and release titles must not override reviewed values.
+
+`manifests/audit-access.json` fixes the two package App Environments, secret
+names, installation owner and repository, and exact permissions. It remains
+disabled until both Apps and their isolated protected Environments have been
+provisioned. Every package audit reader or writer job validates the complete
+control plane and requires this manifest to be enabled before minting an App
+token. The initial control change therefore remains fail-closed with
+`enabled: false`; enabling access is a separate reviewed control change after
+external provisioning succeeds.
 
 GitHub's Immutable Releases status endpoint requires repository
 Administration read access, which the workflow `GITHUB_TOKEN` cannot request.
-A separate private `WuKongIM Package Publisher` GitHub App is therefore
-installed only on `WuKongIM/packages` with Administration read and Contents
-write permissions. Its client ID and private key exist only in the protected
+The private `WuKongIM Package Immutable Policy Reader` GitHub App is installed only on
+`WuKongIM/packages` with Administration read permission only; GitHub supplies
+the implicit Metadata read permission. Its client ID and private key exist
+only in the protected
+`native-package-preview-audit-read` Environment as
+`WK_PACKAGE_AUDIT_READER_APP_CLIENT_ID` and
+`WK_PACKAGE_AUDIT_READER_APP_PRIVATE_KEY`. Only the publisher control and
+immutable replay jobs use this App, and only for the Immutable Releases policy
+endpoint. Release, tag, and asset reads use those jobs' ordinary read-only
+workflow tokens instead.
+
+The separate private `WuKongIM Package Publisher` GitHub App is installed only
+on `WuKongIM/packages` with Administration read and Contents write permissions.
+Its client ID and private key exist only in the protected
 `native-package-preview-audit` Environment as
 `WK_PACKAGE_PUBLISHER_APP_CLIENT_ID` and
-`WK_PACKAGE_PUBLISHER_APP_PRIVATE_KEY`. Control and immutable replay jobs mint
-tokens narrowed to Administration read plus Contents read; only draft
-creation, audit-tag binding, and sealing mint Contents write. The App has no
-webhook, OAuth, workflow, secret, environment, or organization permission.
-The ordinary workflow token remains read-only in those jobs.
+`WK_PACKAGE_PUBLISHER_APP_PRIVATE_KEY`. Only draft creation, audit-tag binding,
+and sealing use this App and request Contents write. The three Apps use three
+distinct private keys; a key must never be copied into another App's
+Environment. None of the Apps has webhook, OAuth, workflow, secret,
+environment, or organization permission. The ordinary workflow token remains
+read-only in these jobs.
 
 The checked-in `site/` tree always remains the disabled bootstrap page. Live
 APT/RPM content is generated from reviewed control plus immutable Releases,
@@ -231,9 +255,14 @@ the bind run then creates the lightweight
 `native-package-preview-r<ID>` tag once at that exact control commit and changes
 only the empty draft's `target_commitish`. The publisher accepts only the exact
 reserved tag and numeric ID. The tag namespace must forbid deletion and force
-updates. If protected `main` advances after binding, that draft/tag pair is
-abandoned and a new numeric draft must be prepared and reviewed; it is never
-rebound to a later control commit.
+updates. Two active, aggregating tag rulesets must match
+`refs/tags/native-package-preview-r*`: a creation-only ruleset grants its sole
+bypass to the numeric Integration ID of the Package Publisher App, while an
+immutability ruleset denies update, deletion, and non-fast-forward operations
+without any bypass actor. The rules stay separate so the App that creates a
+reserved tag can never bypass its immutability. If protected `main` advances
+after binding, that draft/tag pair is abandoned and a new numeric draft must be
+prepared and reviewed; it is never rebound to a later control commit.
 
 Repository immutable Releases must remain enabled. Immediately before making
 a draft immutable, the writer re-downloads both canonical assets, re-reads the

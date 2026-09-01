@@ -22,6 +22,7 @@ SIGNING_SCHEMA = "wukongim.native_package_signing/v3"
 SIGNING_TOOLCHAIN_SCHEMA = "wukongim.native_package_signing_toolchain/v1"
 TOOLCHAIN_SCHEMA = "wukongim.native_package_toolchain/v1"
 SOURCE_READ_SCHEMA = "wukongim.native_package_source_read/v1"
+AUDIT_ACCESS_SCHEMA = "wukongim.native_package_audit_access/v1"
 SOURCE_REPOSITORY = "WuKongIM/WuKongIM"
 SITE_LIMIT_BYTES = 750 * 1024 * 1024
 SITE_WARNING_BYTES = 600 * 1024 * 1024
@@ -94,6 +95,15 @@ SIGNING_TOOLCHAIN_FIELDS = {
     "image",
     "digest",
     "workflow_sha",
+}
+AUDIT_ACCESS_FIELDS = {"schema", "enabled", "reader", "writer"}
+AUDIT_APP_FIELDS = {
+    "environment",
+    "app_client_id_secret",
+    "app_private_key_secret",
+    "owner",
+    "repositories",
+    "permissions",
 }
 TRUSTED_TOOL_FILES = {
     "scripts/build-native-package-repositories.sh",
@@ -651,6 +661,101 @@ def validate_source_read(root: Path) -> dict[str, Any]:
     return source_read
 
 
+def validate_audit_access(
+    root: Path, source_read: dict[str, Any]
+) -> dict[str, Any]:
+    audit_access = exact_fields(
+        load_json(root / "manifests/audit-access.json"),
+        AUDIT_ACCESS_FIELDS,
+        "audit-access manifest",
+    )
+    require(
+        audit_access["schema"] == AUDIT_ACCESS_SCHEMA,
+        f"audit-access schema must be {AUDIT_ACCESS_SCHEMA}",
+    )
+    require(
+        type(audit_access["enabled"]) is bool,
+        "audit-access enabled must be boolean",
+    )
+
+    reader = exact_fields(
+        audit_access["reader"], AUDIT_APP_FIELDS, "audit-access reader"
+    )
+    writer = exact_fields(
+        audit_access["writer"], AUDIT_APP_FIELDS, "audit-access writer"
+    )
+    for role, value in (("reader", reader), ("writer", writer)):
+        require(
+            value["owner"] == "WuKongIM" and value["repositories"] == ["packages"],
+            f"audit-access {role} App must be limited to WuKongIM/packages",
+        )
+        require(
+            isinstance(value["app_client_id_secret"], str)
+            and bool(value["app_client_id_secret"]),
+            f"audit-access {role} client-id secret must be a non-empty string",
+        )
+        require(
+            isinstance(value["app_private_key_secret"], str)
+            and bool(value["app_private_key_secret"]),
+            f"audit-access {role} private-key secret must be a non-empty string",
+        )
+
+    require(
+        reader["environment"] == "native-package-preview-audit-read",
+        "audit-access reader environment must be native-package-preview-audit-read",
+    )
+    require(
+        writer["environment"] == "native-package-preview-audit",
+        "audit-access writer environment must be native-package-preview-audit",
+    )
+    reader_permissions = exact_fields(
+        reader["permissions"], {"administration"}, "audit-access reader permissions"
+    )
+    require(
+        reader_permissions == {"administration": "read"},
+        "audit-access reader App permissions must be Administration read only",
+    )
+    writer_permissions = exact_fields(
+        writer["permissions"],
+        {"administration", "contents"},
+        "audit-access writer permissions",
+    )
+    require(
+        writer_permissions == {"administration": "read", "contents": "write"},
+        "audit-access writer App permissions must be Administration read and Contents write",
+    )
+
+    secret_names = [
+        source_read["app_client_id_secret"],
+        source_read["app_private_key_secret"],
+        reader["app_client_id_secret"],
+        reader["app_private_key_secret"],
+        writer["app_client_id_secret"],
+        writer["app_private_key_secret"],
+    ]
+    require(
+        len(secret_names) == len(set(secret_names)),
+        "Source Reader, Audit Reader, and Package Publisher secret names must all be distinct",
+    )
+    require(
+        reader["app_client_id_secret"] == "WK_PACKAGE_AUDIT_READER_APP_CLIENT_ID",
+        "audit-access reader client-id secret name is fixed",
+    )
+    require(
+        reader["app_private_key_secret"] == "WK_PACKAGE_AUDIT_READER_APP_PRIVATE_KEY",
+        "audit-access reader private-key secret name is fixed",
+    )
+    require(
+        writer["app_client_id_secret"] == "WK_PACKAGE_PUBLISHER_APP_CLIENT_ID",
+        "audit-access writer client-id secret name is fixed",
+    )
+    require(
+        writer["app_private_key_secret"] == "WK_PACKAGE_PUBLISHER_APP_PRIVATE_KEY",
+        "audit-access writer private-key secret name is fixed",
+    )
+    return audit_access
+
+
 def validate_tracked_inputs(root: Path) -> None:
     forbidden_private_markers = (
         b"BEGIN PGP PRIVATE KEY BLOCK",
@@ -750,7 +855,8 @@ def main() -> int:
         signing = validate_signing(root)
         validate_signing_toolchain(root)
         validate_toolchain(root)
-        validate_source_read(root)
+        source_read = validate_source_read(root)
+        validate_audit_access(root, source_read)
         validate_bootstrap_site(root, channels, signing)
     except ContractError as error:
         print(f"publication control validation failed: {error}", file=sys.stderr)
