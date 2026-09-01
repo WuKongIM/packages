@@ -202,6 +202,19 @@ passphrase, a public-key topology change, a subkey lifetime over 180 days, or
 less than 30 days of remaining validity. A proof signature must use the exact
 reviewed signing-subkey fingerprint and SHA-256.
 
+The manual signing-material preflight verifies the two GitHub Environment
+secret pairs without creating or uploading any package, artifact, tag,
+Release, or Pages snapshot. Its APT and RPM jobs remain separate, require the
+exact current protected `main` commit, verify the digest-pinned toolchain's
+GitHub provenance before referencing either family secret, and run the same
+isolated proof-signature validator with networking disabled. The validation
+output contains public certificate metadata only and is discarded rather than
+stored or uploaded. Success proves only that, at that run, each Environment's
+encrypted current subkey and passphrase match the protected manifest and public
+certificate and can create a SHA-256 proof signature. CI does not validate the
+operator-retained primary or next private key, revocation certificate, or
+backup recoverability.
+
 The public certificates are part of every composed snapshot and audit archive,
 and are published at `/keys/apt-preview.asc` and `/keys/rpm-preview.asc`. The
 minimal rotation keeps the same family primary: the old current moves to
