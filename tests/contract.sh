@@ -11,6 +11,7 @@ AUDIT_DRAFT_WORKFLOW="$ROOT_DIR/.github/workflows/native-package-audit-draft.yml
 AUDIT_BIND_WORKFLOW="$ROOT_DIR/.github/workflows/native-package-audit-bind.yml"
 PUBLISH_WORKFLOW="$ROOT_DIR/.github/workflows/native-package-publish.yml"
 TOOLCHAIN_WORKFLOW="$ROOT_DIR/.github/workflows/native-package-signing-toolchain.yml"
+SIGNING_PREFLIGHT_WORKFLOW="$ROOT_DIR/.github/workflows/native-package-signing-preflight.yml"
 TOOLCHAIN_DOCKERFILE="$ROOT_DIR/toolchain/native-package-signing/Dockerfile"
 
 "$ROOT_DIR/scripts/validate-control.py"
@@ -109,7 +110,8 @@ for workflow in \
   "$AUDIT_DRAFT_WORKFLOW" \
   "$AUDIT_BIND_WORKFLOW" \
   "$PUBLISH_WORKFLOW" \
-  "$TOOLCHAIN_WORKFLOW"; do
+  "$TOOLCHAIN_WORKFLOW" \
+  "$SIGNING_PREFLIGHT_WORKFLOW"; do
   test -f "$workflow"
   grep -Fq 'workflow_dispatch:' "$workflow"
   grep -Fq 'permissions: {}' "$workflow"
@@ -118,6 +120,43 @@ for workflow in \
   grep -Fq 'ref: ${{ github.sha }}' "$workflow"
   grep -Fq 'persist-credentials: false' "$workflow"
 done
+
+grep -Fq 'group: native-package-preview-signing-preflight' "$SIGNING_PREFLIGHT_WORKFLOW"
+grep -Fq 'cancel-in-progress: false' "$SIGNING_PREFLIGHT_WORKFLOW"
+grep -Fq 'confirm_control_sha:' "$SIGNING_PREFLIGHT_WORKFLOW"
+grep -Fq '[[ "$CONFIRM_CONTROL_SHA" =~ ^[0-9a-f]{40}$ ]]' "$SIGNING_PREFLIGHT_WORKFLOW"
+if (( $(grep -cF 'test "$CONFIRM_CONTROL_SHA" = "$GITHUB_SHA"' "$SIGNING_PREFLIGHT_WORKFLOW") != 1 )); then
+  echo 'signing-material preflight control must confirm the exact control commit' >&2
+  exit 1
+fi
+if (( $(grep -cF 'environment: native-package-preview-apt-signing' "$SIGNING_PREFLIGHT_WORKFLOW") != 1 ||
+      $(grep -cF 'environment: native-package-preview-rpm-signing' "$SIGNING_PREFLIGHT_WORKFLOW") != 1 ||
+      $(grep -cF 'validate-signing-material.py' "$SIGNING_PREFLIGHT_WORKFLOW") != 2 ||
+      $(grep -cF 'gh attestation verify' "$SIGNING_PREFLIGHT_WORKFLOW") != 2 ||
+      $(grep -cF -- '--deny-self-hosted-runners' "$SIGNING_PREFLIGHT_WORKFLOW") != 2 ||
+      $(grep -cF -- '--pull never' "$SIGNING_PREFLIGHT_WORKFLOW") != 2 ||
+      $(grep -cF -- '--network none' "$SIGNING_PREFLIGHT_WORKFLOW") != 2 ||
+      $(grep -cF -- '--read-only --cap-drop ALL' "$SIGNING_PREFLIGHT_WORKFLOW") != 2 ||
+      $(grep -cF -- '--volume "$GITHUB_WORKSPACE:/control:ro"' "$SIGNING_PREFLIGHT_WORKFLOW") != 2 ||
+      $(grep -cF 'git ls-remote https://github.com/WuKongIM/packages.git refs/heads/main' "$SIGNING_PREFLIGHT_WORKFLOW") != 5 )); then
+  echo 'signing-material preflight must preserve exact family isolation, provenance, offline validation, and main fences' >&2
+  exit 1
+fi
+grep -Fq 'trap '\''docker logout ghcr.io >/dev/null 2>&1 || true'\'' EXIT' "$SIGNING_PREFLIGHT_WORKFLOW"
+if (( $(grep -cF 'test "$(git rev-parse HEAD)" = "$CONTROL_SHA"' "$SIGNING_PREFLIGHT_WORKFLOW") != 4 ||
+      $(grep -cF 'git diff --exit-code HEAD --' "$SIGNING_PREFLIGHT_WORKFLOW") != 5 ||
+      $(grep -cF 'test -z "$(git status --short --untracked-files=all)"' "$SIGNING_PREFLIGHT_WORKFLOW") != 2 )); then
+  echo 'signing-material preflight must prove a clean exact checkout before exposing either secret' >&2
+  exit 1
+fi
+if grep -Eq 'actions/upload-artifact@|actions/upload-pages-artifact@|actions/deploy-pages@|gh release|gh api|git push|refs/tags/|contents: write|packages: write|attestations: write|artifact-metadata: write|id-token: write|pages: write|secrets\.WK_PACKAGE_' "$SIGNING_PREFLIGHT_WORKFLOW"; then
+  echo 'signing-material preflight must remain proof-only and read-only' >&2
+  exit 1
+fi
+if grep -Eq -- '--volume [^[:space:]]+:rw' "$SIGNING_PREFLIGHT_WORKFLOW"; then
+  echo 'signing-material preflight must not persist secret-step output through a writable bind mount' >&2
+  exit 1
+fi
 
 python3 - "$ROOT_DIR/.github/workflows" <<'PY'
 import pathlib
@@ -422,17 +461,58 @@ for secret in (
     if sum(body.count(secret) for body in all_jobs.values()) != 3:
         raise SystemExit(f"{secret} must appear in exactly three workflow jobs")
 
+signing_expected = {
+    "apt": {
+        ("native-package-publish.yml", "apt_sign"),
+        ("native-package-signing-preflight.yml", "apt"),
+    },
+    "rpm": {
+        ("native-package-publish.yml", "rpm_sign"),
+        ("native-package-signing-preflight.yml", "rpm"),
+    },
+}
+for family, expected in signing_expected.items():
+    upper = family.upper()
+    environment = f"native-package-preview-{family}-signing"
+    other = "RPM" if family == "apt" else "APT"
+    actual = {
+        identity
+        for identity, body in all_jobs.items()
+        if has_environment(body, environment)
+        or f"secrets.WK_{upper}_PREVIEW_" in body
+    }
+    if actual != expected:
+        raise SystemExit(
+            f"{upper} signing credentials escaped exact jobs: {sorted(actual)}"
+        )
+    for identity in expected:
+        body = all_jobs[identity]
+        if not has_environment(body, environment):
+            raise SystemExit(f"{upper} signing job {identity} lacks its protected Environment")
+        for secret in (
+            f"secrets.WK_{upper}_PREVIEW_SECRET_SUBKEY_B64",
+            f"secrets.WK_{upper}_PREVIEW_PASSPHRASE",
+        ):
+            if body.count(secret) != 1:
+                raise SystemExit(
+                    f"{upper} signing job {identity} must reference {secret} exactly once"
+                )
+        if f"secrets.WK_{other}_PREVIEW_" in body:
+            raise SystemExit(
+                f"{upper} signing job {identity} exposes the other family credential"
+            )
+
+preflight_jobs = workflow_jobs["native-package-signing-preflight.yml"]
+for family in ("apt", "rpm"):
+    body = "\n".join(preflight_jobs[family])
+    provenance = f"Verify toolchain provenance before exposing either {family.upper()} secret"
+    secret = f"secrets.WK_{family.upper()}_PREVIEW_SECRET_SUBKEY_B64"
+    if body.index(provenance) > body.index(secret):
+        raise SystemExit(f"{family.upper()} preflight exposes its secret before provenance verification")
+    if "actions/upload-artifact@" in body or "actions/upload-pages-artifact@" in body:
+        raise SystemExit(f"{family.upper()} preflight must not upload its validation receipt")
+
 jobs = workflow_jobs[publish_path.name]
-for job, lines in jobs.items():
-    body = "\n".join(lines)
-    apt = "secrets.WK_APT_PREVIEW_" in body
-    rpm = "secrets.WK_RPM_PREVIEW_" in body
-    if apt and rpm:
-        raise SystemExit(f"publisher job {job} exposes both APT and RPM signing secrets")
-if set(job for job, lines in jobs.items() if "secrets.WK_APT_PREVIEW_" in "\n".join(lines)) != {"apt_sign"}:
-    raise SystemExit("only apt_sign may read APT signing secrets")
-if set(job for job, lines in jobs.items() if "secrets.WK_RPM_PREVIEW_" in "\n".join(lines)) != {"rpm_sign"}:
-    raise SystemExit("only rpm_sign may read RPM signing secrets")
 for job in ("apt_sign", "rpm_sign"):
     body = "\n".join(jobs[job])
     if body.count(

@@ -1,0 +1,286 @@
+name: Safety Automation - Verify Native Package Signing Material
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm_control_sha:
+        description: Exact protected packages/main commit to validate
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: native-package-preview-signing-preflight
+  cancel-in-progress: false
+
+jobs:
+  control:
+    name: Validate exact protected signing control
+    if: >-
+      github.repository == 'WuKongIM/packages' &&
+      github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      control_sha: ${{ steps.control.outputs.control_sha }}
+      toolchain_image: ${{ steps.control.outputs.toolchain_image }}
+      toolchain_digest: ${{ steps.control.outputs.toolchain_digest }}
+      toolchain_workflow_sha: ${{ steps.control.outputs.toolchain_workflow_sha }}
+    steps:
+      - name: Check out exact protected control
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Validate exact preflight authorization
+        id: control
+        shell: bash
+        env:
+          CONFIRM_CONTROL_SHA: ${{ inputs.confirm_control_sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          [[ "$CONFIRM_CONTROL_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$CONFIRM_CONTROL_SHA" = "$GITHUB_SHA"
+          ./tests/contract.sh
+          jq -e '.enabled == true' manifests/preview-signing.json >/dev/null
+          jq -e '.enabled == true' manifests/signing-toolchain.json >/dev/null
+          test "$(git ls-remote https://github.com/WuKongIM/packages.git refs/heads/main | cut -f1)" = "$GITHUB_SHA"
+          echo "control_sha=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+          echo "toolchain_image=$(jq -er '.image' manifests/signing-toolchain.json)" >> "$GITHUB_OUTPUT"
+          echo "toolchain_digest=$(jq -er '.digest' manifests/signing-toolchain.json)" >> "$GITHUB_OUTPUT"
+          echo "toolchain_workflow_sha=$(jq -er '.workflow_sha' manifests/signing-toolchain.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Reject tracked-tree mutation
+        if: always()
+        run: git diff --exit-code HEAD --
+
+  apt:
+    name: Validate only the APT signing credential
+    needs: control
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: native-package-preview-apt-signing
+    permissions:
+      attestations: read
+      contents: read
+      packages: read
+    steps:
+      - name: Check out exact protected control
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ needs.control.outputs.control_sha }}
+          persist-credentials: false
+
+      - name: Revalidate exact APT control before credentials
+        shell: bash
+        env:
+          CONTROL_SHA: ${{ needs.control.outputs.control_sha }}
+          TOOLCHAIN_IMAGE: ${{ needs.control.outputs.toolchain_image }}
+          TOOLCHAIN_DIGEST: ${{ needs.control.outputs.toolchain_digest }}
+          TOOLCHAIN_WORKFLOW_SHA: ${{ needs.control.outputs.toolchain_workflow_sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$CONTROL_SHA"
+          ./scripts/validate-control.py
+          jq -e '
+            .enabled == true and
+            .apt.environment == "native-package-preview-apt-signing" and
+            .apt.secret_subkey_env == "WK_APT_PREVIEW_SECRET_SUBKEY_B64" and
+            .apt.passphrase_env == "WK_APT_PREVIEW_PASSPHRASE"
+          ' manifests/preview-signing.json >/dev/null
+          test "$(jq -er '.image' manifests/signing-toolchain.json)" = "$TOOLCHAIN_IMAGE"
+          test "$(jq -er '.digest' manifests/signing-toolchain.json)" = "$TOOLCHAIN_DIGEST"
+          test "$(jq -er '.workflow_sha' manifests/signing-toolchain.json)" = "$TOOLCHAIN_WORKFLOW_SHA"
+
+      - name: Verify toolchain provenance before exposing either APT secret
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CONTROL_SHA: ${{ needs.control.outputs.control_sha }}
+          IMAGE: ${{ needs.control.outputs.toolchain_image }}
+          DIGEST: ${{ needs.control.outputs.toolchain_digest }}
+          WORKFLOW_SHA: ${{ needs.control.outputs.toolchain_workflow_sha }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          trap 'docker logout ghcr.io >/dev/null 2>&1 || true' EXIT
+          docker pull --platform linux/amd64 "$IMAGE@$DIGEST"
+          gh attestation verify "oci://$IMAGE@$DIGEST" \
+            --repo WuKongIM/packages \
+            --signer-workflow WuKongIM/packages/.github/workflows/native-package-signing-toolchain.yml \
+            --source-ref refs/heads/main \
+            --source-digest "$WORKFLOW_SHA" \
+            --signer-digest "$WORKFLOW_SHA" \
+            --deny-self-hosted-runners >/dev/null
+          test "$(git rev-parse HEAD)" = "$CONTROL_SHA"
+          git diff --exit-code HEAD --
+          test -z "$(git status --short --untracked-files=all)"
+          test "$(git ls-remote https://github.com/WuKongIM/packages.git refs/heads/main | cut -f1)" = "$CONTROL_SHA"
+
+      - name: Validate exact APT current signing material offline
+        shell: bash
+        env:
+          IMAGE: ${{ needs.control.outputs.toolchain_image }}
+          DIGEST: ${{ needs.control.outputs.toolchain_digest }}
+          WK_APT_PREVIEW_SECRET_SUBKEY_B64: ${{ secrets.WK_APT_PREVIEW_SECRET_SUBKEY_B64 }}
+          WK_APT_PREVIEW_PASSPHRASE: ${{ secrets.WK_APT_PREVIEW_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          docker run --rm --platform linux/amd64 \
+            --pull never \
+            --network none --read-only --cap-drop ALL \
+            --security-opt no-new-privileges --pids-limit 64 \
+            --tmpfs /tmp:rw,noexec,nosuid,size=64m \
+            --env WK_APT_PREVIEW_SECRET_SUBKEY_B64 \
+            --env WK_APT_PREVIEW_PASSPHRASE \
+            --volume "$GITHUB_WORKSPACE:/control:ro" \
+            "$IMAGE@$DIGEST" bash -euo pipefail -c '
+              args=(
+                --family apt
+                --public-cert /control/keys/apt-preview.asc
+                --secret-subkey-base64-env WK_APT_PREVIEW_SECRET_SUBKEY_B64
+                --passphrase-env WK_APT_PREVIEW_PASSPHRASE
+                --primary-fingerprint "$(jq -er .apt.primary_fingerprint /control/manifests/preview-signing.json)"
+                --signing-subkey-fingerprint "$(jq -er .apt.signing_subkeys.current /control/manifests/preview-signing.json)"
+                --minimum-valid-days "$(jq -er .minimum_valid_days /control/manifests/preview-signing.json)"
+                --rotation-begin-days "$(jq -er .rotation_begin_days /control/manifests/preview-signing.json)"
+                --maximum-lifetime-days "$(jq -er .maximum_subkey_lifetime_days /control/manifests/preview-signing.json)"
+              )
+              next="$(jq -r .apt.signing_subkeys.next//empty /control/manifests/preview-signing.json)"
+              [[ -z "$next" ]] || args+=(--next-signing-subkey-fingerprint "$next")
+              while read -r historical; do
+                args+=(--historical-signing-subkey-fingerprint "$historical")
+              done < <(jq -r ".apt.signing_subkeys.historical[]" /control/manifests/preview-signing.json)
+              python3 /control/scripts/validate-signing-material.py "${args[@]}"
+            ' >/dev/null
+
+      - name: Re-fence protected main after APT secret validation
+        if: always()
+        shell: bash
+        env:
+          CONTROL_SHA: ${{ needs.control.outputs.control_sha }}
+        run: |
+          set -euo pipefail
+          test "$(git ls-remote https://github.com/WuKongIM/packages.git refs/heads/main | cut -f1)" = "$CONTROL_SHA"
+
+      - name: Reject tracked-tree mutation
+        if: always()
+        run: git diff --exit-code HEAD --
+
+  rpm:
+    name: Validate only the RPM signing credential
+    needs: control
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: native-package-preview-rpm-signing
+    permissions:
+      attestations: read
+      contents: read
+      packages: read
+    steps:
+      - name: Check out exact protected control
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ needs.control.outputs.control_sha }}
+          persist-credentials: false
+
+      - name: Revalidate exact RPM control before credentials
+        shell: bash
+        env:
+          CONTROL_SHA: ${{ needs.control.outputs.control_sha }}
+          TOOLCHAIN_IMAGE: ${{ needs.control.outputs.toolchain_image }}
+          TOOLCHAIN_DIGEST: ${{ needs.control.outputs.toolchain_digest }}
+          TOOLCHAIN_WORKFLOW_SHA: ${{ needs.control.outputs.toolchain_workflow_sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$CONTROL_SHA"
+          ./scripts/validate-control.py
+          jq -e '
+            .enabled == true and
+            .rpm.environment == "native-package-preview-rpm-signing" and
+            .rpm.secret_subkey_env == "WK_RPM_PREVIEW_SECRET_SUBKEY_B64" and
+            .rpm.passphrase_env == "WK_RPM_PREVIEW_PASSPHRASE"
+          ' manifests/preview-signing.json >/dev/null
+          test "$(jq -er '.image' manifests/signing-toolchain.json)" = "$TOOLCHAIN_IMAGE"
+          test "$(jq -er '.digest' manifests/signing-toolchain.json)" = "$TOOLCHAIN_DIGEST"
+          test "$(jq -er '.workflow_sha' manifests/signing-toolchain.json)" = "$TOOLCHAIN_WORKFLOW_SHA"
+
+      - name: Verify toolchain provenance before exposing either RPM secret
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CONTROL_SHA: ${{ needs.control.outputs.control_sha }}
+          IMAGE: ${{ needs.control.outputs.toolchain_image }}
+          DIGEST: ${{ needs.control.outputs.toolchain_digest }}
+          WORKFLOW_SHA: ${{ needs.control.outputs.toolchain_workflow_sha }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          trap 'docker logout ghcr.io >/dev/null 2>&1 || true' EXIT
+          docker pull --platform linux/amd64 "$IMAGE@$DIGEST"
+          gh attestation verify "oci://$IMAGE@$DIGEST" \
+            --repo WuKongIM/packages \
+            --signer-workflow WuKongIM/packages/.github/workflows/native-package-signing-toolchain.yml \
+            --source-ref refs/heads/main \
+            --source-digest "$WORKFLOW_SHA" \
+            --signer-digest "$WORKFLOW_SHA" \
+            --deny-self-hosted-runners >/dev/null
+          test "$(git rev-parse HEAD)" = "$CONTROL_SHA"
+          git diff --exit-code HEAD --
+          test -z "$(git status --short --untracked-files=all)"
+          test "$(git ls-remote https://github.com/WuKongIM/packages.git refs/heads/main | cut -f1)" = "$CONTROL_SHA"
+
+      - name: Validate exact RPM current signing material offline
+        shell: bash
+        env:
+          IMAGE: ${{ needs.control.outputs.toolchain_image }}
+          DIGEST: ${{ needs.control.outputs.toolchain_digest }}
+          WK_RPM_PREVIEW_SECRET_SUBKEY_B64: ${{ secrets.WK_RPM_PREVIEW_SECRET_SUBKEY_B64 }}
+          WK_RPM_PREVIEW_PASSPHRASE: ${{ secrets.WK_RPM_PREVIEW_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          docker run --rm --platform linux/amd64 \
+            --pull never \
+            --network none --read-only --cap-drop ALL \
+            --security-opt no-new-privileges --pids-limit 64 \
+            --tmpfs /tmp:rw,noexec,nosuid,size=64m \
+            --env WK_RPM_PREVIEW_SECRET_SUBKEY_B64 \
+            --env WK_RPM_PREVIEW_PASSPHRASE \
+            --volume "$GITHUB_WORKSPACE:/control:ro" \
+            "$IMAGE@$DIGEST" bash -euo pipefail -c '
+              args=(
+                --family rpm
+                --public-cert /control/keys/rpm-preview.asc
+                --secret-subkey-base64-env WK_RPM_PREVIEW_SECRET_SUBKEY_B64
+                --passphrase-env WK_RPM_PREVIEW_PASSPHRASE
+                --primary-fingerprint "$(jq -er .rpm.primary_fingerprint /control/manifests/preview-signing.json)"
+                --signing-subkey-fingerprint "$(jq -er .rpm.signing_subkeys.current /control/manifests/preview-signing.json)"
+                --minimum-valid-days "$(jq -er .minimum_valid_days /control/manifests/preview-signing.json)"
+                --rotation-begin-days "$(jq -er .rotation_begin_days /control/manifests/preview-signing.json)"
+                --maximum-lifetime-days "$(jq -er .maximum_subkey_lifetime_days /control/manifests/preview-signing.json)"
+              )
+              next="$(jq -r .rpm.signing_subkeys.next//empty /control/manifests/preview-signing.json)"
+              [[ -z "$next" ]] || args+=(--next-signing-subkey-fingerprint "$next")
+              while read -r historical; do
+                args+=(--historical-signing-subkey-fingerprint "$historical")
+              done < <(jq -r ".rpm.signing_subkeys.historical[]" /control/manifests/preview-signing.json)
+              python3 /control/scripts/validate-signing-material.py "${args[@]}"
+            ' >/dev/null
+
+      - name: Re-fence protected main after RPM secret validation
+        if: always()
+        shell: bash
+        env:
+          CONTROL_SHA: ${{ needs.control.outputs.control_sha }}
+        run: |
+          set -euo pipefail
+          test "$(git ls-remote https://github.com/WuKongIM/packages.git refs/heads/main | cut -f1)" = "$CONTROL_SHA"
+
+      - name: Reject tracked-tree mutation
+        if: always()
+        run: git diff --exit-code HEAD --
