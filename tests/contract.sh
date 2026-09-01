@@ -289,6 +289,19 @@ grep -Fq 'awk -v tag="control-$GITHUB_SHA:"' "$TOOLCHAIN_WORKFLOW"
 grep -Fq 'NF == 5 && $1 == tag && $2 == "digest:" && $3 ~ /^sha256:[0-9a-f]{64}$/' "$TOOLCHAIN_WORKFLOW"
 grep -Fq '{print $3}' "$TOOLCHAIN_WORKFLOW"
 grep -Fq 'test "${#pushed_digests[@]}" -eq 1' "$TOOLCHAIN_WORKFLOW"
+python3 - "$TOOLCHAIN_WORKFLOW" <<'PY'
+import pathlib
+import sys
+
+workflow = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+receipt = workflow.split("- name: Record public toolchain receipt", 1)[1]
+receipt = receipt.split("- name: Upload public toolchain evidence", 1)[0]
+if "bash -euo pipefail -c" in receipt:
+    raise SystemExit("toolchain receipt must not expand dpkg-query placeholders in bash -u")
+expected = "dpkg-query -W '-f=${Package}\\t${Version}\\n'"
+if expected not in receipt:
+    raise SystemExit("toolchain receipt must pass the dpkg-query format as one literal argument")
+PY
 fixture_sha='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
 fixture_digest='sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
 parse_push_digest() {
