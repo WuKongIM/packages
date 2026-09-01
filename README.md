@@ -20,8 +20,9 @@ never committed to Git.
   credentials.
 - This repository independently verifies the immutable source release before
   accepting a publication request.
-- Once provisioned, preview APT and RPM signing will use separate short-lived
-  signing subkeys in a protected GitHub Environment.
+- Once provisioned, preview APT and RPM signing use separate certificates and
+  separate protected GitHub Environments. Each certificate pre-distributes a
+  current and a next short-lived signing subkey.
 - Stable signing keys remain outside GitHub-hosted CI.
 - GitHub Pages will receive only complete, verified preview snapshots. Stable
   publication requires migration to object storage and a CDN.
@@ -30,9 +31,16 @@ never committed to Git.
   payloads are not trust anchors.
 - `manifests/source-read.json` keeps cross-repository verification disabled
   until a source-only GitHub App and protected Environment are provisioned.
+- Immutable Release policy checks and audit Release/tag writes use a separate
+  package-only GitHub App. Its credentials live only in the protected audit
+  Environment; read paths mint read-scoped tokens and only the three audit
+  writer paths request Contents write.
 - `manifests/trusted-toolchain.json` pins the exact source commit and SHA-256
-  bytes of the repository builder, signer, verifier, and TEST ONLY drill. A
-  source tag never selects executable publishing code.
+  bytes of the repository builder, supplemental legacy verifiers, and TEST
+  ONLY drill. Production signing, snapshot composition, and final verification
+  use this repository's exact reviewed control inside the separately
+  digest-pinned and attested signing image. A source tag never selects
+  executable publishing code.
 
 The manual source preflight accepts only a numeric immutable source Release
 ID. It independently resolves the tag to a commit reachable from `main`,
@@ -42,3 +50,10 @@ without executing either package payload.
 
 See [docs/release-contract.md](docs/release-contract.md) for the release,
 retention, signing, and recovery contracts.
+
+Reviewed public certificates are published at the stable URLs
+`https://packages.githubim.com/keys/apt-preview.asc` and
+`https://packages.githubim.com/keys/rpm-preview.asc`. This repository does not
+yet publish an APT or RPM keyring package. Existing clients therefore do not
+receive certificate updates automatically and must refresh the applicable
+certificate before a newly added successor subkey is promoted.

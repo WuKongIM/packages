@@ -1,0 +1,308 @@
+#!/usr/bin/env python3
+"""Bind one empty numeric package audit draft to the reviewed control commit.
+
+This is a deliberately narrow GitHub writer.  It can change only
+``target_commitish`` on an empty, canonical, unpublished audit draft and
+reserve that draft's canonical lightweight audit tag at the reviewed control
+commit.  The caller is responsible for proving that the previous commit is an
+ancestor of the new protected ``main`` commit before invoking this program.
+"""
+
+from __future__ import annotations
+
+import argparse
+import ipaddress
+import json
+import os
+import re
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from typing import Any
+
+
+AUDIT_REPOSITORY = "WuKongIM/packages"
+RESULT_SCHEMA = "wukongim/package-audit-release-binding/v1"
+CONTROL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+MAX_JSON_BYTES = 8 * 1024 * 1024
+
+
+class BindingError(RuntimeError):
+    """The requested audit draft binding was not safe to perform."""
+
+
+def expected_release_identity(release_id: int) -> tuple[str, str]:
+    return (
+        f"native-package-preview-r{release_id}",
+        f"WuKongIM preview package snapshot r{release_id}",
+    )
+
+
+def _require_object(value: Any, label: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise BindingError(f"{label} must be a JSON object")
+    return value
+
+
+def _require_string(value: Any, label: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise BindingError(f"{label} must be a non-empty string")
+    return value
+
+
+def _is_loopback(hostname: str) -> bool:
+    if hostname == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(hostname).is_loopback
+    except ValueError:
+        return False
+
+
+def _validated_api_base(value: str) -> str:
+    parsed = urllib.parse.urlsplit(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise BindingError("API base URL must be an absolute HTTP(S) URL")
+    if parsed.query or parsed.fragment:
+        raise BindingError("API base URL must not contain a query or fragment")
+    if parsed.scheme != "https" and not _is_loopback(parsed.hostname or ""):
+        raise BindingError("GitHub credentials may be sent only over HTTPS or loopback HTTP")
+    return value.rstrip("/")
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(
+        self,
+        req: Any,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> None:
+        return None
+
+
+class GitHubWriter:
+    """Minimal authenticated JSON client with redirects disabled."""
+
+    def __init__(self, api_base_url: str, token: str) -> None:
+        if not token:
+            raise BindingError("a GitHub token is required")
+        self.api_base_url = _validated_api_base(api_base_url)
+        self.token = token
+        self._opener = urllib.request.build_opener(_NoRedirect())
+
+    def request_json(
+        self,
+        method: str,
+        path: str,
+        payload: dict[str, Any] | None = None,
+        *,
+        allow_unprocessable: bool = False,
+    ) -> dict[str, Any] | None:
+        if method not in {"GET", "PATCH", "POST"}:
+            raise BindingError(f"unsupported GitHub API method: {method}")
+        body = None
+        if payload is not None:
+            body = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        request = urllib.request.Request(
+            f"{self.api_base_url}/{path.lstrip('/')}",
+            data=body,
+            headers={
+                "Accept": "application/vnd.github+json",
+                "Authorization": f"Bearer {self.token}",
+                "Content-Type": "application/json",
+                "User-Agent": "wukongim-package-audit-release-binder/1",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+            method=method,
+        )
+        try:
+            with self._opener.open(request, timeout=30) as response:
+                data = response.read(MAX_JSON_BYTES + 1)
+        except urllib.error.HTTPError as error:
+            if allow_unprocessable and error.code == 422:
+                error.read(MAX_JSON_BYTES + 1)
+                return None
+            raise BindingError(
+                f"GitHub API {method} failed for {path}: {error}"
+            ) from error
+        except OSError as error:
+            raise BindingError(
+                f"GitHub API {method} failed for {path}: {error}"
+            ) from error
+        if len(data) > MAX_JSON_BYTES:
+            raise BindingError(f"GitHub API response is too large for {path}")
+        try:
+            return _require_object(json.loads(data), f"GitHub API response for {path}")
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise BindingError(f"GitHub API returned invalid JSON for {path}") from error
+
+    def ensure_lightweight_tag(self, tag_name: str, control_sha: str) -> bool:
+        """Create the canonical tag once, or prove an existing ref is exact."""
+
+        created = self.request_json(
+            "POST",
+            f"repos/{AUDIT_REPOSITORY}/git/refs",
+            {"ref": f"refs/tags/{tag_name}", "sha": control_sha},
+            allow_unprocessable=True,
+        )
+        if created is None:
+            value = self.request_json(
+                "GET", f"repos/{AUDIT_REPOSITORY}/git/ref/tags/{tag_name}"
+            )
+            was_created = False
+        else:
+            value = created
+            was_created = True
+        if value is None:
+            raise BindingError("GitHub returned an empty audit tag response")
+        target = _require_object(value.get("object"), "audit tag target")
+        if (
+            value.get("ref") != f"refs/tags/{tag_name}"
+            or target.get("type") != "commit"
+            or target.get("sha") != control_sha
+        ):
+            raise BindingError(
+                "canonical audit tag does not point to the reviewed control commit"
+            )
+        return was_created
+
+
+def _empty_draft_snapshot(
+    release: dict[str, Any], release_id: int, expected_control_shas: set[str]
+) -> dict[str, Any]:
+    if release.get("id") != release_id:
+        raise BindingError("audit Release id does not match the requested numeric id")
+    expected_tag, expected_name = expected_release_identity(release_id)
+    if release.get("tag_name") != expected_tag:
+        raise BindingError(f"audit Release tag must be {expected_tag}")
+    if release.get("name") != expected_name:
+        raise BindingError(f"audit Release name must be {expected_name}")
+    if release.get("draft") is not True:
+        raise BindingError("audit Release must remain a draft")
+    if release.get("prerelease") is not True:
+        raise BindingError("audit Release must remain a prerelease")
+    if release.get("immutable") is not False:
+        raise BindingError("audit Release must not be immutable before publication")
+    if release.get("published_at") is not None:
+        raise BindingError("audit Release must not be published")
+    if release.get("assets") != []:
+        raise BindingError("audit Release must be empty before control binding")
+    target_commitish = _require_string(
+        release.get("target_commitish"), "audit Release target_commitish"
+    )
+    if target_commitish not in expected_control_shas:
+        raise BindingError(
+            "audit Release target_commitish does not match the expected previous control commit"
+        )
+    return {
+        "id": release_id,
+        "tag_name": expected_tag,
+        "name": expected_name,
+        "target_commitish": target_commitish,
+        "draft": True,
+        "prerelease": True,
+        "immutable": False,
+        "published_at": None,
+        "assets": [],
+    }
+
+
+def bind_audit_release(
+    *,
+    release_id: int,
+    expected_previous_control_sha: str,
+    expected_control_sha: str,
+    api_base_url: str,
+    token: str,
+) -> dict[str, Any]:
+    """Bind an exact empty draft and return revalidated non-secret evidence."""
+
+    if not isinstance(release_id, int) or isinstance(release_id, bool) or release_id <= 0:
+        raise BindingError("release id must be a positive integer")
+    for value, label in (
+        (expected_previous_control_sha, "expected previous control SHA"),
+        (expected_control_sha, "expected control SHA"),
+    ):
+        if not isinstance(value, str) or not CONTROL_SHA_RE.fullmatch(value):
+            raise BindingError(f"{label} must be a lowercase 40-hex commit")
+
+    writer = GitHubWriter(api_base_url, token)
+    path = f"repos/{AUDIT_REPOSITORY}/releases/{release_id}"
+    initial = _empty_draft_snapshot(
+        _require_object(writer.request_json("GET", path), "initial audit Release"),
+        release_id,
+        {expected_previous_control_sha, expected_control_sha},
+    )
+    # Reserve the create-only canonical ref before changing the Release.  A
+    # conflicting ref therefore cannot leave the draft rebound but unusable.
+    # If the create succeeded and a later PATCH response was lost, a retry may
+    # accept only the already-exact lightweight ref.
+    tag_created = writer.ensure_lightweight_tag(initial["tag_name"], expected_control_sha)
+    updated = initial["target_commitish"] != expected_control_sha
+    if updated:
+        patched = _require_object(writer.request_json(
+            "PATCH", path, {"target_commitish": expected_control_sha}
+        ), "patched audit Release")
+        _empty_draft_snapshot(patched, release_id, {expected_control_sha})
+    final = _empty_draft_snapshot(
+        _require_object(writer.request_json("GET", path), "final audit Release"),
+        release_id,
+        {expected_control_sha},
+    )
+    if {**initial, "target_commitish": expected_control_sha} != final:
+        raise BindingError("audit Release identity or state changed during control binding")
+    return {
+        "schema": RESULT_SCHEMA,
+        "repository": AUDIT_REPOSITORY,
+        "release_id": release_id,
+        "tag_name": final["tag_name"],
+        "previous_control_sha": expected_previous_control_sha,
+        "control_sha": expected_control_sha,
+        "updated": updated,
+        "audit_tag_created": tag_created,
+        "audit_tag_reserved": True,
+        "empty_draft_revalidated": True,
+    }
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Bind one empty numeric package audit draft to reviewed control."
+    )
+    parser.add_argument("--release-id", required=True, type=int)
+    parser.add_argument("--expected-previous-control-sha", required=True)
+    parser.add_argument("--expected-control-sha", required=True)
+    parser.add_argument("--api-base-url", default="https://api.github.com")
+    parser.add_argument(
+        "--token-env",
+        default="GITHUB_TOKEN",
+        help="environment variable containing a packages-repository token",
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parser().parse_args(argv)
+    token = os.environ.get(args.token_env) if args.token_env else None
+    try:
+        result = bind_audit_release(
+            release_id=args.release_id,
+            expected_previous_control_sha=args.expected_previous_control_sha,
+            expected_control_sha=args.expected_control_sha,
+            api_base_url=args.api_base_url,
+            token=token or "",
+        )
+    except BindingError as error:
+        print(f"audit Release binding failed: {error}", file=sys.stderr)
+        return 1
+    json.dump(result, sys.stdout, sort_keys=True, separators=(",", ":"))
+    sys.stdout.write("\n")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -9,7 +9,8 @@ import subprocess
 import sys
 import time
 import unittest
-from dataclasses import dataclass
+from argparse import Namespace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -136,6 +137,7 @@ class TestKeyFactory:
         *,
         signing_expiration: str,
         add_encryption_subkey: bool,
+        algorithm: str = "ed25519",
         fake_time: int | None = None,
         key_passphrase: bytes = PASSPHRASE,
         primary_usage: str = "cert",
@@ -149,14 +151,14 @@ class TestKeyFactory:
         loopback = ["--pinentry-mode", "loopback", "--passphrase-fd", "0"]
         self._gpg(
             home,
-            [*loopback, "--quick-gen-key", uid, "ed25519", primary_usage, "365d"],
+            [*loopback, "--quick-gen-key", uid, algorithm, primary_usage, "365d"],
             input_bytes=key_passphrase + b"\n",
             fake_time=fake_time,
         )
         primary, _ = self._fingerprints(home)
         self._gpg(
             home,
-            [*loopback, "--quick-add-key", primary, "ed25519", signing_usage, signing_expiration],
+            [*loopback, "--quick-add-key", primary, algorithm, signing_usage, signing_expiration],
             input_bytes=key_passphrase + b"\n",
             fake_time=fake_time,
         )
@@ -244,6 +246,18 @@ class SigningMaterialValidationTest(unittest.TestCase):
         cls.factory = TestKeyFactory(Path(cls.temporary.name))
         cls.good = cls.factory.generate(
             "GOOD", signing_expiration="60d", add_encryption_subkey=True
+        )
+        cls.rpm_good = cls.factory.generate(
+            "RPM-GOOD",
+            signing_expiration="60d",
+            add_encryption_subkey=True,
+            algorithm="rsa3072",
+        )
+        cls.rpm_weak = cls.factory.generate(
+            "RPM-RSA2048",
+            signing_expiration="60d",
+            add_encryption_subkey=False,
+            algorithm="rsa2048",
         )
         old_time = int(time.time()) - 10 * 86400
         cls.expired = cls.factory.generate(
@@ -354,17 +368,193 @@ class SigningMaterialValidationTest(unittest.TestCase):
         self.assertNotIn("BEGIN PGP PRIVATE KEY BLOCK", result.stdout + result.stderr)
 
     def test_accepts_only_reviewed_encrypted_signing_subkey_for_both_families(self) -> None:
-        for family in ("apt", "rpm"):
+        for family, key in (("apt", self.good), ("rpm", self.rpm_good)):
             with self.subTest(family=family):
-                result = self.run_validator(self.good, family=family)
+                result = self.run_validator(key, family=family)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 receipt = json.loads(result.stdout)
                 self.assertEqual(receipt["family"], family)
-                self.assertEqual(receipt["primary_fingerprint"], self.good.primary_fingerprint)
+                self.assertEqual(receipt["primary_fingerprint"], key.primary_fingerprint)
                 self.assertEqual(
-                    receipt["signing_subkey_fingerprint"], self.good.signing_subkey_fingerprint
+                    receipt["signing_subkey_fingerprint"], key.signing_subkey_fingerprint
                 )
                 self.assertTrue(receipt["validated"])
+
+    def test_rejects_non_rsa_rpm_signing_material(self) -> None:
+        result = self.run_validator(self.good, family="rpm")
+        self.assert_safe_failure(result, "public-key algorithm 1 (RSA)")
+
+    def test_rejects_rsa2048_rpm_signing_material(self) -> None:
+        result = self.run_validator(self.rpm_weak, family="rpm")
+        self.assert_safe_failure(result, "RSA key must be exactly 3072 or 4096 bits")
+
+    def test_rejects_non_rsa_rpm_secret_record_after_import(self) -> None:
+        primary = "1" * 40
+        current = "2" * 40
+        records = [
+            validator.KeyRecord(
+                "sec", "u", 3072, 1, 1, None, "c", "#", primary
+            ),
+            validator.KeyRecord(
+                "ssb", "u", 255, 22, 1, None, "s", "+", current
+            ),
+        ]
+
+        with self.assertRaisesRegex(
+            validator.SigningMaterialError, r"public-key algorithm 1 \(RSA\)"
+        ):
+            validator.validate_secret_key(records, primary, current, "rpm")
+
+    def test_rejects_non_rsa_key_in_every_reviewed_rpm_role(self) -> None:
+        now = int(time.time())
+        fingerprints = [character * 40 for character in "1234"]
+        records = [
+            validator.KeyRecord(
+                "pub", "u", 3072, 1, now - 86400, now + 365 * 86400,
+                "c", "", fingerprints[0],
+            ),
+            validator.KeyRecord(
+                "sub", "u", 3072, 1, now - 86400, now + 60 * 86400,
+                "s", "", fingerprints[1],
+            ),
+            validator.KeyRecord(
+                "sub", "u", 3072, 1, now - 86400, now + 120 * 86400,
+                "s", "", fingerprints[2],
+            ),
+            validator.KeyRecord(
+                "sub", "u", 3072, 1, now - 10 * 86400, now + 30 * 86400,
+                "s", "", fingerprints[3],
+            ),
+        ]
+        for index, role in enumerate(("primary", "current", "next", "historical")):
+            with self.subTest(role=role), self.assertRaisesRegex(
+                validator.SigningMaterialError, r"public-key algorithm 1 \(RSA\)"
+            ):
+                candidate = list(records)
+                candidate[index] = replace(
+                    candidate[index], key_bits=255, public_key_algorithm=22
+                )
+                validator.validate_public_key(
+                    candidate,
+                    fingerprints[0],
+                    fingerprints[1],
+                    fingerprints[2],
+                    [fingerprints[3]],
+                    30,
+                    45,
+                    180,
+                    now,
+                    "rpm",
+                )
+
+    def test_accepts_rsa4096_for_every_reviewed_rpm_role(self) -> None:
+        now = int(time.time())
+        fingerprints = [character * 40 for character in "1234"]
+        records = [
+            validator.KeyRecord(
+                "pub", "u", 4096, 1, now - 86400, now + 365 * 86400,
+                "c", "", fingerprints[0],
+            ),
+            validator.KeyRecord(
+                "sub", "u", 4096, 1, now - 86400, now + 60 * 86400,
+                "s", "", fingerprints[1],
+            ),
+            validator.KeyRecord(
+                "sub", "u", 4096, 1, now - 86400, now + 120 * 86400,
+                "s", "", fingerprints[2],
+            ),
+            validator.KeyRecord(
+                "sub", "u", 4096, 1, now - 10 * 86400, now + 30 * 86400,
+                "s", "", fingerprints[3],
+            ),
+        ]
+
+        selected = validator.validate_public_key(
+            records,
+            fingerprints[0],
+            fingerprints[1],
+            fingerprints[2],
+            [fingerprints[3]],
+            30,
+            45,
+            180,
+            now,
+            "rpm",
+        )
+
+        self.assertEqual(fingerprints[1], selected.fingerprint)
+
+    def test_accepts_future_next_and_still_valid_former_current(self) -> None:
+        now = int(time.time())
+        primary = "1" * 40
+        current = "2" * 40
+        successor = "3" * 40
+        historical = "4" * 40
+        records = [
+            validator.KeyRecord("pub", "u", 255, 22, now - 86400, now + 365 * 86400,
+                                "c", "", primary),
+            validator.KeyRecord("sub", "u", 255, 22, now - 86400, now + 60 * 86400,
+                                "s", "", current),
+            validator.KeyRecord("sub", "i", 255, 22, now + 2 * 86400, now + 120 * 86400,
+                                "s", "", successor),
+            validator.KeyRecord("sub", "u", 255, 22, now - 10 * 86400, now + 30 * 86400,
+                                "s", "", historical),
+        ]
+
+        selected = validator.validate_public_key(
+            records,
+            primary,
+            current,
+            successor,
+            [historical],
+            30,
+            45,
+            180,
+            now,
+        )
+
+        self.assertEqual(current, selected.fingerprint)
+
+    def test_rejects_historical_subkey_that_expires_after_current(self) -> None:
+        now = int(time.time())
+        primary = "1" * 40
+        current = "2" * 40
+        successor = "3" * 40
+        historical = "4" * 40
+        records = [
+            validator.KeyRecord("pub", "u", 255, 22, now - 86400, now + 365 * 86400,
+                                "c", "", primary),
+            validator.KeyRecord("sub", "u", 255, 22, now - 86400, now + 60 * 86400,
+                                "s", "", current),
+            validator.KeyRecord("sub", "u", 255, 22, now - 86400, now + 120 * 86400,
+                                "s", "", successor),
+            validator.KeyRecord("sub", "u", 255, 22, now - 10 * 86400, now + 90 * 86400,
+                                "s", "", historical),
+        ]
+
+        with self.assertRaisesRegex(
+            validator.SigningMaterialError, "expires after the current"
+        ):
+            validator.validate_public_key(
+                records, primary, current, successor, [historical], 30, 45, 180, now
+            )
+
+    def test_rejects_full_fingerprints_with_colliding_rpm_key_ids(self) -> None:
+        current = "1" * 40
+        args = Namespace(
+            primary_fingerprint="2" * 40,
+            signing_subkey_fingerprint=current,
+            next_signing_subkey_fingerprint="3" * 24 + current[-16:],
+            historical_signing_subkey_fingerprint=[],
+            minimum_valid_days=30,
+            rotation_begin_days=45,
+            maximum_lifetime_days=180,
+        )
+
+        with self.assertRaisesRegex(
+            validator.SigningMaterialError, "distinct 16-hex key IDs"
+        ):
+            validator.validate_arguments(args)
 
     def test_accepts_ci_secrets_from_environment_without_disclosure(self) -> None:
         result = self.run_validator_with_secret_inputs(secret_from_stdin=False)
@@ -433,7 +623,7 @@ class SigningMaterialValidationTest(unittest.TestCase):
         result = self.run_validator(
             self.good, public_cert=self.good.public_cert_with_extra_subkeys
         )
-        self.assert_safe_failure(result, "exactly one subkey")
+        self.assert_safe_failure(result, "do not exactly match reviewed fingerprints")
 
     def test_rejects_mixed_capability_signing_subkey(self) -> None:
         result = self.run_validator(self.mixed)

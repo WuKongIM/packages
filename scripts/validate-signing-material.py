@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
+import hashlib
 import json
 import os
 import re
@@ -16,10 +17,11 @@ import subprocess
 import sys
 import tempfile
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Sequence
+from typing import Callable, Iterator, Sequence
 
 
 FINGERPRINT_RE = re.compile(r"^[0-9A-F]{40}$")
@@ -29,6 +31,9 @@ MAX_SECRET_BASE64_BYTES = 2 * 1024 * 1024
 MAX_PASSPHRASE_BYTES = 4096
 POLICY_MINIMUM_VALID_DAYS = 30
 POLICY_MAXIMUM_LIFETIME_DAYS = 180
+OPENPGP_RSA_ALGORITHM = 1
+OPENPGP_SHA256_ALGORITHM = 8
+RPM_RSA_BITS = frozenset({3072, 4096})
 BAD_VALIDITY = frozenset({"d", "e", "i", "r"})
 KNOWN_COLON_RECORDS = frozenset(
     {"cfg", "fpr", "grp", "pub", "rev", "rvk", "sec", "ssb", "sub", "tru", "uat", "uid"}
@@ -43,6 +48,8 @@ class SigningMaterialError(ValueError):
 class KeyRecord:
     record_type: str
     validity: str
+    key_bits: int
+    public_key_algorithm: int
     created: int
     expires: int | None
     capabilities: str
@@ -175,6 +182,13 @@ def parse_timestamp(value: str, label: str, *, optional: bool) -> int | None:
     return timestamp
 
 
+def parse_positive_integer(value: str, label: str) -> int:
+    require(value.isascii() and value.isdigit(), f"{label} must be a positive integer")
+    parsed = int(value)
+    require(parsed > 0, f"{label} must be a positive integer")
+    return parsed
+
+
 def parse_colon_keys(output: bytes, *, allow_no_keys: bool = False) -> list[KeyRecord]:
     try:
         text = output.decode("utf-8", errors="strict")
@@ -206,6 +220,10 @@ def parse_colon_keys(output: bytes, *, allow_no_keys: bool = False) -> list[KeyR
                 KeyRecord(
                     record_type=key_type,
                     validity=key_fields[1],
+                    key_bits=parse_positive_integer(key_fields[2], "key size"),
+                    public_key_algorithm=parse_positive_integer(
+                        key_fields[3], "public-key algorithm"
+                    ),
                     created=created,
                     expires=parse_timestamp(key_fields[6], "key expiration", optional=True),
                     capabilities=key_fields[11],
@@ -280,6 +298,85 @@ class IsolatedGPG:
         )
 
 
+@dataclass
+class ValidatedSigningSession:
+    """One validated family key kept inside its short-lived signing boundary."""
+
+    family: str
+    gpg: IsolatedGPG
+    passphrase: bytearray
+    primary_fingerprint: str
+    signing_subkey: KeyRecord
+    next_signing_subkey_fingerprint: str | None
+    historical_signing_subkey_fingerprints: tuple[str, ...]
+    public_certificate_sha256: str
+    public_certificate_size: int
+    minimum_valid_days: int
+    maximum_lifetime_days: int
+
+    @property
+    def signing_subkey_fingerprint(self) -> str:
+        return self.signing_subkey.fingerprint
+
+    def sign(
+        self,
+        source: Path,
+        output: Path,
+        *,
+        armor: bool,
+        cleartext: bool = False,
+        stage: str,
+    ) -> None:
+        """Sign one exact file with the reviewed subkey in this same GPG home."""
+
+        arguments = [
+            "--yes",
+            "--pinentry-mode",
+            "loopback",
+            "--passphrase-fd",
+            "0",
+            "--local-user",
+            f"{self.signing_subkey_fingerprint}!",
+            "--digest-algo",
+            "SHA256",
+        ]
+        if armor:
+            arguments.append("--armor")
+        arguments.extend(("--output", str(output)))
+        arguments.append("--clearsign" if cleartext else "--detach-sign")
+        arguments.append(str(source))
+        self.gpg.run(
+            arguments,
+            stage=stage,
+            input_bytes=bytes(self.passphrase) + b"\n",
+        )
+
+    def receipt(self) -> dict[str, object]:
+        """Return the canonical public validation facts for audit receipts."""
+
+        assert self.signing_subkey.expires is not None
+        return {
+            "family": self.family,
+            "maximum_lifetime_days": self.maximum_lifetime_days,
+            "minimum_valid_days": self.minimum_valid_days,
+            "primary_fingerprint": self.primary_fingerprint,
+            "public_certificate_sha256": self.public_certificate_sha256,
+            "public_certificate_size": self.public_certificate_size,
+            "next_signing_subkey_fingerprint": self.next_signing_subkey_fingerprint,
+            "historical_signing_subkey_fingerprints": list(
+                self.historical_signing_subkey_fingerprints
+            ),
+            "signing_subkey_created": datetime.fromtimestamp(
+                self.signing_subkey.created, timezone.utc
+            ).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "signing_subkey_expires": datetime.fromtimestamp(
+                self.signing_subkey.expires, timezone.utc
+            ).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "signing_subkey_fingerprint": self.signing_subkey_fingerprint,
+            "validated": True,
+        }
+
+
 def public_key_records(gpg: IsolatedGPG) -> list[KeyRecord]:
     result = gpg.run(
         [
@@ -299,38 +396,98 @@ def public_key_records(gpg: IsolatedGPG) -> list[KeyRecord]:
 def validate_public_key(
     records: list[KeyRecord],
     primary_fingerprint: str,
-    signing_subkey_fingerprint: str,
+    current_signing_subkey_fingerprint: str,
+    next_signing_subkey_fingerprint: str | None,
+    historical_signing_subkey_fingerprints: Sequence[str],
     minimum_valid_days: int,
+    rotation_begin_days: int,
     maximum_lifetime_days: int,
     now: int,
+    family: str = "apt",
 ) -> KeyRecord:
+    reviewed_fingerprints = [
+        primary_fingerprint,
+        current_signing_subkey_fingerprint,
+        *([next_signing_subkey_fingerprint]
+          if next_signing_subkey_fingerprint is not None else []),
+        *historical_signing_subkey_fingerprints,
+    ]
+    require(len({value[-16:] for value in reviewed_fingerprints})
+            == len(reviewed_fingerprints),
+            "reviewed OpenPGP fingerprints must have distinct 16-hex key IDs")
+    require(len({value[-8:] for value in reviewed_fingerprints})
+            == len(reviewed_fingerprints),
+            "reviewed OpenPGP fingerprints must have distinct 8-hex key IDs")
     primary_records = [record for record in records if record.record_type == "pub"]
     subkey_records = [record for record in records if record.record_type == "sub"]
     require(len(primary_records) == 1, "public certificate must contain exactly one primary key")
-    require(len(subkey_records) == 1, "public certificate must contain exactly one subkey")
+    expected_subkeys = {
+        current_signing_subkey_fingerprint,
+        *historical_signing_subkey_fingerprints,
+    }
+    if next_signing_subkey_fingerprint is not None:
+        expected_subkeys.add(next_signing_subkey_fingerprint)
+    require(len(subkey_records) == len(expected_subkeys)
+            and {record.fingerprint for record in subkey_records} == expected_subkeys,
+            "public certificate subkeys do not exactly match reviewed fingerprints")
     primary = primary_records[0]
     require(
         primary.fingerprint == primary_fingerprint,
         "public primary fingerprint does not match reviewed control",
     )
+    if family == "rpm":
+        validate_rpm_rsa_key(primary, "public RPM primary key")
     require("c" in primary.capabilities, "public primary key must have its own certify capability")
     require(not any(capability in primary.capabilities for capability in "sea"),
             "public primary key own capabilities must be certify-only")
     validate_usable(primary, "public primary key", minimum_valid_days, now, require_expiration=False)
 
-    signing_subkey = subkey_records[0]
-    require("s" in signing_subkey.capabilities,
-            "public signing subkey must have its own signing capability")
-    require(not any(capability in signing_subkey.capabilities for capability in "cea"),
-            "public signing subkey must be sign-only")
-    require(signing_subkey.fingerprint == signing_subkey_fingerprint,
-            "public signing-subkey fingerprint does not match reviewed control")
-    validate_usable(signing_subkey, "public signing subkey", minimum_valid_days, now,
+    by_fingerprint = {record.fingerprint: record for record in subkey_records}
+    for subkey in subkey_records:
+        if family == "rpm":
+            validate_rpm_rsa_key(subkey, "public RPM signing subkey")
+        require("s" in subkey.capabilities,
+                "public signing subkey must have its own signing capability")
+        require(not any(capability in subkey.capabilities for capability in "cea"),
+                "public signing subkey must be sign-only")
+        require(subkey.expires is not None, "public signing subkey must have an expiration")
+        require(subkey.expires - subkey.created <= maximum_lifetime_days * 86400,
+                "public signing subkey lifetime exceeds reviewed policy")
+
+    signing_subkey = by_fingerprint[current_signing_subkey_fingerprint]
+    validate_usable(signing_subkey, "public current signing subkey", minimum_valid_days, now,
                     require_expiration=True)
     assert signing_subkey.expires is not None
-    require(signing_subkey.expires - signing_subkey.created <= maximum_lifetime_days * 86400,
-            "public signing subkey lifetime exceeds reviewed policy")
+    if next_signing_subkey_fingerprint is not None:
+        successor = by_fingerprint[next_signing_subkey_fingerprint]
+        require(successor.validity not in {"d", "e", "r"},
+                "public next signing subkey is disabled, expired, or revoked")
+        require(successor.validity != "i" or successor.created > now,
+                "public next signing subkey is invalid")
+        assert successor.expires is not None
+        require(successor.expires >= signing_subkey.expires + rotation_begin_days * 86400,
+                "public next signing subkey does not extend the rotation runway")
+    for fingerprint in historical_signing_subkey_fingerprints:
+        historical = by_fingerprint[fingerprint]
+        require(historical.validity not in {"d", "i"}
+                and "D" not in historical.capabilities
+                and historical.created <= now,
+                "public historical signing subkey is not a former usable current")
+        assert historical.expires is not None
+        require(historical.expires <= signing_subkey.expires,
+                "public historical signing subkey expires after the current subkey")
     return signing_subkey
+
+
+def validate_rpm_rsa_key(record: KeyRecord, label: str) -> None:
+    require(
+        record.public_key_algorithm == OPENPGP_RSA_ALGORITHM,
+        f"{label} must use GnuPG public-key algorithm 1 (RSA)",
+    )
+    require(
+        record.key_bits in RPM_RSA_BITS,
+        f"{label} RSA key must be exactly 3072 or 4096 bits",
+    )
 
 
 def validate_usable(
@@ -391,6 +548,8 @@ def public_topology(records: list[KeyRecord]) -> list[tuple[object, ...]]:
     return [
         (
             record.record_type,
+            record.key_bits,
+            record.public_key_algorithm,
             record.created,
             record.expires,
             record.capabilities,
@@ -401,7 +560,10 @@ def public_topology(records: list[KeyRecord]) -> list[tuple[object, ...]]:
 
 
 def validate_secret_key(
-    records: list[KeyRecord], primary_fingerprint: str, signing_subkey_fingerprint: str
+    records: list[KeyRecord],
+    primary_fingerprint: str,
+    signing_subkey_fingerprint: str,
+    family: str = "apt",
 ) -> None:
     primary_records = [record for record in records if record.record_type == "sec"]
     subkey_records = [record for record in records if record.record_type == "ssb"]
@@ -409,6 +571,10 @@ def validate_secret_key(
     primary = primary_records[0]
     require(primary.fingerprint == primary_fingerprint, "secret material primary fingerprint is unexpected")
     require(primary.secret_marker == "#", "secret material must not contain a private primary key")
+    if family == "rpm":
+        validate_rpm_rsa_key(primary, "secret RPM primary-key stub")
+        for subkey in subkey_records:
+            validate_rpm_rsa_key(subkey, "secret RPM signing subkey")
 
     local_subkeys = [record for record in subkey_records if record.secret_marker in {"", "+"}]
     token_subkeys = [record for record in subkey_records if record.secret_marker not in {"", "+", "#"}]
@@ -435,6 +601,8 @@ def sign_and_verify(
         "0",
         "--local-user",
         f"{signing_subkey_fingerprint}!",
+        "--digest-algo",
+        "SHA256",
         "--output",
         str(signature),
         "--detach-sign",
@@ -463,106 +631,180 @@ def sign_and_verify(
     status = valid_signatures[0]
     require(len(status) >= 12, "proof signature VALIDSIG status is truncated")
     require(status[2] == signing_subkey_fingerprint, "proof signature used an unexpected signing subkey")
+    require(
+        status[9] == str(OPENPGP_SHA256_ALGORITHM),
+        "proof signature did not use SHA-256",
+    )
     require(status[-1] == primary_fingerprint, "proof signature belongs to an unexpected primary key")
 
 
-def validate_material(args: argparse.Namespace) -> dict[str, object]:
+def validate_arguments(args: argparse.Namespace) -> None:
+    """Validate the reviewed, non-secret controls before reading any secret."""
+
     require(FINGERPRINT_RE.fullmatch(args.primary_fingerprint) is not None,
             "reviewed primary fingerprint must be uppercase 40-hex")
     require(FINGERPRINT_RE.fullmatch(args.signing_subkey_fingerprint) is not None,
             "reviewed signing-subkey fingerprint must be uppercase 40-hex")
     require(args.primary_fingerprint != args.signing_subkey_fingerprint,
             "primary and signing-subkey fingerprints must differ")
+    optional_fingerprints = [
+        value for value in [
+            args.next_signing_subkey_fingerprint,
+            *args.historical_signing_subkey_fingerprint,
+        ] if value is not None
+    ]
+    require(all(FINGERPRINT_RE.fullmatch(value) is not None for value in optional_fingerprints),
+            "next and historical signing-subkey fingerprints must be uppercase 40-hex")
+    require(
+        args.historical_signing_subkey_fingerprint
+        == sorted(set(args.historical_signing_subkey_fingerprint)),
+        "historical signing-subkey fingerprints must be unique and sorted",
+    )
+    all_fingerprints = [
+        args.primary_fingerprint,
+        args.signing_subkey_fingerprint,
+        *optional_fingerprints,
+    ]
+    require(len(all_fingerprints) == len(set(all_fingerprints)),
+            "reviewed OpenPGP fingerprints must all be distinct")
+    require(len({value[-16:] for value in all_fingerprints}) == len(all_fingerprints),
+            "reviewed OpenPGP fingerprints must have distinct 16-hex key IDs")
+    require(len({value[-8:] for value in all_fingerprints}) == len(all_fingerprints),
+            "reviewed OpenPGP fingerprints must have distinct 8-hex key IDs")
     require(args.minimum_valid_days >= POLICY_MINIMUM_VALID_DAYS,
             f"minimum_valid_days must be at least {POLICY_MINIMUM_VALID_DAYS}")
     require(0 < args.maximum_lifetime_days <= POLICY_MAXIMUM_LIFETIME_DAYS,
             f"maximum_lifetime_days must be at most {POLICY_MAXIMUM_LIFETIME_DAYS}")
     require(args.minimum_valid_days <= args.maximum_lifetime_days,
             "minimum_valid_days must not exceed maximum_lifetime_days")
+    require(args.rotation_begin_days >= args.minimum_valid_days,
+            "rotation_begin_days must be at least minimum_valid_days")
 
+
+def erase(secret: bytearray) -> None:
+    """Best-effort overwrite of mutable secret buffers before releasing them."""
+
+    secret[:] = b"\x00" * len(secret)
+
+
+@contextmanager
+def validated_signing_session(args: argparse.Namespace) -> Iterator[ValidatedSigningSession]:
+    """Validate and retain exactly one family key for immediate in-process use.
+
+    Secret environment variables are removed as they are read.  The yielded
+    session, validation proof, and all caller-requested signatures therefore
+    share one temporary GNUPGHOME and one Python process boundary.
+    """
+
+    validate_arguments(args)
+
+    gpg_path = require_tool("gpg")
+    gpgconf_path = require_tool("gpgconf")
     public_cert = checked_regular_file(
         args.public_cert, "public certificate", MAX_PUBLIC_CERT_BYTES, secret=False
     )
-    secret_material = read_secret_base64(args)
-    passphrase = read_passphrase(args)
-    gpg_path = require_tool("gpg")
-    gpgconf_path = require_tool("gpgconf")
+    secret_material = bytearray()
+    passphrase = bytearray()
     now = int(time.time())
 
     # A short base path avoids GnuPG agent socket-length failures on macOS while
     # TemporaryDirectory still creates an unpredictable mode-0700 child.
     temporary_base = "/tmp" if Path("/tmp").is_dir() else None
-    with tempfile.TemporaryDirectory(
-        prefix=f"wk-{args.family}-signer-", dir=temporary_base
-    ) as directory:
-        home = Path(directory)
-        home.chmod(0o700)
-        gpg = IsolatedGPG(home, gpg_path, gpgconf_path)
-        try:
-            public_path = home / "reviewed-public-cert.gpg"
-            secret_path = home / "encrypted-secret-subkey.gpg"
-            public_path.write_bytes(public_cert)
-            public_path.chmod(0o600)
-            secret_path.write_bytes(secret_material)
-            secret_path.chmod(0o600)
+    try:
+        secret_material.extend(read_secret_base64(args))
+        passphrase.extend(read_passphrase(args))
+        with tempfile.TemporaryDirectory(
+            prefix=f"wk-{args.family}-signer-", dir=temporary_base
+        ) as directory:
+            home = Path(directory)
+            home.chmod(0o700)
+            gpg = IsolatedGPG(home, gpg_path, gpgconf_path)
+            try:
+                public_path = home / "reviewed-public-cert.gpg"
+                secret_path = home / "encrypted-secret-subkey.gpg"
+                public_path.write_bytes(public_cert)
+                public_path.chmod(0o600)
+                secret_path.write_bytes(secret_material)
+                secret_path.chmod(0o600)
 
-            gpg.run(["--import-options", "import-minimal", "--import", str(public_path)],
-                    stage="public-certificate import")
-            public_before = public_key_records(gpg)
-            signing_subkey = validate_public_key(
-                public_before,
-                args.primary_fingerprint,
-                args.signing_subkey_fingerprint,
-                args.minimum_valid_days,
-                args.maximum_lifetime_days,
-                now,
-            )
-            require(not secret_key_records_before_import(gpg),
-                    "public certificate must not contain secret key material")
+                gpg.run(["--import-options", "import-minimal", "--import", str(public_path)],
+                        stage="public-certificate import")
+                public_before = public_key_records(gpg)
+                signing_subkey = validate_public_key(
+                    public_before,
+                    args.primary_fingerprint,
+                    args.signing_subkey_fingerprint,
+                    args.next_signing_subkey_fingerprint,
+                    args.historical_signing_subkey_fingerprint,
+                    args.minimum_valid_days,
+                    args.rotation_begin_days,
+                    args.maximum_lifetime_days,
+                    now,
+                    args.family,
+                )
+                require(not secret_key_records_before_import(gpg),
+                        "public certificate must not contain secret key material")
 
-            gpg.run(["--import-options", "import-minimal", "--import", str(secret_path)],
-                    stage="secret-subkey import")
-            validate_secret_key(
-                secret_key_records(gpg),
-                args.primary_fingerprint,
-                args.signing_subkey_fingerprint,
-            )
-            public_after = public_key_records(gpg)
-            require(public_topology(public_after) == public_topology(public_before),
-                    "secret material changed the reviewed public certificate topology")
-            validate_public_key(
-                public_after,
-                args.primary_fingerprint,
-                args.signing_subkey_fingerprint,
-                args.minimum_valid_days,
-                args.maximum_lifetime_days,
-                now,
-            )
-            sign_and_verify(
-                gpg,
-                passphrase,
-                args.primary_fingerprint,
-                args.signing_subkey_fingerprint,
-            )
-        finally:
-            gpg.kill_agent()
+                gpg.run(["--import-options", "import-minimal", "--import", str(secret_path)],
+                        stage="secret-subkey import")
+                secret_path.unlink()
+                erase(secret_material)
+                validate_secret_key(
+                    secret_key_records(gpg),
+                    args.primary_fingerprint,
+                    args.signing_subkey_fingerprint,
+                    args.family,
+                )
+                public_after = public_key_records(gpg)
+                require(public_topology(public_after) == public_topology(public_before),
+                        "secret material changed the reviewed public certificate topology")
+                validate_public_key(
+                    public_after,
+                    args.primary_fingerprint,
+                    args.signing_subkey_fingerprint,
+                    args.next_signing_subkey_fingerprint,
+                    args.historical_signing_subkey_fingerprint,
+                    args.minimum_valid_days,
+                    args.rotation_begin_days,
+                    args.maximum_lifetime_days,
+                    now,
+                    args.family,
+                )
+                sign_and_verify(
+                    gpg,
+                    bytes(passphrase),
+                    args.primary_fingerprint,
+                    args.signing_subkey_fingerprint,
+                )
+                session = ValidatedSigningSession(
+                    family=args.family,
+                    gpg=gpg,
+                    passphrase=passphrase,
+                    primary_fingerprint=args.primary_fingerprint,
+                    signing_subkey=signing_subkey,
+                    next_signing_subkey_fingerprint=args.next_signing_subkey_fingerprint,
+                    historical_signing_subkey_fingerprints=tuple(
+                        args.historical_signing_subkey_fingerprint
+                    ),
+                    public_certificate_sha256=hashlib.sha256(public_cert).hexdigest(),
+                    public_certificate_size=len(public_cert),
+                    minimum_valid_days=args.minimum_valid_days,
+                    maximum_lifetime_days=args.maximum_lifetime_days,
+                )
+                yield session
+            finally:
+                gpg.kill_agent()
+    finally:
+        erase(secret_material)
+        erase(passphrase)
 
-    assert signing_subkey.expires is not None
-    return {
-        "schema": "wukongim/openpgp-signing-material-validation/v1",
-        "family": args.family,
-        "primary_fingerprint": args.primary_fingerprint,
-        "signing_subkey_fingerprint": args.signing_subkey_fingerprint,
-        "minimum_valid_days": args.minimum_valid_days,
-        "maximum_lifetime_days": args.maximum_lifetime_days,
-        "signing_subkey_created": datetime.fromtimestamp(
-            signing_subkey.created, timezone.utc
-        ).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "signing_subkey_expires": datetime.fromtimestamp(
-            signing_subkey.expires, timezone.utc
-        ).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "validated": True,
-    }
+
+def validate_material(args: argparse.Namespace) -> dict[str, object]:
+    with validated_signing_session(args) as session:
+        return {
+            "schema": "wukongim/openpgp-signing-material-validation/v1",
+            **session.receipt(),
+        }
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -580,7 +822,12 @@ def build_parser() -> argparse.ArgumentParser:
     passphrase_group.add_argument("--passphrase-env")
     parser.add_argument("--primary-fingerprint", required=True)
     parser.add_argument("--signing-subkey-fingerprint", required=True)
+    parser.add_argument("--next-signing-subkey-fingerprint")
+    parser.add_argument(
+        "--historical-signing-subkey-fingerprint", action="append", default=[]
+    )
     parser.add_argument("--minimum-valid-days", type=int, default=POLICY_MINIMUM_VALID_DAYS)
+    parser.add_argument("--rotation-begin-days", type=int, default=45)
     parser.add_argument("--maximum-lifetime-days", type=int, default=POLICY_MAXIMUM_LIFETIME_DAYS)
     return parser
 

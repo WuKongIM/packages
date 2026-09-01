@@ -1,0 +1,7 @@
+{
+  "schema": "wukongim.native_package_signing_toolchain/v1",
+  "enabled": false,
+  "image": "ghcr.io/wukongim/native-package-signing-toolchain",
+  "digest": null,
+  "workflow_sha": null
+}
