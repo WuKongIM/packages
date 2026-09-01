@@ -124,8 +124,8 @@ jobs:
           image="ghcr.io/wukongim/native-package-signing-toolchain@$IMAGE_DIGEST"
           mkdir -p "$RUNNER_TEMP/native-package-toolchain-receipt"
           docker run --rm --network none --read-only "$image" \
-            bash -euo pipefail -c \
-            'dpkg-query -W -f="${Package}\t${Version}\n" | LC_ALL=C sort' \
+            dpkg-query -W '-f=${Package}\t${Version}\n' \
+            | LC_ALL=C sort \
             >"$RUNNER_TEMP/native-package-toolchain-receipt/packages.tsv"
           jq -n \
             --arg schema 'wukongim/native-package-signing-toolchain-receipt/v1' \
