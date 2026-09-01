@@ -149,7 +149,7 @@ if (( $(grep -cF 'test "$(git rev-parse HEAD)" = "$CONTROL_SHA"' "$SIGNING_PREFL
   echo 'signing-material preflight must prove a clean exact checkout before exposing either secret' >&2
   exit 1
 fi
-if grep -Eq 'actions/upload-artifact@|actions/upload-pages-artifact@|actions/deploy-pages@|gh release|gh api|git push|refs/tags/|contents: write|packages: write|attestations: write|artifact-metadata: write|id-token: write|pages: write|secrets\.WK_PACKAGE_' "$SIGNING_PREFLIGHT_WORKFLOW"; then
+if grep -Eq 'actions/(upload|download)-artifact@|actions/upload-pages-artifact@|actions/deploy-pages@|actions/create-github-app-token@|gh release|gh api|git push|refs/tags/|contents: write|packages: write|attestations: write|artifact-metadata: write|id-token: write|pages: write|secrets\.WK_PACKAGE_|sign-package-family\.py|GITHUB_STEP_SUMMARY' "$SIGNING_PREFLIGHT_WORKFLOW"; then
   echo 'signing-material preflight must remain proof-only and read-only' >&2
   exit 1
 fi
@@ -509,6 +509,12 @@ for family in ("apt", "rpm"):
     secret = f"secrets.WK_{family.upper()}_PREVIEW_SECRET_SUBKEY_B64"
     if body.index(provenance) > body.index(secret):
         raise SystemExit(f"{family.upper()} preflight exposes its secret before provenance verification")
+    if body.count(
+        "git ls-remote https://github.com/WuKongIM/packages.git refs/heads/main"
+    ) != 2:
+        raise SystemExit(
+            f"{family.upper()} preflight must fence protected main immediately before and after secret validation"
+        )
     if "actions/upload-artifact@" in body or "actions/upload-pages-artifact@" in body:
         raise SystemExit(f"{family.upper()} preflight must not upload its validation receipt")
 
