@@ -145,7 +145,7 @@ sign-only subkey for that family. APT uses the protected
 `WK_APT_PREVIEW_SECRET_SUBKEY_B64` / `WK_APT_PREVIEW_PASSPHRASE` secrets. RPM
 uses `native-package-preview-rpm-signing` and the
 `WK_RPM_PREVIEW_SECRET_SUBKEY_B64` / `WK_RPM_PREVIEW_PASSPHRASE` secrets. The
-two offline certify-only primary keys must never be present in either
+two operator-retained certify-only primary keys must never be present in either
 environment.
 
 Each reviewed certificate contains one certify-only primary and an exact
@@ -205,28 +205,30 @@ reviewed signing-subkey fingerprint and SHA-256.
 The public certificates are part of every composed snapshot and audit archive,
 and are published at `/keys/apt-preview.asc` and `/keys/rpm-preview.asc`. The
 minimal rotation keeps the same family primary: the old current moves to
-`historical`, the pre-distributed next becomes current, and the offline primary
-certifies a new next. This promotion may happen at the 45-day rotation boundary
-without waiting for expiry or revoking a healthy former current. The next
-subkey must be present in the public certificate before the first signed
-publication. There is currently no repository keyring
+`historical`, the pre-distributed next becomes current, and the
+operator-retained primary certifies a new next. This promotion may happen at
+the 45-day rotation boundary without waiting for expiry or revoking a healthy
+former current. The next subkey must be present in the public certificate
+before the first signed publication. There is currently no repository keyring
 package, so this is not an automatic client key-rotation system. The initially
 pre-distributed next permits one promotion without a client update; clients
 must manually refresh the stable certificate URL while the current subkey is
 still valid to learn each later successor. Automatic ongoing delivery requires
 a separately designed and signed keyring package.
 
-Production primary-key generation is blocked until maintainers explicitly
-record the three offline storage media, three physical locations, and named
-custodians. The minimum recoverable ceremony creates each primary on an
-isolated machine and stores three tested encrypted primary-key backups on
-separate offline media in separate physical locations. Unlock and recovery use
-a documented 2-of-3 custodian control so no single custodian can recover a
-primary alone. Revocation certificates and a fingerprint/backup-digest record
-are stored with the recovery material, and an isolated 2-of-3 restore rehearsal
-is required before CI secrets are provisioned. A hardware token may hold the
-working ceremony copy, but it is not a substitute for the three tested
-encrypted backups.
+Preview primary-key generation currently uses an explicitly accepted
+single-operator online-workstation custody model. The named operator is
+`tangtaoit`. The operator retains one encrypted full-secret backup and its
+revocation certificate outside the repository in a mode-0700 local directory
+with mode-0600 files, stores each distinct passphrase in the operating-system
+credential store, and completes a restore check before CI secrets are
+provisioned. Only the encrypted current sign-only subkey is copied to its
+package-family Environment; the primary and next private keys never enter
+GitHub. This lower-assurance model does not claim resistance to compromise of
+the generation workstation. Moving preview signing to an offline or
+multi-custodian trust model requires generating new primary certificates under
+that model and distributing their public certificates; an online-generated
+primary cannot become retroactively offline.
 
 Stable private keys never enter GitHub-hosted CI. Stable publication uses an
 offline or hardware-backed signing ceremony. Promoting an RPM preserves the
@@ -289,10 +291,11 @@ control change while any draft, bind, publisher, or bootstrap deployment is in
 progress. Pull-request validation uses a separate concurrency group and cannot
 replace a queued production run.
 
-Suspected key compromise freezes publication. Using the offline family primary,
-maintainers revoke the affected subkey, promote the already distributed next
-subkey, certify and publish a new next, publish an incident notice, and remove
-affected versions from indexes or rebuild signed bytes as required. A preserved
+Suspected key compromise freezes publication. Using the operator-retained
+family primary, maintainers revoke the affected subkey, promote the already
+distributed next subkey, certify and publish a new next, publish an incident
+notice, and remove affected versions from indexes or rebuild signed bytes as
+required. A preserved
 RPM whose issuer is revoked must fail verification and cannot remain published
 under the normal historical-key exception. The
 updated certificate, manifest, snapshot, and audit receipt must agree before
