@@ -1,0 +1,98 @@
+name: Safety Automation - Drill Native Package Repository
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/native-package-repository-drill.yml"
+      - "manifests/**"
+      - "scripts/**"
+      - "tests/**"
+      - "docs/**"
+      - "README.md"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-package-repository-drill-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  drill:
+    name: TEST ONLY signed APT/RPM repository
+    if: github.repository == 'WuKongIM/packages'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Check out exact package-repository control
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Validate reviewed control
+        id: toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./tests/contract.sh
+          commit="$(jq -r '.commit' manifests/trusted-toolchain.json)"
+          [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+
+      - name: Check out immutable trusted repository tools
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: WuKongIM/WuKongIM
+          ref: ${{ steps.toolchain.outputs.commit }}
+          path: .trusted/wukongim
+          persist-credentials: false
+
+      - name: Verify trusted repository tool bytes
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C .trusted/wukongim rev-parse HEAD)" = "${{ steps.toolchain.outputs.commit }}"
+          jq -r \
+            '.files | to_entries[] | "\(.value)  .trusted/wukongim/\(.key)"' \
+            manifests/trusted-toolchain.json | sha256sum --check --strict
+
+      - name: Set up fixed GoReleaser toolchain
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: "1.27.0"
+          cache-dependency-path: .trusted/wukongim/go.sum
+          cache: true
+
+      - name: Install fixed GoReleaser version
+        shell: bash
+        run: |
+          set -euo pipefail
+          install_dir="$RUNNER_TEMP/goreleaser-bin"
+          mkdir -p "$install_dir"
+          GOBIN="$install_dir" go install github.com/goreleaser/goreleaser/v2@v2.18.0
+          echo "install_dir=$install_dir" >> "$GITHUB_ENV"
+
+      - name: Restore exact source Go toolchain
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: .trusted/wukongim/go.mod
+          cache-dependency-path: .trusted/wukongim/go.sum
+          cache: true
+
+      - name: Build unsigned TEST ONLY packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd .trusted/wukongim
+          "$install_dir/goreleaser" release --snapshot --clean --config .goreleaser.packages.yaml
+
+      - name: Build, sign, verify, and install TEST ONLY repositories
+        env:
+          WK_NATIVE_PACKAGE_DIST_DIR: ${{ github.workspace }}/.trusted/wukongim/dist
+        run: .trusted/wukongim/scripts/validate-native-package-repositories-container.sh
+
+      - name: Reject tracked-tree mutation
+        if: always()
+        shell: bash
+        run: git diff --exit-code HEAD -- . ':!.trusted'

@@ -10,6 +10,7 @@ on:
       - ".github/CODEOWNERS"
       - "keys/**"
       - "manifests/**"
+      - "scripts/**"
       - "site/**"
       - "tests/**"
       - "README.md"
@@ -29,6 +30,8 @@ jobs:
     if: github.repository == 'WuKongIM/packages'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    outputs:
+      deploy_bootstrap: ${{ steps.control.outputs.deploy_bootstrap }}
     permissions:
       contents: read
     steps:
@@ -38,12 +41,21 @@ jobs:
           persist-credentials: false
 
       - name: Validate repository contracts
-        run: ./tests/contract.sh
+        id: control
+        run: |
+          ./tests/contract.sh
+          if [[ "$(jq -r '.channels.preview.enabled' manifests/channels.json)" == "false" ]]; then
+            echo 'deploy_bootstrap=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'deploy_bootstrap=false' >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Configure Pages
+        if: steps.control.outputs.deploy_bootstrap == 'true'
         uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5
 
       - name: Upload complete Pages artifact
+        if: steps.control.outputs.deploy_bootstrap == 'true'
         uses: actions/upload-pages-artifact@7b1f4a764d45c48632c6b24a0339c27f5614fb0b # v4
         with:
           path: site
@@ -53,7 +65,8 @@ jobs:
     if: >-
       github.repository == 'WuKongIM/packages' &&
       github.ref == 'refs/heads/main' &&
-      github.event_name != 'pull_request'
+      github.event_name != 'pull_request' &&
+      needs.build.outputs.deploy_bootstrap == 'true'
     needs: build
     runs-on: ubuntu-24.04
     timeout-minutes: 10
