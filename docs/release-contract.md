@@ -258,6 +258,12 @@ source Release payload. The credential-free TEST ONLY drill may install the
 packages it builds from the immutable trusted-tool commit. There is no in-place
 mutation of the live repository.
 
+The first `add_release` deployment accepts only the provisioned bootstrap
+status with both package families disabled and reason
+`awaiting_first_release`. A stale `signing_not_provisioned` bootstrap is not a
+valid predecessor for production publication; operators must first complete
+the reviewed signing-provisioning bootstrap deployment.
+
 Exact release assets are never overwritten. A retry may finish an exact
 matching draft or redeploy an already verified immutable snapshot. A mutable
 published release, a digest conflict, unexpected assets, or an unverifiable

@@ -289,6 +289,26 @@ grep -Fq -- '--signing-toolchain' "$PUBLISH_WORKFLOW"
 grep -Fq 'native-package-public-snapshot-' "$PUBLISH_WORKFLOW"
 grep -Fq -- '--snapshot "$snapshot"' "$PUBLISH_WORKFLOW"
 grep -Fq '.snapshot_verified == true and .status_revalidated == true' "$PUBLISH_WORKFLOW"
+grep -Fq 'keys == ["apt", "reason", "rpm", "schema"]' "$PUBLISH_WORKFLOW"
+grep -Fq '.apt == false and .rpm == false and .reason == "awaiting_first_release"' "$PUBLISH_WORKFLOW"
+if grep -Fq '.reason == "signing_not_provisioned"' "$PUBLISH_WORKFLOW"; then
+  echo 'first publication must start from the provisioned awaiting_first_release bootstrap' >&2
+  exit 1
+fi
+first_bootstrap_filter='keys == ["apt", "reason", "rpm", "schema"] and .schema == "wukongim.native_package_repository_status/v1" and .apt == false and .rpm == false and .reason == "awaiting_first_release"'
+jq -e "$first_bootstrap_filter" >/dev/null \
+  <<<'{"schema":"wukongim.native_package_repository_status/v1","apt":false,"rpm":false,"reason":"awaiting_first_release"}'
+for invalid_bootstrap in \
+  '{"schema":"wukongim.native_package_repository_status/v1","apt":false,"rpm":false,"reason":"signing_not_provisioned"}' \
+  '{"schema":"wukongim.native_package_repository_status/v1","apt":false,"rpm":false,"reason":"ready"}' \
+  '{"schema":"wukongim.native_package_repository_status/v2","apt":false,"rpm":false,"reason":"awaiting_first_release"}' \
+  '{"schema":"wukongim.native_package_repository_status/v1","apt":false,"rpm":false,"reason":"awaiting_first_release","extra":true}'
+do
+  if jq -e "$first_bootstrap_filter" >/dev/null <<<"$invalid_bootstrap"; then
+    echo 'first publication accepted an invalid bootstrap status' >&2
+    exit 1
+  fi
+done
 if (( $(grep -cF -- '--expected-version "$TARGET_VERSION"' "$PUBLISH_WORKFLOW") != 2 )); then
   echo 'local and remote add_release clients must download the exact target version' >&2
   exit 1

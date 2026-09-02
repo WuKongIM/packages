@@ -1290,8 +1290,9 @@ jobs:
               "$RUNNER_TEMP/live-base-receipt.json" >/dev/null
             deploy_needed=true
           elif [[ -z "$BASE_AUDIT_RELEASE_ID" ]] && jq -e \
-            '.schema == "wukongim.native_package_repository_status/v1" and
-             .apt == false and .rpm == false and .reason == "signing_not_provisioned"' \
+            'keys == ["apt", "reason", "rpm", "schema"] and
+             .schema == "wukongim.native_package_repository_status/v1" and
+             .apt == false and .rpm == false and .reason == "awaiting_first_release"' \
             "$remote" >/dev/null; then
             deploy_needed=true
           else
