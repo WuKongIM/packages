@@ -274,9 +274,16 @@ creates one canonical empty draft and reports its numeric ID while its final
 non-version tag is still absent. A protected control change records that ID;
 the bind run then creates the lightweight
 `native-package-preview-r<ID>` tag once at that exact control commit and changes
-only the empty draft's `target_commitish`. The publisher accepts only the exact
-reserved tag and numeric ID. The tag namespace must forbid deletion and force
-updates. Two active, aggregating tag rulesets must match
+only the empty draft's `target_commitish`. GitHub may detach a draft to a
+generated `untagged-<20hex>` identity when the real tag is materialized. The
+binder accepts that intermediate identity only while the Release remains the
+exact empty draft and the canonical lightweight tag already points to the
+reviewed control commit. The generated name must have no corresponding Git ref
+and must remain byte-for-byte stable across recovery reads; the binder then
+restores only the canonical `tag_name` and revalidates both objects. The
+publisher accepts only the exact reserved tag and
+numeric ID. The tag namespace must forbid deletion and force updates. Two
+active, aggregating tag rulesets must match
 `refs/tags/native-package-preview-r*`: a creation-only ruleset grants its sole
 bypass to the numeric Integration ID of the Package Publisher App, while an
 immutability ruleset denies update, deletion, and non-fast-forward operations

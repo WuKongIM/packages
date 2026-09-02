@@ -95,7 +95,7 @@ jobs:
             exit 78
           }
 
-      - name: Bind only target_commitish on exact empty draft
+      - name: Bind exact empty draft and restore canonical tag association
         id: binding
         shell: bash
         env:
@@ -114,6 +114,7 @@ jobs:
             --argjson id "$RELEASE_ID" \
             --arg sha "$GITHUB_SHA" \
             '.release_id == $id and .control_sha == $sha and
+             (.release_tag_repaired | type) == "boolean" and
              .audit_tag_reserved == true and
              .empty_draft_revalidated == true' \
             "$evidence" >/dev/null
@@ -145,7 +146,7 @@ jobs:
             echo
             echo "- Release id: \`$RELEASE_ID\`"
             echo "- Control commit: \`$GITHUB_SHA\`"
-            echo '- The non-version audit tag was reserved; no asset, package, signature, product version tag, or Pages content was published.'
+            echo '- The non-version audit tag was reserved and its canonical draft association was verified; no asset, package, signature, product version tag, or Pages content was published.'
           } >>"$GITHUB_STEP_SUMMARY"
 
       - name: Reject tracked-tree mutation

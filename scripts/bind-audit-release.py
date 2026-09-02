@@ -2,10 +2,11 @@
 """Bind one empty numeric package audit draft to the reviewed control commit.
 
 This is a deliberately narrow GitHub writer.  It can change only
-``target_commitish`` on an empty, canonical, unpublished audit draft and
-reserve that draft's canonical lightweight audit tag at the reviewed control
-commit.  The caller is responsible for proving that the previous commit is an
-ancestor of the new protected ``main`` commit before invoking this program.
+``target_commitish`` on an empty, canonical, unpublished audit draft, reserve
+that draft's canonical lightweight audit tag at the reviewed control commit,
+and restore ``tag_name`` when GitHub detaches the draft while materializing the
+same tag.  The caller is responsible for proving that the previous commit is
+an ancestor of the new protected ``main`` commit before invoking this program.
 """
 
 from __future__ import annotations
@@ -25,6 +26,7 @@ from typing import Any
 AUDIT_REPOSITORY = "WuKongIM/packages"
 RESULT_SCHEMA = "wukongim/package-audit-release-binding/v1"
 CONTROL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+GITHUB_DETACHED_TAG_RE = re.compile(r"^untagged-[0-9a-f]{20}$")
 MAX_JSON_BYTES = 8 * 1024 * 1024
 
 
@@ -100,10 +102,13 @@ class GitHubWriter:
         path: str,
         payload: dict[str, Any] | None = None,
         *,
+        allow_not_found: bool = False,
         allow_unprocessable: bool = False,
     ) -> dict[str, Any] | None:
         if method not in {"GET", "PATCH", "POST"}:
             raise BindingError(f"unsupported GitHub API method: {method}")
+        if allow_not_found and method != "GET":
+            raise BindingError("only a GitHub API GET may allow a missing response")
         body = None
         if payload is not None:
             body = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
@@ -123,6 +128,9 @@ class GitHubWriter:
             with self._opener.open(request, timeout=30) as response:
                 data = response.read(MAX_JSON_BYTES + 1)
         except urllib.error.HTTPError as error:
+            if allow_not_found and error.code == 404:
+                error.read(MAX_JSON_BYTES + 1)
+                return None
             if allow_unprocessable and error.code == 422:
                 error.read(MAX_JSON_BYTES + 1)
                 return None
@@ -139,6 +147,41 @@ class GitHubWriter:
             return _require_object(json.loads(data), f"GitHub API response for {path}")
         except (UnicodeDecodeError, json.JSONDecodeError) as error:
             raise BindingError(f"GitHub API returned invalid JSON for {path}") from error
+
+    @staticmethod
+    def _validate_lightweight_tag(
+        value: dict[str, Any] | None, tag_name: str, control_sha: str
+    ) -> None:
+        if value is None:
+            raise BindingError("GitHub returned an empty audit tag response")
+        target = _require_object(value.get("object"), "audit tag target")
+        if (
+            value.get("ref") != f"refs/tags/{tag_name}"
+            or target.get("type") != "commit"
+            or target.get("sha") != control_sha
+        ):
+            raise BindingError(
+                "canonical audit tag does not point to the reviewed control commit"
+            )
+
+    def require_lightweight_tag(self, tag_name: str, control_sha: str) -> None:
+        """Prove that the canonical lightweight tag already exists and is exact."""
+
+        value = self.request_json(
+            "GET", f"repos/{AUDIT_REPOSITORY}/git/ref/tags/{tag_name}"
+        )
+        self._validate_lightweight_tag(value, tag_name, control_sha)
+
+    def require_lightweight_tag_absent(self, tag_name: str) -> None:
+        """Prove that a GitHub-generated detached Release name is not a ref."""
+
+        value = self.request_json(
+            "GET",
+            f"repos/{AUDIT_REPOSITORY}/git/ref/tags/{tag_name}",
+            allow_not_found=True,
+        )
+        if value is not None:
+            raise BindingError("detached audit Release tag_name must not have a Git ref")
 
     def ensure_lightweight_tag(self, tag_name: str, control_sha: str) -> bool:
         """Create the canonical tag once, or prove an existing ref is exact."""
@@ -157,27 +200,26 @@ class GitHubWriter:
         else:
             value = created
             was_created = True
-        if value is None:
-            raise BindingError("GitHub returned an empty audit tag response")
-        target = _require_object(value.get("object"), "audit tag target")
-        if (
-            value.get("ref") != f"refs/tags/{tag_name}"
-            or target.get("type") != "commit"
-            or target.get("sha") != control_sha
-        ):
-            raise BindingError(
-                "canonical audit tag does not point to the reviewed control commit"
-            )
+        self._validate_lightweight_tag(value, tag_name, control_sha)
         return was_created
 
 
 def _empty_draft_snapshot(
-    release: dict[str, Any], release_id: int, expected_control_shas: set[str]
+    release: dict[str, Any],
+    release_id: int,
+    expected_control_shas: set[str],
+    *,
+    allow_github_detached_tag: bool = False,
 ) -> dict[str, Any]:
     if release.get("id") != release_id:
         raise BindingError("audit Release id does not match the requested numeric id")
     expected_tag, expected_name = expected_release_identity(release_id)
-    if release.get("tag_name") != expected_tag:
+    tag_name = release.get("tag_name")
+    if tag_name != expected_tag and not (
+        allow_github_detached_tag
+        and isinstance(tag_name, str)
+        and GITHUB_DETACHED_TAG_RE.fullmatch(tag_name)
+    ):
         raise BindingError(f"audit Release tag must be {expected_tag}")
     if release.get("name") != expected_name:
         raise BindingError(f"audit Release name must be {expected_name}")
@@ -200,7 +242,7 @@ def _empty_draft_snapshot(
         )
     return {
         "id": release_id,
-        "tag_name": expected_tag,
+        "tag_name": tag_name,
         "name": expected_name,
         "target_commitish": target_commitish,
         "draft": True,
@@ -232,29 +274,93 @@ def bind_audit_release(
 
     writer = GitHubWriter(api_base_url, token)
     path = f"repos/{AUDIT_REPOSITORY}/releases/{release_id}"
+    expected_tag, _ = expected_release_identity(release_id)
     initial = _empty_draft_snapshot(
         _require_object(writer.request_json("GET", path), "initial audit Release"),
         release_id,
         {expected_previous_control_sha, expected_control_sha},
+        allow_github_detached_tag=True,
     )
     # Reserve the create-only canonical ref before changing the Release.  A
     # conflicting ref therefore cannot leave the draft rebound but unusable.
     # If the create succeeded and a later PATCH response was lost, a retry may
     # accept only the already-exact lightweight ref.
-    tag_created = writer.ensure_lightweight_tag(initial["tag_name"], expected_control_sha)
+    if initial["tag_name"] == expected_tag:
+        tag_created = writer.ensure_lightweight_tag(
+            expected_tag, expected_control_sha
+        )
+    else:
+        # A retry may observe the exact intermediate state GitHub creates when
+        # a real tag is materialized for a draft.  Never create a missing ref
+        # from that noncanonical state; require the already-reserved exact ref.
+        writer.require_lightweight_tag(expected_tag, expected_control_sha)
+        writer.require_lightweight_tag_absent(initial["tag_name"])
+        tag_created = False
+
+    current = _empty_draft_snapshot(
+        _require_object(
+            writer.request_json("GET", path), "post-reservation audit Release"
+        ),
+        release_id,
+        {expected_previous_control_sha, expected_control_sha},
+        allow_github_detached_tag=True,
+    )
+    normalized_initial = {**initial, "tag_name": expected_tag}
+    normalized_current = {**current, "tag_name": expected_tag}
+    if normalized_initial != normalized_current:
+        raise BindingError("audit Release identity or state changed during tag reservation")
+    if current["tag_name"] != expected_tag:
+        writer.require_lightweight_tag_absent(current["tag_name"])
+    if initial["tag_name"] != expected_tag:
+        if current["tag_name"] != initial["tag_name"]:
+            raise BindingError("detached audit Release tag_name changed concurrently")
+    elif current["tag_name"] != expected_tag and not tag_created:
+        raise BindingError("audit Release tag_name changed without this run creating the tag")
+
     updated = initial["target_commitish"] != expected_control_sha
     if updated:
+        previous_tag_name = current["tag_name"]
         patched = _require_object(writer.request_json(
             "PATCH", path, {"target_commitish": expected_control_sha}
         ), "patched audit Release")
-        _empty_draft_snapshot(patched, release_id, {expected_control_sha})
+        current = _empty_draft_snapshot(
+            patched,
+            release_id,
+            {expected_control_sha},
+            allow_github_detached_tag=True,
+        )
+        if current["tag_name"] != expected_tag:
+            writer.require_lightweight_tag_absent(current["tag_name"])
+        if (
+            previous_tag_name != expected_tag
+            and current["tag_name"] != previous_tag_name
+        ):
+            raise BindingError("detached audit Release tag_name changed during binding")
+
+    release_tag_repaired = current["tag_name"] != expected_tag
+    if release_tag_repaired:
+        current = _empty_draft_snapshot(
+            _require_object(
+                writer.request_json("PATCH", path, {"tag_name": expected_tag}),
+                "repaired audit Release",
+            ),
+            release_id,
+            {expected_control_sha},
+        )
+
     final = _empty_draft_snapshot(
         _require_object(writer.request_json("GET", path), "final audit Release"),
         release_id,
         {expected_control_sha},
     )
-    if {**initial, "target_commitish": expected_control_sha} != final:
+    expected_final = {
+        **initial,
+        "tag_name": expected_tag,
+        "target_commitish": expected_control_sha,
+    }
+    if expected_final != final:
         raise BindingError("audit Release identity or state changed during control binding")
+    writer.require_lightweight_tag(expected_tag, expected_control_sha)
     return {
         "schema": RESULT_SCHEMA,
         "repository": AUDIT_REPOSITORY,
@@ -264,6 +370,7 @@ def bind_audit_release(
         "control_sha": expected_control_sha,
         "updated": updated,
         "audit_tag_created": tag_created,
+        "release_tag_repaired": release_tag_repaired,
         "audit_tag_reserved": True,
         "empty_draft_revalidated": True,
     }

@@ -26,6 +26,7 @@ class FixtureState:
     def __init__(self) -> None:
         self.release_id = RELEASE_ID
         self.tag_name, self.name = binder.expected_release_identity(RELEASE_ID)
+        self.release_tag_name = self.tag_name
         self.target_commitish = OLD_SHA
         self.draft = True
         self.prerelease = True
@@ -35,13 +36,19 @@ class FixtureState:
         self.patch_payloads: list[dict[str, Any]] = []
         self.post_payloads: list[dict[str, Any]] = []
         self.tag_sha: str | None = None
+        self.detached_tag_sha: str | None = None
         self.authorization: list[str | None] = []
         self.change_after_patch = False
+        self.detach_release_on_tag_create = False
+        self.detach_release_on_target_patch = False
+        self.change_detached_on_target_patch = False
+        self.change_release_tag_after_initial_get = False
+        self.release_get_count = 0
 
     def release(self) -> dict[str, Any]:
         return {
             "id": self.release_id,
-            "tag_name": self.tag_name,
+            "tag_name": self.release_tag_name,
             "name": self.name,
             "target_commitish": self.target_commitish,
             "draft": self.draft,
@@ -68,18 +75,32 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         self.server.state.authorization.append(self.headers.get("Authorization"))
-        if self.path == f"/repos/{binder.AUDIT_REPOSITORY}/git/ref/tags/{self.server.state.tag_name}":
-            if self.server.state.tag_sha is None:
+        tag_prefix = f"/repos/{binder.AUDIT_REPOSITORY}/git/ref/tags/"
+        if self.path.startswith(tag_prefix):
+            tag_name = self.path.removeprefix(tag_prefix)
+            if tag_name == self.server.state.tag_name:
+                tag_sha = self.server.state.tag_sha
+            elif tag_name == self.server.state.release_tag_name:
+                tag_sha = self.server.state.detached_tag_sha
+            else:
+                tag_sha = None
+            if tag_sha is None:
                 self.send_error(404)
                 return
             self._response({
-                "ref": f"refs/tags/{self.server.state.tag_name}",
-                "object": {"type": "commit", "sha": self.server.state.tag_sha},
+                "ref": f"refs/tags/{tag_name}",
+                "object": {"type": "commit", "sha": tag_sha},
             })
             return
         if self.path != f"/repos/{binder.AUDIT_REPOSITORY}/releases/{RELEASE_ID}":
             self.send_error(404)
             return
+        if (
+            self.server.state.change_release_tag_after_initial_get
+            and self.server.state.release_get_count > 0
+        ):
+            self.server.state.release_tag_name = f"untagged-{'f' * 20}"
+        self.server.state.release_get_count += 1
         if self.server.state.change_after_patch and self.server.state.patch_payloads:
             self.server.state.assets = [{"id": 9, "name": "unexpected"}]
         self._response(self.server.state.release())
@@ -96,6 +117,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(422)
             return
         self.server.state.tag_sha = payload["sha"]
+        if self.server.state.detach_release_on_tag_create:
+            self.server.state.release_tag_name = f"untagged-{'d' * 20}"
         self._response({
             "ref": payload["ref"],
             "object": {"type": "commit", "sha": payload["sha"]},
@@ -111,6 +134,12 @@ class Handler(BaseHTTPRequestHandler):
         self.server.state.patch_payloads.append(payload)
         if set(payload) == {"target_commitish"}:
             self.server.state.target_commitish = payload["target_commitish"]
+            if self.server.state.detach_release_on_target_patch:
+                self.server.state.release_tag_name = f"untagged-{'d' * 20}"
+            elif self.server.state.change_detached_on_target_patch:
+                self.server.state.release_tag_name = f"untagged-{'f' * 20}"
+        elif set(payload) == {"tag_name"}:
+            self.server.state.release_tag_name = payload["tag_name"]
         self._response(self.server.state.release())
 
 
@@ -167,11 +196,157 @@ class BindAuditReleaseTest(unittest.TestCase):
         self.assertEqual(state.target_commitish, NEW_SHA)
         self.assertTrue(result["updated"])
         self.assertTrue(result["audit_tag_created"])
+        self.assertFalse(result["release_tag_repaired"])
         self.assertTrue(result["audit_tag_reserved"])
         self.assertTrue(result["empty_draft_revalidated"])
         self.assertEqual(result["previous_control_sha"], OLD_SHA)
         self.assertEqual(result["control_sha"], NEW_SHA)
         self.assertTrue(all(value == "Bearer fixture-token" for value in state.authorization))
+
+    def test_repairs_github_detachment_after_reserving_tag(self) -> None:
+        state = FixtureState()
+        state.detach_release_on_tag_create = True
+
+        result = self.bind(state)
+
+        self.assertEqual(
+            state.patch_payloads,
+            [
+                {"target_commitish": NEW_SHA},
+                {"tag_name": state.tag_name},
+            ],
+        )
+        self.assertEqual(state.release_tag_name, state.tag_name)
+        self.assertEqual(state.target_commitish, NEW_SHA)
+        self.assertTrue(result["release_tag_repaired"])
+
+    def test_repairs_github_detachment_during_target_patch(self) -> None:
+        state = FixtureState()
+        state.detach_release_on_target_patch = True
+
+        result = self.bind(state)
+
+        self.assertEqual(
+            state.patch_payloads,
+            [
+                {"target_commitish": NEW_SHA},
+                {"tag_name": state.tag_name},
+            ],
+        )
+        self.assertEqual(state.release_tag_name, state.tag_name)
+        self.assertEqual(state.target_commitish, NEW_SHA)
+        self.assertTrue(result["release_tag_repaired"])
+
+    def test_retry_repairs_only_an_exact_detached_release(self) -> None:
+        state = FixtureState()
+        state.release_tag_name = f"untagged-{'e' * 20}"
+        state.target_commitish = NEW_SHA
+        state.tag_sha = NEW_SHA
+
+        result = self.bind(state)
+
+        self.assertEqual(state.post_payloads, [])
+        self.assertEqual(state.patch_payloads, [{"tag_name": state.tag_name}])
+        self.assertFalse(result["updated"])
+        self.assertFalse(result["audit_tag_created"])
+        self.assertTrue(result["release_tag_repaired"])
+
+    def test_retry_finishes_target_update_before_repairing_detachment(self) -> None:
+        state = FixtureState()
+        state.release_tag_name = f"untagged-{'e' * 20}"
+        state.tag_sha = NEW_SHA
+
+        result = self.bind(state)
+
+        self.assertEqual(state.post_payloads, [])
+        self.assertEqual(
+            state.patch_payloads,
+            [
+                {"target_commitish": NEW_SHA},
+                {"tag_name": state.tag_name},
+            ],
+        )
+        self.assertTrue(result["updated"])
+        self.assertTrue(result["release_tag_repaired"])
+
+    def test_rejects_detached_release_without_exact_reserved_tag(self) -> None:
+        for tag_sha, pattern in (
+            (None, "GET failed"),
+            ("c" * 40, "does not point to the reviewed control"),
+        ):
+            with self.subTest(tag_sha=tag_sha):
+                state = FixtureState()
+                state.release_tag_name = f"untagged-{'e' * 20}"
+                state.target_commitish = NEW_SHA
+                state.tag_sha = tag_sha
+                with self.assertRaisesRegex(binder.BindingError, pattern):
+                    self.bind(state)
+                self.assertEqual(state.post_payloads, [])
+                self.assertEqual(state.patch_payloads, [])
+
+    def test_rejects_noncanonical_detached_tag_pattern_without_writes(self) -> None:
+        state = FixtureState()
+        state.release_tag_name = "untagged-not-a-github-placeholder"
+        state.target_commitish = NEW_SHA
+        state.tag_sha = NEW_SHA
+
+        with self.assertRaisesRegex(binder.BindingError, "tag must"):
+            self.bind(state)
+
+        self.assertEqual(state.post_payloads, [])
+        self.assertEqual(state.patch_payloads, [])
+
+    def test_rejects_detached_release_name_that_is_also_a_git_ref(self) -> None:
+        state = FixtureState()
+        state.release_tag_name = f"untagged-{'e' * 20}"
+        state.target_commitish = NEW_SHA
+        state.tag_sha = NEW_SHA
+        state.detached_tag_sha = NEW_SHA
+
+        with self.assertRaisesRegex(binder.BindingError, "must not have a Git ref"):
+            self.bind(state)
+
+        self.assertEqual(state.post_payloads, [])
+        self.assertEqual(state.patch_payloads, [])
+
+    def test_rejects_concurrent_detached_name_change_between_reads(self) -> None:
+        state = FixtureState()
+        state.release_tag_name = f"untagged-{'e' * 20}"
+        state.target_commitish = NEW_SHA
+        state.tag_sha = NEW_SHA
+        state.change_release_tag_after_initial_get = True
+
+        with self.assertRaisesRegex(binder.BindingError, "changed concurrently"):
+            self.bind(state)
+
+        self.assertEqual(state.post_payloads, [])
+        self.assertEqual(state.patch_payloads, [])
+
+    def test_rejects_detachment_without_this_run_creating_the_tag(self) -> None:
+        state = FixtureState()
+        state.target_commitish = NEW_SHA
+        state.tag_sha = NEW_SHA
+        state.change_release_tag_after_initial_get = True
+
+        with self.assertRaisesRegex(binder.BindingError, "without this run"):
+            self.bind(state)
+
+        self.assertEqual(state.post_payloads, [
+            {"ref": f"refs/tags/{state.tag_name}", "sha": NEW_SHA},
+        ])
+        self.assertEqual(state.patch_payloads, [])
+
+    def test_rejects_detached_name_change_during_target_patch(self) -> None:
+        state = FixtureState()
+        state.release_tag_name = f"untagged-{'e' * 20}"
+        state.tag_sha = NEW_SHA
+        state.change_detached_on_target_patch = True
+
+        with self.assertRaisesRegex(binder.BindingError, "changed during binding"):
+            self.bind(state)
+
+        self.assertEqual(state.post_payloads, [])
+        self.assertEqual(state.patch_payloads, [{"target_commitish": NEW_SHA}])
 
     def test_same_commit_is_idempotent_without_patch(self) -> None:
         state = FixtureState()
@@ -202,7 +377,7 @@ class BindAuditReleaseTest(unittest.TestCase):
 
     def test_rejects_noncanonical_or_nonempty_release(self) -> None:
         mutations = (
-            ("tag_name", "wrong", "tag must"),
+            ("release_tag_name", "wrong", "tag must"),
             ("name", "wrong", "name must"),
             ("draft", False, "remain a draft"),
             ("prerelease", False, "remain a prerelease"),
