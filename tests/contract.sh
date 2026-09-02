@@ -842,6 +842,10 @@ test -f "$ROOT_DIR/scripts/verify-production-package-site.py"
 grep -Fq 'RSAHEADER:armor' "$ROOT_DIR/scripts/verify-production-package-site.py"
 grep -Fq 'SHA-256' "$ROOT_DIR/scripts/verify-production-package-site.py"
 grep -Fq 'SHA-256' "$ROOT_DIR/scripts/sign-package-family.py"
+if [[ $(grep -cF '"--no-database"' "$ROOT_DIR/scripts/sign-package-family.py") != 1 ]]; then
+  echo 'production RPM signer must suppress unverified createrepo_c SQLite metadata' >&2
+  exit 1
+fi
 
 grep -Fq 'environment: native-package-toolchain-publish' "$TOOLCHAIN_WORKFLOW"
 grep -Fq 'artifact-metadata: write' "$TOOLCHAIN_WORKFLOW"

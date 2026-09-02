@@ -755,7 +755,7 @@ def sign_rpm(stage: Path, args: argparse.Namespace, session: object) -> dict[str
         target.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
         copy_file_safely(source, target, f"active RPM {relative}")
     run_tool(
-        [createrepo, "--quiet", "--simple-md-filenames", str(metadata_view)],
+        [createrepo, "--quiet", "--simple-md-filenames", "--no-database", str(metadata_view)],
         label="active RPM metadata generation",
         environment=environment,
     )
