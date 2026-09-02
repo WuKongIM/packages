@@ -798,13 +798,26 @@ for job, required_paths in family_path_contracts.items():
         )
 prepare_body = "\n".join(jobs["prepare"])
 for family in ("apt", "rpm"):
-    flattened_copy = (
-        f"cp -a /work/prepared-repository/{family}/. "
-        f"/work/artifacts/{family}/tree/"
+    family_copy = (
+        f"cp -a /work/prepared-repository/{family} "
+        f"/work/artifacts/{family}/tree"
     )
-    if prepare_body.count(flattened_copy) != 1:
+    if prepare_body.count(family_copy) != 1:
         raise SystemExit(
-            f"publisher prepare must flatten the {family.upper()} family-only boundary"
+            f"publisher prepare must flatten the {family.upper()} family-only boundary "
+            "by letting the container create the family tree root"
+        )
+    forbidden_root_copy = f"cp -a /work/prepared-repository/{family}/."
+    if forbidden_root_copy in prepare_body:
+        raise SystemExit(
+            f"publisher prepare must not preserve the {family.upper()} source root "
+            "metadata onto a runner-owned bind-mount root"
+        )
+    runner_created_tree = f'"$work/artifacts/{family}/tree"'
+    if runner_created_tree in prepare_body:
+        raise SystemExit(
+            f"publisher prepare must leave the {family.upper()} tree absent so the "
+            "fixed cross-UID container creates and owns it"
         )
 trusted = "\n".join(jobs.get("trusted_source_tools", []))
 if "GH_TOKEN" in trusted or "gh api" in trusted:
