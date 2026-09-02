@@ -287,11 +287,11 @@ if (( $(grep -cF 'client-id: ${{ secrets.WK_PACKAGE_AUDIT_READER_APP_CLIENT_ID }
       $(grep -cF 'private-key: ${{ secrets.WK_PACKAGE_AUDIT_READER_APP_PRIVATE_KEY }}' "$PUBLISH_WORKFLOW") != 2 ||
       $(grep -cF 'environment: native-package-preview-audit-read' "$PUBLISH_WORKFLOW") != 2 ||
       $(grep -cF 'IMMUTABLE_POLICY_TOKEN: ${{ steps.audit-reader-token.outputs.token }}' "$PUBLISH_WORKFLOW") != 2 ||
-      $(grep -cF 'client-id: ${{ secrets.WK_PACKAGE_PUBLISHER_APP_CLIENT_ID }}' "$PUBLISH_WORKFLOW") != 1 ||
-      $(grep -cF 'private-key: ${{ secrets.WK_PACKAGE_PUBLISHER_APP_PRIVATE_KEY }}' "$PUBLISH_WORKFLOW") != 1 ||
+      $(grep -cF 'client-id: ${{ secrets.WK_PACKAGE_PUBLISHER_APP_CLIENT_ID }}' "$PUBLISH_WORKFLOW") != 2 ||
+      $(grep -cF 'private-key: ${{ secrets.WK_PACKAGE_PUBLISHER_APP_PRIVATE_KEY }}' "$PUBLISH_WORKFLOW") != 2 ||
       $(grep -cF 'permission-administration: read' "$PUBLISH_WORKFLOW") != 3 ||
-      $(grep -cF 'GH_TOKEN: ${{ steps.publisher-token.outputs.token }}' "$PUBLISH_WORKFLOW") != 2 ||
-      $(grep -cE '^[[:space:]]+environment: native-package-preview-audit$' "$PUBLISH_WORKFLOW") != 1 )); then
+      $(grep -cF 'GH_TOKEN: ${{ steps.publisher-token.outputs.token }}' "$PUBLISH_WORKFLOW") != 3 ||
+      $(grep -cE '^[[:space:]]+environment: native-package-preview-audit$' "$PUBLISH_WORKFLOW") != 2 )); then
   echo 'publisher reader and writer jobs must use isolated package App credentials' >&2
   exit 1
 fi
@@ -385,13 +385,33 @@ if (( resolve_count == 0 || resolve_count != exact_tag_count )); then
   exit 1
 fi
 
-python3 - "$ROOT_DIR/.github/workflows" "$PUBLISH_WORKFLOW" <<'PY'
+python3 - "$ROOT_DIR/.github/workflows" "$PUBLISH_WORKFLOW" \
+  "$ROOT_DIR/scripts/resolve-audit-release.py" <<'PY'
+import ast
 import pathlib
 import re
 import sys
 
 workflow_root = pathlib.Path(sys.argv[1])
 publish_path = pathlib.Path(sys.argv[2])
+audit_resolver_path = pathlib.Path(sys.argv[3])
+
+resolver_tree = ast.parse(
+    audit_resolver_path.read_text(encoding="utf-8"), filename=str(audit_resolver_path)
+)
+request_calls = [
+    node
+    for node in ast.walk(resolver_tree)
+    if isinstance(node, ast.Call)
+    and isinstance(node.func, ast.Attribute)
+    and node.func.attr == "Request"
+]
+if len(request_calls) != 3:
+    raise SystemExit("audit resolver must contain exactly three reviewed HTTP requests")
+for call in request_calls:
+    methods = [keyword.value for keyword in call.keywords if keyword.arg == "method"]
+    if len(methods) != 1 or not isinstance(methods[0], ast.Constant) or methods[0].value != "GET":
+        raise SystemExit("every audit resolver HTTP request must be an explicit GET")
 
 
 def parse_jobs(path):
@@ -429,7 +449,7 @@ all_jobs = {
 }
 
 reader_expected = {
-    ("native-package-publish.yml", "control"),
+    ("native-package-publish.yml", "policy"),
     ("native-package-publish.yml", "immutable_passthrough"),
 }
 reader_jobs = {
@@ -447,6 +467,7 @@ if reader_jobs != reader_expected:
 writer_expected = {
     ("native-package-audit-draft.yml", "prepare"),
     ("native-package-audit-bind.yml", "bind"),
+    ("native-package-publish.yml", "audit_release"),
     ("native-package-publish.yml", "seal_draft"),
 }
 writer_jobs = {
@@ -497,16 +518,47 @@ for identity in reader_expected:
     ) != 1:
         raise SystemExit(f"Audit Reader job {identity} must isolate its policy token")
 
-control_reader = all_jobs[("native-package-publish.yml", "control")]
-if control_reader.count("            site/") != 1:
+control_job = all_jobs[("native-package-publish.yml", "control")]
+if control_job.count("            site/") != 1:
     raise SystemExit("publisher control artifact must carry the bootstrap site for validation")
-if control_reader.count('gh api "repos/WuKongIM/packages/immutable-releases"') != 1:
-    raise SystemExit("publisher control must read immutable policy exactly once")
-if control_reader.count('GH_TOKEN="$IMMUTABLE_POLICY_TOKEN"') != 1:
-    raise SystemExit("publisher control must scope the policy token to its policy read")
+if "WK_PACKAGE_AUDIT_READER_APP_" in control_job or "WK_PACKAGE_PUBLISHER_APP_" in control_job:
+    raise SystemExit("publisher control must not receive package App credentials")
+if control_job.count("    needs: audit_release") != 1:
+    raise SystemExit("publisher control must consume the protected draft classification")
+if "empty_draft|archive_only_draft|complete_draft|immutable_complete) ;;" not in control_job:
+    raise SystemExit("publisher control must accept only the resolver's four exact states")
+policy_reader = all_jobs[("native-package-publish.yml", "policy")]
+if policy_reader.count('gh api "repos/WuKongIM/packages/immutable-releases"') != 1:
+    raise SystemExit("publisher policy job must read immutable policy exactly once")
+if policy_reader.count('GH_TOKEN="$IMMUTABLE_POLICY_TOKEN"') != 1:
+    raise SystemExit("publisher policy job must scope the policy token to its policy read")
 immutable_reader = all_jobs[("native-package-publish.yml", "immutable_passthrough")]
 if immutable_reader.count("--policy-token-env IMMUTABLE_POLICY_TOKEN") != 1:
     raise SystemExit("immutable replay must pass a separate policy token to the sealer")
+
+draft_reader = all_jobs[("native-package-publish.yml", "audit_release")]
+if draft_reader.count("    needs: policy") != 1:
+    raise SystemExit("draft classification must follow the immutable policy fence")
+if draft_reader.count('GH_TOKEN: ${{ steps.publisher-token.outputs.token }}') != 1:
+    raise SystemExit("draft classification must use the package Publisher token exactly once")
+if "GH_TOKEN: ${{ github.token }}" in draft_reader:
+    raise SystemExit("draft classification must not use the read-only workflow token")
+if draft_reader.count('gh api "repos/WuKongIM/packages/releases/$audit_id"') != 1:
+    raise SystemExit("draft classification must read the exact numeric Release once")
+if draft_reader.count("./scripts/resolve-audit-release.py") != 1:
+    raise SystemExit("draft classification must use the revalidating resolver exactly once")
+if draft_reader.count("      contents: read") != 1:
+    raise SystemExit("draft classification workflow token must remain Contents read-only")
+if draft_reader.index("Validate enabled production contracts and exact current main") > draft_reader.index(
+    "actions/create-github-app-token@"
+):
+    raise SystemExit("draft classification mints its Publisher token before full validation")
+if re.search(
+    r"--method\s+(?:POST|PATCH|PUT|DELETE)|gh\s+release\s+(?:create|edit|upload|delete)|"
+    r"git\s+push|draft:\s*false",
+    draft_reader,
+):
+    raise SystemExit("draft classification job may not mutate Releases, tags, or Git")
 
 for identity in writer_expected:
     body = all_jobs[identity]
@@ -521,8 +573,13 @@ for identity in writer_expected:
     app_permissions = re.findall(
         r"^\s+permission-([a-z-]+):\s+(\S+)\s*$", body, re.MULTILINE
     )
-    if app_permissions != [("administration", "read"), ("contents", "write")]:
-        raise SystemExit(f"Publisher job {identity} lacks exact write token permissions")
+    expected_permissions = (
+        [("contents", "write")]
+        if identity == ("native-package-publish.yml", "audit_release")
+        else [("administration", "read"), ("contents", "write")]
+    )
+    if app_permissions != expected_permissions:
+        raise SystemExit(f"Publisher job {identity} lacks exact bounded token permissions")
 
 for identity in credential_jobs:
     body = all_jobs[identity]
@@ -539,8 +596,8 @@ if sum(
 if sum(
     has_environment(body, "native-package-preview-audit")
     for body in all_jobs.values()
-) != 3:
-    raise SystemExit("Publisher Environment must appear in exactly three workflow jobs")
+) != 4:
+    raise SystemExit("Publisher Environment must appear in exactly four workflow jobs")
 for secret in (
     "WK_PACKAGE_AUDIT_READER_APP_CLIENT_ID",
     "WK_PACKAGE_AUDIT_READER_APP_PRIVATE_KEY",
@@ -551,8 +608,8 @@ for secret in (
     "WK_PACKAGE_PUBLISHER_APP_CLIENT_ID",
     "WK_PACKAGE_PUBLISHER_APP_PRIVATE_KEY",
 ):
-    if sum(body.count(secret) for body in all_jobs.values()) != 3:
-        raise SystemExit(f"{secret} must appear in exactly three workflow jobs")
+    if sum(body.count(secret) for body in all_jobs.values()) != 4:
+        raise SystemExit(f"{secret} must appear in exactly four workflow jobs")
 
 signing_expected = {
     "apt": {

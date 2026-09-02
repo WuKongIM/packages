@@ -22,14 +22,73 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  control:
-    name: Fence reviewed control and classify numeric audit Release
+  policy:
+    name: Fence reviewed control and verify immutable Release policy
     if: >-
       github.repository == 'WuKongIM/packages' &&
       github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     environment: native-package-preview-audit-read
+    permissions:
+      contents: read
+    steps:
+      - name: Check out exact protected policy control
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Validate reviewed audit access before credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./scripts/validate-control.py
+          jq -e '.enabled == true' manifests/audit-access.json >/dev/null || {
+            echo 'audit App access is not provisioned' >&2
+            exit 78
+          }
+
+      - name: Mint read-scoped package audit reader token
+        id: audit-reader-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ secrets.WK_PACKAGE_AUDIT_READER_APP_CLIENT_ID }}
+          private-key: ${{ secrets.WK_PACKAGE_AUDIT_READER_APP_PRIVATE_KEY }}
+          owner: WuKongIM
+          repositories: packages
+          permission-administration: read
+
+      - name: Verify exact current main and immutable Release policy
+        shell: bash
+        env:
+          EXPECTED_MAIN_SHA: ${{ inputs.expected_main_sha }}
+          GH_TOKEN: ${{ github.token }}
+          IMMUTABLE_POLICY_TOKEN: ${{ steps.audit-reader-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          [[ "$EXPECTED_MAIN_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$EXPECTED_MAIN_SHA" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(gh api repos/WuKongIM/packages/git/ref/heads/main --jq .object.sha)" = "$GITHUB_SHA"
+          GH_TOKEN="$IMMUTABLE_POLICY_TOKEN" \
+            gh api "repos/WuKongIM/packages/immutable-releases" \
+            | jq -e '.enabled == true' >/dev/null
+
+      - name: Reject tracked-tree mutation
+        if: always()
+        run: git diff --exit-code HEAD --
+
+  audit_release:
+    name: Read and classify exact numeric audit Release without mutation
+    needs: policy
+    if: >-
+      github.repository == 'WuKongIM/packages' &&
+      github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: native-package-preview-audit
     permissions:
       contents: read
     outputs:
@@ -59,16 +118,6 @@ jobs:
             echo 'audit App access is not provisioned' >&2
             exit 78
           }
-
-      - name: Mint read-scoped package audit reader token
-        id: audit-reader-token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
-        with:
-          client-id: ${{ secrets.WK_PACKAGE_AUDIT_READER_APP_CLIENT_ID }}
-          private-key: ${{ secrets.WK_PACKAGE_AUDIT_READER_APP_PRIVATE_KEY }}
-          owner: WuKongIM
-          repositories: packages
-          permission-administration: read
 
       - name: Validate enabled production contracts and exact current main
         shell: bash
@@ -120,12 +169,21 @@ jobs:
           test -f keys/apt-preview.asc
           test -f keys/rpm-preview.asc
 
+      - name: Mint write-capable token for read-only draft classification
+        id: publisher-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ secrets.WK_PACKAGE_PUBLISHER_APP_CLIENT_ID }}
+          private-key: ${{ secrets.WK_PACKAGE_PUBLISHER_APP_PRIVATE_KEY }}
+          owner: WuKongIM
+          repositories: packages
+          permission-contents: write
+
       - name: Resolve and classify exact numeric audit Release
         id: resolve
         shell: bash
         env:
-          GH_TOKEN: ${{ github.token }}
-          IMMUTABLE_POLICY_TOKEN: ${{ steps.audit-reader-token.outputs.token }}
+          GH_TOKEN: ${{ steps.publisher-token.outputs.token }}
           REQUESTED_AUDIT_RELEASE_ID: ${{ inputs.audit_release_id }}
         run: |
           set -euo pipefail
@@ -133,9 +191,6 @@ jobs:
           release_json="$RUNNER_TEMP/audit-release-api.json"
           resolution="$RUNNER_TEMP/target-resolution.json"
           assets="$RUNNER_TEMP/target-release-assets"
-          GH_TOKEN="$IMMUTABLE_POLICY_TOKEN" \
-            gh api "repos/WuKongIM/packages/immutable-releases" \
-            | jq -e '.enabled == true' >/dev/null
           gh api "repos/WuKongIM/packages/releases/$audit_id" >"$release_json"
           expected_tag="native-package-preview-r${audit_id}"
           expected_name="WuKongIM preview package snapshot r${audit_id}"
@@ -198,6 +253,97 @@ jobs:
             echo "toolchain_workflow_sha=$toolchain_workflow_sha"
           } >>"$GITHUB_OUTPUT"
 
+      - name: Upload initial numeric Release state
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-package-target-state-${{ inputs.audit_release_id }}
+          path: |
+            ${{ runner.temp }}/target-resolution.json
+            ${{ runner.temp }}/audit-release-api.json
+            ${{ runner.temp }}/target-release-assets/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+      - name: Reject tracked-tree mutation
+        if: always()
+        run: git diff --exit-code HEAD --
+
+  control:
+    name: Materialize exact reviewed publication control
+    needs: audit_release
+    if: >-
+      github.repository == 'WuKongIM/packages' &&
+      github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    outputs:
+      audit_release_id: ${{ steps.resolve.outputs.audit_release_id }}
+      base_audit_release_id: ${{ steps.resolve.outputs.base_audit_release_id }}
+      classification: ${{ steps.resolve.outputs.classification }}
+      operation: ${{ steps.resolve.outputs.operation }}
+      target_version: ${{ steps.resolve.outputs.target_version }}
+      source_release_id: ${{ steps.resolve.outputs.source_release_id }}
+      toolchain_image: ${{ steps.resolve.outputs.toolchain_image }}
+      toolchain_digest: ${{ steps.resolve.outputs.toolchain_digest }}
+      toolchain_workflow_sha: ${{ steps.resolve.outputs.toolchain_workflow_sha }}
+    steps:
+      - name: Check out exact protected publication control
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Revalidate exact control after protected draft access
+        id: resolve
+        shell: bash
+        env:
+          EXPECTED_MAIN_SHA: ${{ inputs.expected_main_sha }}
+          REQUESTED_AUDIT_RELEASE_ID: ${{ inputs.audit_release_id }}
+          RESOLVED_AUDIT_RELEASE_ID: ${{ needs.audit_release.outputs.audit_release_id }}
+          BASE_AUDIT_RELEASE_ID: ${{ needs.audit_release.outputs.base_audit_release_id }}
+          CLASSIFICATION: ${{ needs.audit_release.outputs.classification }}
+          OPERATION: ${{ needs.audit_release.outputs.operation }}
+          TARGET_VERSION: ${{ needs.audit_release.outputs.target_version }}
+          SOURCE_RELEASE_ID: ${{ needs.audit_release.outputs.source_release_id }}
+          TOOLCHAIN_IMAGE: ${{ needs.audit_release.outputs.toolchain_image }}
+          TOOLCHAIN_DIGEST: ${{ needs.audit_release.outputs.toolchain_digest }}
+          TOOLCHAIN_WORKFLOW_SHA: ${{ needs.audit_release.outputs.toolchain_workflow_sha }}
+        run: |
+          set -euo pipefail
+          ./scripts/validate-control.py
+          ./tests/contract.sh
+          [[ "$EXPECTED_MAIN_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$EXPECTED_MAIN_SHA" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git fetch --no-tags --depth=1 origin main
+          test "$(git rev-parse FETCH_HEAD)" = "$GITHUB_SHA"
+          [[ "$REQUESTED_AUDIT_RELEASE_ID" =~ ^[1-9][0-9]*$ ]]
+          test "$REQUESTED_AUDIT_RELEASE_ID" = "$RESOLVED_AUDIT_RELEASE_ID"
+          case "$CLASSIFICATION" in
+            empty_draft|archive_only_draft|complete_draft|immutable_complete) ;;
+            *) echo "unexpected audit Release classification: $CLASSIFICATION" >&2; exit 1 ;;
+          esac
+          jq -e \
+            --argjson requested "$REQUESTED_AUDIT_RELEASE_ID" \
+            '.channels.preview.publication.audit_release_id == $requested and
+             .channels.preview.publication.operation != "none"' \
+            manifests/channels.json >/dev/null
+          {
+            echo "audit_release_id=$RESOLVED_AUDIT_RELEASE_ID"
+            echo "base_audit_release_id=$BASE_AUDIT_RELEASE_ID"
+            echo "classification=$CLASSIFICATION"
+            echo "operation=$OPERATION"
+            echo "target_version=$TARGET_VERSION"
+            echo "source_release_id=$SOURCE_RELEASE_ID"
+            echo "toolchain_image=$TOOLCHAIN_IMAGE"
+            echo "toolchain_digest=$TOOLCHAIN_DIGEST"
+            echo "toolchain_workflow_sha=$TOOLCHAIN_WORKFLOW_SHA"
+          } >>"$GITHUB_OUTPUT"
+
       - name: Upload exact control bundle
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -209,18 +355,6 @@ jobs:
             site/
             tests/contract.sh
           if-no-files-found: error
-          retention-days: 7
-
-      - name: Upload initial numeric Release state
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: native-package-target-state-${{ inputs.audit_release_id }}
-          path: |
-            ${{ runner.temp }}/target-resolution.json
-            ${{ runner.temp }}/audit-release-api.json
-            ${{ runner.temp }}/target-release-assets/
-          if-no-files-found: error
-          compression-level: 0
           retention-days: 7
 
       - name: Reject tracked-tree mutation
