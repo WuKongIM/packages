@@ -1,0 +1,432 @@
+name: Safety Automation - Reverify Immutable Public Package Snapshot
+
+on:
+  workflow_dispatch:
+    inputs:
+      expected_verifier_sha:
+        description: Exact protected packages/main commit containing the reviewed verifier
+        required: true
+        type: string
+      audit_release_id:
+        description: Positive numeric immutable package audit Release id to reverify
+        required: true
+        type: string
+
+permissions: {}
+
+# Public verification must not race a whole-site Pages replacement. This
+# workflow shares the publisher's non-cancelling serialization domain even
+# though it has no write permission and never deploys anything.
+concurrency:
+  group: packages-pages
+  cancel-in-progress: false
+
+jobs:
+  reverify:
+    name: Reverify immutable Release and public clean clients without mutation
+    if: >-
+      github.repository == 'WuKongIM/packages' &&
+      github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      attestations: read
+      contents: read
+      packages: read
+    steps:
+      - name: Check out exact protected verifier with history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Fence current verifier and derive immutable artifact control
+        shell: bash
+        env:
+          EXPECTED_VERIFIER_SHA: ${{ inputs.expected_verifier_sha }}
+          AUDIT_RELEASE_ID: ${{ inputs.audit_release_id }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "$EXPECTED_VERIFIER_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$AUDIT_RELEASE_ID" =~ ^[1-9][0-9]*$ ]]
+          test "$EXPECTED_VERIFIER_SHA" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(gh api repos/WuKongIM/packages/git/ref/heads/main --jq .object.sha)" = "$GITHUB_SHA"
+
+          ./scripts/validate-control.py
+          ./tests/contract.sh
+          jq -e \
+            --argjson id "$AUDIT_RELEASE_ID" \
+            '.channels.preview.enabled == true and
+             .channels.preview.status == "ready" and
+             .channels.preview.publication.audit_release_id == $id and
+             .channels.preview.publication.operation == "add_release" and
+             (.channels.preview.publication.target_version | type == "string") and
+             (.channels.preview.publication.target_version as $target |
+               [.channels.preview.releases[] |
+                 select(.version == $target and .package_release_id == $id and
+                        .state == "active")] | length) == 1' \
+            manifests/channels.json >/dev/null
+
+          root="$RUNNER_TEMP/immutable-public-reverify"
+          mkdir -p "$root/evidence"
+          release="$root/evidence/release-initial.json"
+          gh api "repos/WuKongIM/packages/releases/$AUDIT_RELEASE_ID" >"$root/release-api.json"
+          expected_tag="native-package-preview-r${AUDIT_RELEASE_ID}"
+          expected_name="WuKongIM preview package snapshot r${AUDIT_RELEASE_ID}"
+          archive_name="wukongim-preview-r${AUDIT_RELEASE_ID}-site.tar"
+          receipt_name="wukongim-preview-r${AUDIT_RELEASE_ID}-receipt.json"
+          jq -e \
+            --argjson id "$AUDIT_RELEASE_ID" \
+            --arg tag "$expected_tag" \
+            --arg name "$expected_name" \
+            --arg archive "$archive_name" \
+            --arg receipt "$receipt_name" \
+            '.id == $id and .tag_name == $tag and .name == $name and
+             .prerelease == true and .draft == false and .immutable == true and
+             (.published_at | type == "string") and
+             (.target_commitish | type == "string" and test("^[0-9a-f]{40}$")) and
+             (.assets | length) == 2 and
+             ([.assets[].name] | sort) == ([$archive, $receipt] | sort) and
+             all(.assets[];
+               (.id | type == "number" and . > 0) and .state == "uploaded" and
+               (.size | type == "number" and . > 0) and
+               (.digest | type == "string" and test("^sha256:[0-9a-f]{64}$")))' \
+            "$root/release-api.json" >/dev/null
+          jq -S \
+            '{id,tag_name,name,prerelease,target_commitish,draft,immutable,published_at,
+              assets:(.assets | map({id,name,size,state,digest}) | sort_by(.name))}' \
+            "$root/release-api.json" >"$release"
+
+          gh api "repos/WuKongIM/packages/git/ref/tags/$expected_tag" \
+            | jq -S '{ref,object:{type:.object.type,sha:.object.sha}}' \
+            >"$root/evidence/tag-initial.json"
+          jq -e \
+            --arg ref "refs/tags/$expected_tag" \
+            '.ref == $ref and .object.type == "commit" and
+             (.object.sha | type == "string" and test("^[0-9a-f]{40}$"))' \
+            "$root/evidence/tag-initial.json" >/dev/null
+          snapshot_control_sha="$(jq -er '.object.sha' "$root/evidence/tag-initial.json")"
+          test "$(jq -er '.target_commitish' "$release")" = "$snapshot_control_sha"
+          git cat-file -e "${snapshot_control_sha}^{commit}"
+          git merge-base --is-ancestor "$snapshot_control_sha" "$GITHUB_SHA"
+
+          # This is an intentionally narrow one-time recovery boundary. It
+          # proves that the immutable artifact's control differs from the
+          # current verifier only by this workflow, the CA fix, and its tests.
+          # Any later main commit must receive a separately reviewed recovery.
+          actual_diff="$root/evidence/artifact-to-verifier.diff"
+          expected_diff="$root/expected-artifact-to-verifier.diff"
+          git diff --name-status --no-renames "$snapshot_control_sha" "$GITHUB_SHA" \
+            | LC_ALL=C sort >"$actual_diff"
+          printf '%s\n' \
+            $'A\t.github/workflows/native-package-immutable-public-reverify.yml' \
+            $'M\tscripts/validate-production-package-clients.py' \
+            $'M\ttests/contract.sh' \
+            $'M\ttests/test_validate_production_package_clients.py' \
+            | LC_ALL=C sort >"$expected_diff"
+          cmp -- "$actual_diff" "$expected_diff"
+
+          historical="$root/artifact-control"
+          historical_paths=(
+            keys/README.md
+            keys/apt-preview.asc
+            keys/rpm-preview.asc
+            manifests/audit-access.json
+            manifests/channels.json
+            manifests/preview-signing.json
+            manifests/signing-toolchain.json
+            manifests/source-read.json
+            manifests/trusted-toolchain.json
+            site/index.html
+            site/status.json
+          )
+          for path in "${historical_paths[@]}"; do
+            mkdir -p "$historical/$(dirname "$path")"
+            git show "$snapshot_control_sha:$path" >"$historical/$path"
+          done
+          ./scripts/validate-control.py --root "$historical"
+          identity_paths=(
+            manifests/channels.json
+            manifests/preview-signing.json
+            manifests/signing-toolchain.json
+            manifests/trusted-toolchain.json
+            keys/apt-preview.asc
+            keys/rpm-preview.asc
+          )
+          for path in "${identity_paths[@]}"; do
+            cmp -- "$historical/$path" "$path"
+          done
+
+          target_version="$(jq -er '.channels.preview.publication.target_version' \
+            "$historical/manifests/channels.json")"
+          jq -e \
+            --argjson id "$AUDIT_RELEASE_ID" \
+            --arg target "$target_version" \
+            '.channels.preview.publication.audit_release_id == $id and
+             .channels.preview.publication.operation == "add_release" and
+             .channels.preview.publication.target_version == $target and
+             ([.channels.preview.releases[] |
+                select(.version == $target and .package_release_id == $id and
+                       .state == "active")] | length) == 1' \
+            "$historical/manifests/channels.json" >/dev/null
+
+          jq -n \
+            --arg artifact_control_sha "$snapshot_control_sha" \
+            --arg verifier_sha "$GITHUB_SHA" \
+            --argjson audit_release_id "$AUDIT_RELEASE_ID" \
+            --arg target_version "$target_version" \
+            '{schema:"wukongim/immutable-public-reverification/v1",
+              artifact_control_sha:$artifact_control_sha,
+              verifier_sha:$verifier_sha,
+              audit_release_id:$audit_release_id,
+              target_version:$target_version}' \
+            >"$root/evidence/reverification-metadata.json"
+
+      - name: Resolve and verify exact immutable audit assets
+        shell: bash
+        env:
+          AUDIT_RELEASE_ID: ${{ inputs.audit_release_id }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/immutable-public-reverify"
+          historical="$root/artifact-control"
+          snapshot_control_sha="$(jq -er '.artifact_control_sha' \
+            "$root/evidence/reverification-metadata.json")"
+          target_version="$(jq -er '.target_version' \
+            "$root/evidence/reverification-metadata.json")"
+
+          ./scripts/resolve-audit-release.py \
+            --release-id "$AUDIT_RELEASE_ID" \
+            --expected-control-sha "$snapshot_control_sha" \
+            --expected-tag-state exact \
+            --output-dir "$root/release-assets" \
+            --token-env GH_TOKEN >"$root/evidence/release-resolution.json"
+          jq -e \
+            --argjson id "$AUDIT_RELEASE_ID" \
+            --arg control "$snapshot_control_sha" \
+            '.release_id == $id and .control_sha == $control and
+             .classification == "immutable_complete" and .draft == false and
+             .immutable == true and .tag_commit_verified == true and
+             .release_revalidated == true and .id_bound_downloads == true and
+             .asset_count == 2' \
+            "$root/evidence/release-resolution.json" >/dev/null
+
+          archive="$root/release-assets/wukongim-preview-r${AUDIT_RELEASE_ID}-site.tar"
+          receipt="$root/release-assets/wukongim-preview-r${AUDIT_RELEASE_ID}-receipt.json"
+          ./scripts/archive-package-snapshot.py extract \
+            --archive "$archive" \
+            --output-dir "$root/snapshot-root" \
+            >"$root/evidence/archive-extraction.json"
+
+          jq -e \
+            --argjson id "$AUDIT_RELEASE_ID" \
+            --arg control "$snapshot_control_sha" \
+            --arg target "$target_version" \
+            '.audit_release_id == $id and .control_sha == $control and
+             .operation == "add_release" and .target_version == $target' \
+            "$root/snapshot-root/audit/plan.json" >/dev/null
+          jq -e \
+            --argjson id "$AUDIT_RELEASE_ID" \
+            --arg control "$snapshot_control_sha" \
+            '.audit_release_id == $id and .control_sha == $control' \
+            "$root/snapshot-root/audit/snapshot.json" >/dev/null
+          jq -e \
+            --argjson id "$AUDIT_RELEASE_ID" \
+            --arg control "$snapshot_control_sha" \
+            '.audit_release_id == $id and .control_sha == $control' \
+            "$receipt" >/dev/null
+
+          source_args=()
+          if [[ -d "$root/snapshot-root/audit/source-attestations" ]]; then
+            source_args+=(--source-attestations "$root/snapshot-root/audit/source-attestations")
+          fi
+          ./scripts/package-audit-receipt.py verify \
+            --channels "$historical/manifests/channels.json" \
+            --signing "$historical/manifests/preview-signing.json" \
+            --signing-toolchain "$historical/manifests/signing-toolchain.json" \
+            --apt-public-cert "$historical/keys/apt-preview.asc" \
+            --rpm-public-cert "$historical/keys/rpm-preview.asc" \
+            "${source_args[@]}" \
+            --plan "$root/snapshot-root/audit/plan.json" \
+            --apt-receipt "$root/snapshot-root/audit/apt-signing.json" \
+            --rpm-receipt "$root/snapshot-root/audit/rpm-signing.json" \
+            --archive "$archive" \
+            --receipt "$receipt" \
+            >"$root/evidence/audit-receipt-verification.json"
+          jq -e \
+            --argjson id "$AUDIT_RELEASE_ID" \
+            --arg control "$snapshot_control_sha" \
+            '.audit_release_id == $id and .control_sha == $control' \
+            "$root/evidence/audit-receipt-verification.json" >/dev/null
+
+      - name: Verify pinned toolchain provenance and archived site offline
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/immutable-public-reverify"
+          historical="$root/artifact-control"
+          snapshot_control_sha="$(jq -er '.artifact_control_sha' \
+            "$root/evidence/reverification-metadata.json")"
+          audit_release_id="$(jq -er '.audit_release_id' \
+            "$root/evidence/reverification-metadata.json")"
+          target_version="$(jq -er '.target_version' \
+            "$root/evidence/reverification-metadata.json")"
+          image="$(jq -er '.image' "$historical/manifests/signing-toolchain.json")"
+          digest="$(jq -er '.digest' "$historical/manifests/signing-toolchain.json")"
+          workflow_sha="$(jq -er '.workflow_sha' "$historical/manifests/signing-toolchain.json")"
+
+          trap 'docker logout ghcr.io >/dev/null 2>&1 || true' EXIT
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          docker pull --platform linux/amd64 "$image@$digest"
+          gh attestation verify "oci://$image@$digest" \
+            --repo WuKongIM/packages \
+            --signer-workflow WuKongIM/packages/.github/workflows/native-package-signing-toolchain.yml \
+            --source-ref refs/heads/main \
+            --source-digest "$workflow_sha" \
+            --signer-digest "$workflow_sha" \
+            --deny-self-hosted-runners \
+            --format json >"$root/evidence/toolchain-attestation.json"
+          docker logout ghcr.io
+          trap - EXIT
+
+          docker run --rm --platform linux/amd64 \
+            --network none --read-only --cap-drop ALL \
+            --security-opt no-new-privileges --pids-limit 256 \
+            --tmpfs /tmp:rw,noexec,nosuid,size=256m \
+            --volume "$GITHUB_WORKSPACE:/current:ro" \
+            --volume "$root:/reverify:ro" \
+            "$image@$digest" \
+            python3 /current/scripts/verify-production-package-site.py \
+              --site-root /reverify/snapshot-root/site \
+              --snapshot /reverify/snapshot-root/audit/snapshot.json \
+              --channels /reverify/artifact-control/manifests/channels.json \
+              --signing /reverify/artifact-control/manifests/preview-signing.json \
+              --apt-public-cert /reverify/artifact-control/keys/apt-preview.asc \
+              --rpm-public-cert /reverify/artifact-control/keys/rpm-preview.asc \
+            >"$root/evidence/site-verification.json"
+          jq -e \
+            --argjson id "$audit_release_id" \
+            --arg control "$snapshot_control_sha" \
+            --arg target "$target_version" \
+            '.audit_release_id == $id and .control_sha == $control and
+             .operation == "add_release" and .target_version == $target' \
+            "$root/evidence/site-verification.json" >/dev/null
+
+      - name: Compare public critical bytes with immutable artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/immutable-public-reverify"
+          site="$root/snapshot-root/site"
+          public="$root/evidence/public"
+          mkdir -p "$public"
+          fetch_and_compare() {
+            local relative="$1" expected="$site/$1" output="$public/${1//\//_}"
+            for attempt in {1..10}; do
+              if curl --proto '=https' --tlsv1.2 --fail --silent --show-error \
+                --max-time 30 --max-filesize 16777216 \
+                "https://packages.githubim.com/$relative" >"$output" &&
+                 cmp -- "$output" "$expected"; then
+                return 0
+              fi
+              sleep 3
+            done
+            echo "public file differs from immutable artifact: $relative" >&2
+            return 1
+          }
+          fetch_and_compare status.json
+          fetch_and_compare apt/dists/preview/Release
+          fetch_and_compare rpm/preview/el/9/x86_64/repodata/repomd.xml
+          fetch_and_compare keys/apt-preview.asc
+          fetch_and_compare keys/rpm-preview.asc
+          (cd "$public" && sha256sum -- *) >"$root/evidence/public-critical-sha256.txt"
+
+          snapshot_sha256="$(sha256sum "$root/snapshot-root/audit/snapshot.json" | cut -d' ' -f1)"
+          artifact_control_sha="$(jq -er '.artifact_control_sha' \
+            "$root/evidence/reverification-metadata.json")"
+          audit_release_id="$(jq -er '.audit_release_id' \
+            "$root/evidence/reverification-metadata.json")"
+          jq -e \
+            --argjson id "$audit_release_id" \
+            --arg control "$artifact_control_sha" \
+            --arg snapshot "$snapshot_sha256" \
+            '.schema == "wukongim.native_package_repository_status/v2" and
+             .audit_release_id == $id and .control_sha == $control and
+             .snapshot_sha256 == $snapshot and .operation == "add_release" and
+             .apt == true and .rpm == true and .reason == "ready"' \
+            "$public/status.json" >/dev/null
+
+      - name: Validate public endpoint with four clean download-only clients
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/immutable-public-reverify"
+          historical="$root/artifact-control"
+          snapshot="$root/snapshot-root/audit/snapshot.json"
+          audit_release_id="$(jq -er '.audit_release_id' \
+            "$root/evidence/reverification-metadata.json")"
+          artifact_control_sha="$(jq -er '.artifact_control_sha' \
+            "$root/evidence/reverification-metadata.json")"
+          target_version="$(jq -er '.target_version' \
+            "$root/evidence/reverification-metadata.json")"
+          snapshot_sha256="$(sha256sum "$snapshot" | cut -d' ' -f1)"
+
+          python3 scripts/validate-production-package-clients.py \
+            --base-url https://packages.githubim.com \
+            --snapshot "$snapshot" \
+            --apt-public-cert "$historical/keys/apt-preview.asc" \
+            --rpm-public-cert "$historical/keys/rpm-preview.asc" \
+            --expected-version "$target_version" \
+            >"$root/evidence/public-client-validation.json"
+          jq -e \
+            --argjson id "$audit_release_id" \
+            --arg control "$artifact_control_sha" \
+            --arg snapshot "$snapshot_sha256" \
+            --arg target "$target_version" \
+            '.mode == "remote" and .audit_release_id == $id and
+             .control_sha == $control and .snapshot_sha256 == $snapshot and
+             .snapshot_verified == true and .status_revalidated == true and
+             (.apt | length) == 2 and (.rpm | length) == 2 and
+             .expected_version == $target and .expected_version_verified == true and
+             all(.apt[].download.snapshot_versions; . == [$target]) and
+             all(.rpm[].download.snapshot_versions; . == [$target])' \
+            "$root/evidence/public-client-validation.json" >/dev/null
+
+      - name: Re-fence immutable identity and current main
+        shell: bash
+        env:
+          AUDIT_RELEASE_ID: ${{ inputs.audit_release_id }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/immutable-public-reverify"
+          gh api "repos/WuKongIM/packages/releases/$AUDIT_RELEASE_ID" \
+            | jq -S \
+              '{id,tag_name,name,prerelease,target_commitish,draft,immutable,published_at,
+                assets:(.assets | map({id,name,size,state,digest}) | sort_by(.name))}' \
+              >"$root/evidence/release-final.json"
+          cmp -- "$root/evidence/release-initial.json" "$root/evidence/release-final.json"
+          expected_tag="native-package-preview-r${AUDIT_RELEASE_ID}"
+          gh api "repos/WuKongIM/packages/git/ref/tags/$expected_tag" \
+            | jq -S '{ref,object:{type:.object.type,sha:.object.sha}}' \
+            >"$root/evidence/tag-final.json"
+          cmp -- "$root/evidence/tag-initial.json" "$root/evidence/tag-final.json"
+          git diff --exit-code HEAD --
+          test -z "$(git status --short --untracked-files=all)"
+          test "$(gh api repos/WuKongIM/packages/git/ref/heads/main --jq .object.sha)" = "$GITHUB_SHA"
+
+      - name: Upload immutable public reverification evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-package-immutable-public-reverification-${{ inputs.audit_release_id }}-${{ github.sha }}
+          path: ${{ runner.temp }}/immutable-public-reverify/evidence/
+          if-no-files-found: warn
+          compression-level: 6
+          retention-days: 90
