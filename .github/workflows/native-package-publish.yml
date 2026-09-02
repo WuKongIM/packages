@@ -538,7 +538,11 @@ jobs:
     needs:
       - control
       - prepare
-    if: needs.control.outputs.classification == 'empty_draft'
+    if: >-
+      always() &&
+      needs.control.result == 'success' &&
+      needs.prepare.result == 'success' &&
+      needs.control.outputs.classification == 'empty_draft'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     environment: native-package-preview-apt-signing
@@ -633,7 +637,11 @@ jobs:
     needs:
       - control
       - prepare
-    if: needs.control.outputs.classification == 'empty_draft'
+    if: >-
+      always() &&
+      needs.control.result == 'success' &&
+      needs.prepare.result == 'success' &&
+      needs.control.outputs.classification == 'empty_draft'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     environment: native-package-preview-rpm-signing
@@ -1276,6 +1284,10 @@ jobs:
     needs:
       - control
       - sealed
+    if: >-
+      always() &&
+      needs.control.result == 'success' &&
+      needs.sealed.result == 'success'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     permissions:
@@ -1474,7 +1486,11 @@ jobs:
     needs:
       - control
       - pages_artifact
-    if: needs.pages_artifact.outputs.deploy_needed == 'true'
+    if: >-
+      always() &&
+      needs.control.result == 'success' &&
+      needs.pages_artifact.result == 'success' &&
+      needs.pages_artifact.outputs.deploy_needed == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -1522,6 +1538,7 @@ jobs:
       - deploy
     if: >-
       always() &&
+      needs.control.result == 'success' &&
       needs.pages_artifact.result == 'success' &&
       (needs.pages_artifact.outputs.deploy_needed != 'true' || needs.deploy.result == 'success')
     runs-on: ubuntu-24.04

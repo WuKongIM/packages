@@ -272,6 +272,12 @@ source Release payload. The credential-free TEST ONLY drill may install the
 packages it builds from the immutable trusted-tool commit. There is no in-place
 mutation of the live repository.
 
+GitHub propagates a skipped job through its dependency chain. Jobs that follow
+an intentionally optional branch therefore use `always()` together with
+explicit success checks for every required direct dependency; `always()` alone
+must never convert a failed or cancelled prerequisite into a signing or
+deployment attempt.
+
 Canonical snapshot archives use `0755` directories and `0644` files. After
 final archive validation, extraction also normalizes its root directory to
 `0755`; the composer does the same immediately before atomically exporting a
