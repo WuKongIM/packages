@@ -213,12 +213,19 @@ def enable_signing(
     preview["enabled"] = preview_ready
     preview["status"] = "ready" if preview_ready else "awaiting_first_release"
     preview["releases"] = [preview_release()] if preview_ready else []
+    preview["retirement"] = {
+        "phase": "none",
+        "version": None,
+        "not_before": None,
+    }
     if preview_ready:
         preview["publication"] = publication(
             "add_release",
             audit_release_id=2001,
             target_version="3.1.0-rc.1",
         )
+    else:
+        preview["publication"] = publication()
     write_manifest(root, "channels.json", channels)
     write_bootstrap_reason(root, preview["status"])
 
@@ -436,6 +443,10 @@ class ValidateControlTest(unittest.TestCase):
     def test_accepts_reviewed_public_certificates_when_signing_is_enabled(self) -> None:
         with copied_control_root() as root:
             enable_signing(root)
+            preview = load_manifest(root, "channels.json")["channels"]["preview"]
+
+            self.assertEqual([], preview["releases"])
+            self.assertEqual(publication(), preview["publication"])
 
             result = self.run_validator(root)
 

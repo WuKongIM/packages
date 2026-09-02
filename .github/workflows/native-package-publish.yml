@@ -1804,7 +1804,9 @@ jobs:
             "$IMAGE@$DIGEST" bash -euo pipefail -c '
               deb="/source/wukongim_${TARGET_VERSION}_linux_amd64.deb"
               rpm_package="/source/wukongim_${TARGET_VERSION}_linux_amd64.rpm"
-              deb_version="${TARGET_VERSION/-/~}"
+              release_core="${TARGET_VERSION%%-*}"
+              prerelease="${TARGET_VERSION#*-}"
+              deb_version="${release_core}~${prerelease}"
               rpm_version="${deb_version//-/_}"
               test "$(dpkg-deb --field "$deb" Package)" = wukongim
               test "$(dpkg-deb --field "$deb" Architecture)" = amd64
