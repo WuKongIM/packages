@@ -439,10 +439,9 @@ jobs:
           set -euo pipefail
           work="$RUNNER_TEMP/prepare-work"
           mkdir -p "$work/source-assets" "$work/artifacts/metadata" \
-            "$work/artifacts/apt/tree" "$work/artifacts/rpm/tree"
+            "$work/artifacts/apt" "$work/artifacts/rpm"
           chmod 0777 "$work" "$work/source-assets" "$work/artifacts" \
-            "$work/artifacts/metadata" "$work/artifacts/apt" "$work/artifacts/apt/tree" \
-            "$work/artifacts/rpm" "$work/artifacts/rpm/tree"
+            "$work/artifacts/metadata" "$work/artifacts/apt" "$work/artifacts/rpm"
           if [[ "$OPERATION" == add_release ]]; then
             cp -a "$RUNNER_TEMP/source-input/source-assets/." "$work/source-assets/"
           fi
@@ -484,8 +483,8 @@ jobs:
                 --new-output /work/rpm-new.json \
                 --signed-output /work/rpm-preserved.json \
                 --active-output /work/rpm-active.json
-              cp -a /work/prepared-repository/apt/. /work/artifacts/apt/tree/
-              cp -a /work/prepared-repository/rpm/. /work/artifacts/rpm/tree/
+              cp -a /work/prepared-repository/apt /work/artifacts/apt/tree
+              cp -a /work/prepared-repository/rpm /work/artifacts/rpm/tree
               cp /work/plan.json /work/inventory.json /work/rpm-new.json \
                 /work/rpm-preserved.json /work/rpm-active.json \
                 /work/preparation.json /work/artifacts/metadata/
