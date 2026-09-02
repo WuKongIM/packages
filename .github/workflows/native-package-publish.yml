@@ -484,8 +484,8 @@ jobs:
                 --new-output /work/rpm-new.json \
                 --signed-output /work/rpm-preserved.json \
                 --active-output /work/rpm-active.json
-              cp -a /work/prepared-repository/apt /work/artifacts/apt/tree/
-              cp -a /work/prepared-repository/rpm /work/artifacts/rpm/tree/
+              cp -a /work/prepared-repository/apt/. /work/artifacts/apt/tree/
+              cp -a /work/prepared-repository/rpm/. /work/artifacts/rpm/tree/
               cp /work/plan.json /work/inventory.json /work/rpm-new.json \
                 /work/rpm-preserved.json /work/rpm-active.json \
                 /work/preparation.json /work/artifacts/metadata/
@@ -612,7 +612,7 @@ jobs:
                 --minimum-valid-days "$(jq -er .minimum_valid_days /control/manifests/preview-signing.json)"
                 --rotation-begin-days "$(jq -er .rotation_begin_days /control/manifests/preview-signing.json)"
                 --maximum-lifetime-days "$(jq -er .maximum_subkey_lifetime_days /control/manifests/preview-signing.json)"
-                --apt-release apt/dists/preview/Release
+                --apt-release dists/preview/Release
               )
               next="$(jq -r .apt.signing_subkeys.next//empty /control/manifests/preview-signing.json)"
               [[ -z "$next" ]] || args+=(--next-signing-subkey-fingerprint "$next")
@@ -718,7 +718,7 @@ jobs:
                 --minimum-valid-days "$(jq -er .minimum_valid_days /control/manifests/preview-signing.json)"
                 --rotation-begin-days "$(jq -er .rotation_begin_days /control/manifests/preview-signing.json)"
                 --maximum-lifetime-days "$(jq -er .maximum_subkey_lifetime_days /control/manifests/preview-signing.json)"
-                --rpm-repository rpm/preview/el/9/x86_64
+                --rpm-repository preview/el/9/x86_64
                 --new-rpm-allowlist /metadata/rpm-new.json
                 --signed-rpm-allowlist /metadata/rpm-preserved.json
                 --active-rpm-allowlist /metadata/rpm-active.json
