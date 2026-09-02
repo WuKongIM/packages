@@ -657,6 +657,8 @@ grep -Fq 'Acquire::https::CaInfo="$WK_CA_BUNDLE"' \
   "$ROOT_DIR/scripts/validate-production-package-clients.py"
 grep -Fq 'command.extend(("--env", f"WK_CA_BUNDLE={APT_CA_BUNDLE_PATH}"))' \
   "$ROOT_DIR/scripts/validate-production-package-clients.py"
+grep -Fq 'list(command), check=True, stdout=sys.stderr, stderr=sys.stderr' \
+  "$ROOT_DIR/scripts/validate-production-package-clients.py"
 grep -Fq 'test "$(gh api repos/WuKongIM/packages/git/ref/heads/main --jq .object.sha)" = "$GITHUB_SHA"' "$PUBLISH_WORKFLOW"
 grep -Fq 'actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e' "$PUBLISH_WORKFLOW"
 if grep -Eq 'gh release delete|--method DELETE|git push|refs/tags/v|source-attestation-summary|--source-attestation-summary|repos/WuKongIM/WuKongIM/contents' "$PUBLISH_WORKFLOW"; then

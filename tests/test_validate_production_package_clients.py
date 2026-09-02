@@ -453,6 +453,18 @@ class ValidateProductionPackageClientsTest(unittest.TestCase):
                     command[image_index + 3],
                 )
 
+    def test_default_runner_routes_container_logs_away_from_json_stdout(self) -> None:
+        command = ["docker", "run", "pinned-image"]
+        with mock.patch.object(validator.subprocess, "run") as run:
+            validator._run(command)
+
+        run.assert_called_once_with(
+            command,
+            check=True,
+            stdout=validator.sys.stderr,
+            stderr=validator.sys.stderr,
+        )
+
     def test_remote_mode_pins_endpoint_keys_and_uses_https_clients(self) -> None:
         with TemporaryDirectory() as temporary:
             fixture = Fixture(Path(temporary))
