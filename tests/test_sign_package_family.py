@@ -121,6 +121,9 @@ package.write_bytes(package.read_bytes() + f"WK-RPM-SIGNATURE:{fingerprint}\\n".
         cls._write_tool(
             "createrepo_c",
             """import pathlib, sys
+if "--no-database" not in sys.argv:
+    print("createrepo_c must disable unverified SQLite metadata", file=sys.stderr)
+    raise SystemExit(44)
 root = pathlib.Path(sys.argv[-1])
 packages = sorted(path.relative_to(root).as_posix() for path in root.glob("Packages/**/*.rpm"))
 repodata = root / "repodata"
