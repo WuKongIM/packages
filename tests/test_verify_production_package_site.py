@@ -532,6 +532,23 @@ class VerifyProductionPackageSiteTest(unittest.TestCase):
         self.assertEqual(armor, exported[candidate])
         export_command = next(command for command in commands if "--export" in command)
         self.assertIn("--armor", export_command)
+        filter_index = export_command.index("--export-filter")
+        self.assertEqual(
+            f"drop-subkey=fpr <> {candidate}", export_command[filter_index + 1]
+        )
+
+    def test_rpm_candidate_export_isolates_real_rotation_subkeys(self) -> None:
+        signing = json.loads((ROOT / "manifests/preview-signing.json").read_text())
+        rpm_signing = signing["rpm"]["signing_subkeys"]
+        candidates = [rpm_signing["current"], rpm_signing["next"]]
+
+        exported = verifier.export_rpm_candidate_certificates(
+            ROOT / "keys/rpm-preview.asc", candidates
+        )
+
+        self.assertEqual(set(candidates), set(exported))
+        self.assertTrue(all(value.startswith(b"-----BEGIN PGP PUBLIC KEY BLOCK-----")
+                            for value in exported.values()))
 
     def test_rpm_packet_requires_full_issuer_and_sha256_not_sha512(self) -> None:
         signature = (

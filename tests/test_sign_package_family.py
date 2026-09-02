@@ -394,6 +394,43 @@ repodata.mkdir()
                 environment=self.environment(),
             )
 
+    def test_rpm_verification_isolates_each_real_rotation_subkey(self) -> None:
+        signing = json.loads((ROOT / "manifests/preview-signing.json").read_text())
+        rpm_signing = signing["rpm"]["signing_subkeys"]
+        candidates = (rpm_signing["current"], rpm_signing["next"])
+        package = self.case / "rotating-wukongim.rpm"
+        package.write_bytes(
+            b"RPM-TEST-ONLY:rotating\n"
+            + f"WK-RPM-SIGNATURE:{candidates[0]}\n".encode()
+        )
+
+        with TemporaryDirectory(prefix="wk-rpm-rotation-TEST-ONLY-", dir="/tmp") as name:
+            home = Path(name)
+            home.chmod(0o700)
+            gpg = signer.validator.IsolatedGPG(
+                home,
+                shutil.which("gpg"),
+                shutil.which("gpgconf"),
+            )
+            try:
+                gpg.run(
+                    ["--import", str(ROOT / "keys/rpm-preview.asc")],
+                    stage="TEST ONLY RPM rotation-certificate import",
+                )
+                with mock.patch.object(signer.time, "time", return_value=1_788_279_420):
+                    verified = signer.rpm_verifying_fingerprints(
+                        str(self.fake_bin / "rpm"),
+                        str(self.fake_bin / "rpmkeys"),
+                        gpg,
+                        package,
+                        candidates,
+                        environment=self.environment(),
+                    )
+            finally:
+                gpg.kill_agent()
+
+        self.assertEqual(candidates, verified)
+
     def test_rpm_rejects_ambiguous_allowed_key_ids_before_verification(self) -> None:
         current = "1" * 40
         collision = "2" * 24 + current[-16:]
