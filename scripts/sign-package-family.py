@@ -474,7 +474,8 @@ def rpm_verifying_fingerprints(
                     "--armor",
                     "--output", str(certificate),
                     "--export-options", "export-minimal",
-                    "--export-filter", f"drop-subkey=fpr != {fingerprint}",
+                    # GnuPG uses <> for full-string inequality; != is numeric.
+                    "--export-filter", f"drop-subkey=fpr <> {fingerprint}",
                     "--export", fingerprint,
                 ],
                 stage="exact RPM verification-certificate export",

@@ -330,7 +330,8 @@ def export_rpm_candidate_certificates(
                     _tool("gpg"), "--batch", "--no-options", "--homedir", str(home),
                     "--armor",
                     "--export-options", "export-minimal",
-                    "--export-filter", f"drop-subkey=fpr != {candidate}",
+                    # GnuPG uses <> for full-string inequality; != is numeric.
+                    "--export-filter", f"drop-subkey=fpr <> {candidate}",
                     "--export",
                 ],
                 f"RPM candidate certificate export {candidate}",
