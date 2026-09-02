@@ -385,13 +385,33 @@ if (( resolve_count == 0 || resolve_count != exact_tag_count )); then
   exit 1
 fi
 
-python3 - "$ROOT_DIR/.github/workflows" "$PUBLISH_WORKFLOW" <<'PY'
+python3 - "$ROOT_DIR/.github/workflows" "$PUBLISH_WORKFLOW" \
+  "$ROOT_DIR/scripts/resolve-audit-release.py" <<'PY'
+import ast
 import pathlib
 import re
 import sys
 
 workflow_root = pathlib.Path(sys.argv[1])
 publish_path = pathlib.Path(sys.argv[2])
+audit_resolver_path = pathlib.Path(sys.argv[3])
+
+resolver_tree = ast.parse(
+    audit_resolver_path.read_text(encoding="utf-8"), filename=str(audit_resolver_path)
+)
+request_calls = [
+    node
+    for node in ast.walk(resolver_tree)
+    if isinstance(node, ast.Call)
+    and isinstance(node.func, ast.Attribute)
+    and node.func.attr == "Request"
+]
+if len(request_calls) != 3:
+    raise SystemExit("audit resolver must contain exactly three reviewed HTTP requests")
+for call in request_calls:
+    methods = [keyword.value for keyword in call.keywords if keyword.arg == "method"]
+    if len(methods) != 1 or not isinstance(methods[0], ast.Constant) or methods[0].value != "GET":
+        raise SystemExit("every audit resolver HTTP request must be an explicit GET")
 
 
 def parse_jobs(path):

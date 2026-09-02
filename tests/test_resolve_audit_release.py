@@ -526,6 +526,7 @@ class ResolveAuditReleaseTest(unittest.TestCase):
         for forbidden in (
             'method="POST"',
             'method="PATCH"',
+            'method="PUT"',
             'method="DELETE"',
             "/releases/tags/",
             'asset.get("browser_download_url")',
