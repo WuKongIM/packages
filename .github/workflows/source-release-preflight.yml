@@ -127,27 +127,58 @@ jobs:
           SOURCE_RECEIPT: ${{ runner.temp }}/source-release.json
         run: |
           set -euo pipefail
+          export LC_ALL=C
+
+          assert_metadata() {
+            local label="$1"
+            local expected="$2"
+            local actual="$3"
+            if [[ "$actual" != "$expected" ]]; then
+              printf '%s mismatch: expected <%s>, got <%s>\n' \
+                "$label" "$expected" "$actual" >&2
+              exit 1
+            fi
+          }
+
           version="$(jq -r '.version' "$SOURCE_RECEIPT")"
           deb="$SOURCE_ASSETS/wukongim_${version}_linux_amd64.deb"
           rpm_package="$SOURCE_ASSETS/wukongim_${version}_linux_amd64.rpm"
-          expected_deb_version="${version/-/~}"
+          release_core="${version%%-*}"
+          prerelease="${version#*-}"
+          [[ "$release_core" != "$version" && -n "$prerelease" ]] || {
+            echo 'source package version must be a pre-release' >&2
+            exit 1
+          }
+          # Do not use Bash pattern replacement with a bare tilde: Bash expands
+          # it to $HOME and silently corrupts the expected package version.
+          expected_deb_version="${release_core}~${prerelease}"
           expected_rpm_version="${expected_deb_version//-/_}"
 
-          test "$(dpkg-deb --field "$deb" Package)" = wukongim
-          test "$(dpkg-deb --field "$deb" Architecture)" = amd64
-          test "$(dpkg-deb --field "$deb" Version)" = "$expected_deb_version"
-          test "$(rpm -qp --queryformat '%{NAME}' "$rpm_package")" = wukongim
-          test "$(rpm -qp --queryformat '%{ARCH}' "$rpm_package")" = x86_64
-          test "$(rpm -qp --queryformat '%{VERSION}' "$rpm_package")" = "$expected_rpm_version"
-          test "$(rpm -qp --queryformat '%{RELEASE}' "$rpm_package")" = 1
-          test "$(rpm -qp --queryformat '%{SIGPGP:pgpsig}' "$rpm_package")" = '(none)'
-          test "$(rpm -qp --queryformat '%{SIGGPG:pgpsig}' "$rpm_package")" = '(none)'
+          deb_package="$(dpkg-deb --field "$deb" Package)"
+          deb_architecture="$(dpkg-deb --field "$deb" Architecture)"
+          deb_version="$(dpkg-deb --field "$deb" Version)"
+          rpm_name="$(rpm -qp --queryformat '%{NAME}' "$rpm_package")"
+          rpm_architecture="$(rpm -qp --queryformat '%{ARCH}' "$rpm_package")"
+          rpm_version="$(rpm -qp --queryformat '%{VERSION}' "$rpm_package")"
+          rpm_release="$(rpm -qp --queryformat '%{RELEASE}' "$rpm_package")"
+          rpm_signature_pgp="$(rpm -qp --queryformat '%{SIGPGP:pgpsig}' "$rpm_package")"
+          rpm_signature_gpg="$(rpm -qp --queryformat '%{SIGGPG:pgpsig}' "$rpm_package")"
+
+          assert_metadata 'DEB package' wukongim "$deb_package"
+          assert_metadata 'DEB architecture' amd64 "$deb_architecture"
+          assert_metadata 'DEB version' "$expected_deb_version" "$deb_version"
+          assert_metadata 'RPM package' wukongim "$rpm_name"
+          assert_metadata 'RPM architecture' x86_64 "$rpm_architecture"
+          assert_metadata 'RPM version' "$expected_rpm_version" "$rpm_version"
+          assert_metadata 'RPM release' 1 "$rpm_release"
+          assert_metadata 'RPM SIGPGP' '(none)' "$rpm_signature_pgp"
+          assert_metadata 'RPM SIGGPG' '(none)' "$rpm_signature_gpg"
 
           jq -n \
             --arg schema 'wukongim/source-package-metadata/v1' \
             --arg version "$version" \
-            --arg deb_version "$expected_deb_version" \
-            --arg rpm_version "$expected_rpm_version" \
+            --arg deb_version "$deb_version" \
+            --arg rpm_version "$rpm_version" \
             '{
               schema: $schema,
               package: "wukongim",

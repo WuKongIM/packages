@@ -99,8 +99,27 @@ grep -Fq 'permission-attestations: read' "$SOURCE_PREFLIGHT"
 grep -Fq 'GH_TOKEN: ${{ steps.source-token.outputs.token }}' "$SOURCE_PREFLIGHT"
 grep -Fq './scripts/resolve-source-release.py' "$SOURCE_PREFLIGHT"
 grep -Fq './scripts/verify-source-attestations.py' "$SOURCE_PREFLIGHT"
-grep -Fq "test \"\$(rpm -qp --queryformat '%{SIGPGP:pgpsig}'" "$SOURCE_PREFLIGHT"
+grep -Fq 'assert_metadata() {' "$SOURCE_PREFLIGHT"
+grep -Fq 'release_core="${version%%-*}"' "$SOURCE_PREFLIGHT"
+grep -Fq 'prerelease="${version#*-}"' "$SOURCE_PREFLIGHT"
+grep -Fq 'expected_deb_version="${release_core}~${prerelease}"' "$SOURCE_PREFLIGHT"
+grep -Fq "assert_metadata 'DEB version' \"\$expected_deb_version\" \"\$deb_version\"" "$SOURCE_PREFLIGHT"
+grep -Fq "assert_metadata 'RPM SIGPGP' '(none)' \"\$rpm_signature_pgp\"" "$SOURCE_PREFLIGHT"
+grep -Fq 'export LC_ALL=C' "$SOURCE_PREFLIGHT"
 grep -Fq 'retention-days: 30' "$SOURCE_PREFLIGHT"
+if grep -Fq '${version/-/~}' "$SOURCE_PREFLIGHT"; then
+  echo 'source Release preflight must not use Bash tilde-expanding replacement syntax' >&2
+  exit 1
+fi
+(
+  version='3.1.0-rc.1-hotfix'
+  release_core="${version%%-*}"
+  prerelease="${version#*-}"
+  expected_deb_version="${release_core}~${prerelease}"
+  expected_rpm_version="${expected_deb_version//-/_}"
+  test "$expected_deb_version" = '3.1.0~rc.1-hotfix'
+  test "$expected_rpm_version" = '3.1.0~rc.1_hotfix'
+)
 if grep -Eq 'contents: write|pages: write|id-token: write' "$SOURCE_PREFLIGHT"; then
   echo 'source Release preflight must remain read-only' >&2
   exit 1
