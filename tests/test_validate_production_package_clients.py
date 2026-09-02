@@ -356,6 +356,8 @@ class ValidateProductionPackageClientsTest(unittest.TestCase):
                         self.assertIn("apt-get \"${apt_options[@]}\" update", rendered)
                         self.assertIn("apt-get \"${apt_options[@]}\" download", rendered)
                         self.assertIn("signed-by=/keys/apt-preview.asc", rendered)
+                        self.assertNotIn("WK_CA_BUNDLE=", rendered)
+                        self.assertNotIn(validator.APT_CA_BUNDLE_PATH, rendered)
                     else:
                         self.assertIn("repo_gpgcheck=1", rendered)
                         self.assertIn(
@@ -417,6 +419,40 @@ class ValidateProductionPackageClientsTest(unittest.TestCase):
                         ["bash", "-c", script], command[image_index + 1:]
                     )
 
+    def test_remote_apt_explicitly_uses_the_mounted_host_ca_bundle(self) -> None:
+        with TemporaryDirectory() as temporary:
+            fixture = Fixture(Path(temporary))
+            downloads = Path(temporary) / "downloads"
+            downloads.mkdir()
+            ca_bundle = Path(temporary) / "ca-certificates.crt"
+            ca_bundle.write_bytes(b"host ca\n")
+            for _, image in validator.APT_CLIENTS:
+                with mock.patch.object(
+                    validator, "_host_ca_bundle", return_value=ca_bundle
+                ):
+                    command = validator._client_command(
+                        image,
+                        downloads,
+                        fixture.apt_certificate,
+                        "apt",
+                        None,
+                        "https://packages.example",
+                    )
+
+                image_index = command.index(image)
+                self.assertIn(
+                    f"{ca_bundle}:{validator.APT_CA_BUNDLE_PATH}:ro",
+                    command[:image_index],
+                )
+                self.assertIn(
+                    f"WK_CA_BUNDLE={validator.APT_CA_BUNDLE_PATH}",
+                    command[:image_index],
+                )
+                self.assertIn(
+                    'Acquire::https::CaInfo="$WK_CA_BUNDLE"',
+                    command[image_index + 3],
+                )
+
     def test_remote_mode_pins_endpoint_keys_and_uses_https_clients(self) -> None:
         with TemporaryDirectory() as temporary:
             fixture = Fixture(Path(temporary))
@@ -474,6 +510,23 @@ class ValidateProductionPackageClientsTest(unittest.TestCase):
         ]
         self.assertEqual(2, len(apt_commands))
         self.assertTrue(all(str(ca_bundle) in "\n".join(item) for item in apt_commands))
+        self.assertTrue(
+            all(
+                f"WK_CA_BUNDLE={validator.APT_CA_BUNDLE_PATH}" in item
+                for item in apt_commands
+            )
+        )
+        rpm_commands = [
+            command for command in fixture.commands
+            if any(image in command for _, image in validator.RPM_CLIENTS)
+        ]
+        self.assertEqual(2, len(rpm_commands))
+        self.assertTrue(
+            all(str(ca_bundle) not in "\n".join(item) for item in rpm_commands)
+        )
+        self.assertTrue(
+            all("WK_CA_BUNDLE=" not in "\n".join(item) for item in rpm_commands)
+        )
 
     def test_remote_snapshot_closes_over_indexed_and_retained_payloads(self) -> None:
         with TemporaryDirectory() as temporary:

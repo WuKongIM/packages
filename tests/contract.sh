@@ -10,6 +10,7 @@ SOURCE_PREFLIGHT="$ROOT_DIR/.github/workflows/source-release-preflight.yml"
 AUDIT_DRAFT_WORKFLOW="$ROOT_DIR/.github/workflows/native-package-audit-draft.yml"
 AUDIT_BIND_WORKFLOW="$ROOT_DIR/.github/workflows/native-package-audit-bind.yml"
 PUBLISH_WORKFLOW="$ROOT_DIR/.github/workflows/native-package-publish.yml"
+IMMUTABLE_REVERIFY_WORKFLOW="$ROOT_DIR/.github/workflows/native-package-immutable-public-reverify.yml"
 TOOLCHAIN_WORKFLOW="$ROOT_DIR/.github/workflows/native-package-signing-toolchain.yml"
 SIGNING_PREFLIGHT_WORKFLOW="$ROOT_DIR/.github/workflows/native-package-signing-preflight.yml"
 TOOLCHAIN_DOCKERFILE="$ROOT_DIR/toolchain/native-package-signing/Dockerfile"
@@ -132,6 +133,7 @@ for workflow in \
   "$AUDIT_DRAFT_WORKFLOW" \
   "$AUDIT_BIND_WORKFLOW" \
   "$PUBLISH_WORKFLOW" \
+  "$IMMUTABLE_REVERIFY_WORKFLOW" \
   "$TOOLCHAIN_WORKFLOW" \
   "$SIGNING_PREFLIGHT_WORKFLOW"; do
   test -f "$workflow"
@@ -142,6 +144,183 @@ for workflow in \
   grep -Fq 'ref: ${{ github.sha }}' "$workflow"
   grep -Fq 'persist-credentials: false' "$workflow"
 done
+
+python3 - "$IMMUTABLE_REVERIFY_WORKFLOW" <<'PY'
+import pathlib
+import re
+import sys
+
+path = pathlib.Path(sys.argv[1])
+workflow = path.read_text(encoding="utf-8")
+
+if workflow.count("\npermissions: {}\n") != 1:
+    raise SystemExit("immutable public reverify must default to no token permissions")
+dispatch = workflow.split("  workflow_dispatch:\n", 1)[1].split(
+    "\npermissions: {}", 1
+)[0]
+inputs = re.findall(r"(?m)^      ([a-z][a-z0-9_]+):$", dispatch)
+if inputs != ["expected_verifier_sha", "audit_release_id"]:
+    raise SystemExit(
+        f"immutable public reverify inputs must be exact and caller-minimal: {inputs}"
+    )
+
+jobs_text = workflow.split("\njobs:\n", 1)[1]
+jobs = re.findall(r"(?m)^  ([a-z][a-z0-9_]*):$", jobs_text)
+if jobs != ["reverify"]:
+    raise SystemExit(f"immutable public reverify must contain one exact job: {jobs}")
+job = jobs_text.split("  reverify:\n", 1)[1]
+permission_match = re.search(
+    r"(?m)^    permissions:\n((?:      [a-z-]+: (?:read|write)\n)+)", job
+)
+if permission_match is None:
+    raise SystemExit("immutable public reverify lacks explicit job permissions")
+permissions = dict(
+    re.findall(r"(?m)^      ([a-z-]+): (read|write)$", permission_match.group(1))
+)
+if permissions != {"attestations": "read", "contents": "read", "packages": "read"}:
+    raise SystemExit(
+        f"immutable public reverify permissions escaped the read-only boundary: {permissions}"
+    )
+
+actions = re.findall(r"(?m)^\s+uses: ([^\s#]+)", job)
+expected_actions = [
+    "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+    "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
+]
+if actions != expected_actions:
+    raise SystemExit(
+        f"immutable public reverify actions must remain exact: {actions}"
+    )
+
+forbidden = re.compile(
+    r"secrets\.|^[ \t]+environment:|(?:contents|packages|attestations|pages|id-token): write|"
+    r"read-all|write-all|actions/(?:download-artifact|configure-pages|upload-pages-artifact|deploy-pages)@|"
+    r"actions/create-github-app-token@|gh release|--method\s+(?:POST|PATCH|PUT|DELETE)|"
+    r"git push|seal-audit-release|bind-audit-release|sign-package-family|"
+    r"compose-package-site|archive-package-snapshot\.py create",
+    re.MULTILINE,
+)
+match = forbidden.search(job)
+if match is not None:
+    raise SystemExit(
+        f"immutable public reverify contains a forbidden write or credential path: {match.group(0)!r}"
+    )
+
+required = (
+    "group: packages-pages",
+    "cancel-in-progress: false",
+    "ref: ${{ github.sha }}",
+    "fetch-depth: 0",
+    "persist-credentials: false",
+    'test "$EXPECTED_VERIFIER_SHA" = "$GITHUB_SHA"',
+    'git merge-base --is-ancestor "$snapshot_control_sha" "$GITHUB_SHA"',
+    'snapshot_control_sha="$(jq -er \'.object.sha\' "$root/evidence/tag-initial.json")"',
+    'test "$(jq -er \'.target_commitish\' "$release")" = "$snapshot_control_sha"',
+    'git diff --name-status --no-renames "$snapshot_control_sha" "$GITHUB_SHA"',
+    "$'A\\t.github/workflows/native-package-immutable-public-reverify.yml'",
+    "$'M\\tscripts/validate-production-package-clients.py'",
+    "$'M\\ttests/contract.sh'",
+    "$'M\\ttests/test_validate_production_package_clients.py'",
+    './scripts/validate-control.py --root "$historical"',
+    'git show "$snapshot_control_sha:$path" >"$historical/$path"',
+    'cmp -- "$historical/$path" "$path"',
+    './scripts/resolve-audit-release.py',
+    '--expected-control-sha "$snapshot_control_sha"',
+    "--expected-tag-state exact",
+    '.classification == "immutable_complete"',
+    "./scripts/archive-package-snapshot.py extract",
+    "./scripts/package-audit-receipt.py verify",
+    "gh attestation verify",
+    "--network none --read-only --cap-drop ALL",
+    "python3 /current/scripts/verify-production-package-site.py",
+    "fetch_and_compare status.json",
+    "fetch_and_compare apt/dists/preview/Release",
+    "fetch_and_compare rpm/preview/el/9/x86_64/repodata/repomd.xml",
+    "fetch_and_compare keys/apt-preview.asc",
+    "fetch_and_compare keys/rpm-preview.asc",
+    "python3 scripts/validate-production-package-clients.py",
+    "--base-url https://packages.githubim.com",
+    '.control_sha == $control and .snapshot_sha256 == $snapshot',
+    '(.apt | length) == 2 and (.rpm | length) == 2',
+    'artifact_control_sha:$artifact_control_sha',
+    'verifier_sha:$verifier_sha',
+    'cmp -- "$root/evidence/release-initial.json" "$root/evidence/release-final.json"',
+    'cmp -- "$root/evidence/tag-initial.json" "$root/evidence/tag-final.json"',
+    "retention-days: 90",
+    "git diff --exit-code HEAD --",
+)
+missing = [value for value in required if value not in workflow]
+if missing:
+    raise SystemExit(
+        f"immutable public reverify omits required fail-closed evidence: {missing}"
+    )
+
+if workflow.count(
+    'test "$(gh api repos/WuKongIM/packages/git/ref/heads/main --jq .object.sha)" = "$GITHUB_SHA"'
+) != 2:
+    raise SystemExit("immutable public reverify must fence protected main twice")
+final_tag_cmp = workflow.index(
+    'cmp -- "$root/evidence/tag-initial.json" "$root/evidence/tag-final.json"'
+)
+final_main_fence = workflow.rindex(
+    'test "$(gh api repos/WuKongIM/packages/git/ref/heads/main --jq .object.sha)" = "$GITHUB_SHA"'
+)
+if final_main_fence <= final_tag_cmp:
+    raise SystemExit(
+        "immutable public reverify must fence main after its final Release and tag reads"
+    )
+if workflow.count("./scripts/resolve-audit-release.py") != 1:
+    raise SystemExit("immutable public reverify must resolve the numeric Release exactly once")
+if '--expected-control-sha "$GITHUB_SHA"' in workflow:
+    raise SystemExit("immutable artifact resolution must not conflate artifact and verifier SHAs")
+if "/artifact-control/scripts" in workflow or "/artifact-control/tests" in workflow:
+    raise SystemExit("immutable public reverify may not execute historical code")
+if workflow.count("https://packages.githubim.com") != 2:
+    raise SystemExit("immutable public reverify must use only the fixed production endpoint")
+
+historical_match = re.search(
+    r"historical_paths=\(\n(?P<body>.*?)^          \)\n", workflow, re.MULTILINE | re.DOTALL
+)
+if historical_match is None:
+    raise SystemExit("immutable public reverify lacks its historical data allowlist")
+historical_paths = [line.strip() for line in historical_match.group("body").splitlines()]
+expected_historical_paths = [
+    "keys/README.md",
+    "keys/apt-preview.asc",
+    "keys/rpm-preview.asc",
+    "manifests/audit-access.json",
+    "manifests/channels.json",
+    "manifests/preview-signing.json",
+    "manifests/signing-toolchain.json",
+    "manifests/source-read.json",
+    "manifests/trusted-toolchain.json",
+    "site/index.html",
+    "site/status.json",
+]
+if historical_paths != expected_historical_paths:
+    raise SystemExit(
+        f"immutable public reverify historical data allowlist changed: {historical_paths}"
+    )
+
+identity_match = re.search(
+    r"identity_paths=\(\n(?P<body>.*?)^          \)\n", workflow, re.MULTILINE | re.DOTALL
+)
+if identity_match is None:
+    raise SystemExit("immutable public reverify lacks its byte-identity allowlist")
+identity_paths = [line.strip() for line in identity_match.group("body").splitlines()]
+expected_identity_paths = [
+    "manifests/channels.json",
+    "manifests/preview-signing.json",
+    "manifests/signing-toolchain.json",
+    "manifests/trusted-toolchain.json",
+    "keys/apt-preview.asc",
+    "keys/rpm-preview.asc",
+]
+if identity_paths != expected_identity_paths:
+    raise SystemExit(
+        f"immutable public reverify identity allowlist changed: {identity_paths}"
+    )
+PY
 
 grep -Fq 'group: native-package-preview-signing-preflight' "$SIGNING_PREFLIGHT_WORKFLOW"
 grep -Fq 'cancel-in-progress: false' "$SIGNING_PREFLIGHT_WORKFLOW"
@@ -472,6 +651,12 @@ grep -Fq '.expected_version == $target and .expected_version_verified == true' "
 grep -Fq 'https://raw.githubusercontent.com/WuKongIM/WuKongIM/${commit}/${relative}' "$PUBLISH_WORKFLOW"
 grep -Fq -- '--connect-timeout 10 --max-time 30 --max-filesize 1048576' "$PUBLISH_WORKFLOW"
 grep -Fq 'install --downloadonly' "$ROOT_DIR/scripts/validate-production-package-clients.py"
+grep -Fq 'APT_CA_BUNDLE_PATH = "/etc/ssl/certs/ca-certificates.crt"' \
+  "$ROOT_DIR/scripts/validate-production-package-clients.py"
+grep -Fq 'Acquire::https::CaInfo="$WK_CA_BUNDLE"' \
+  "$ROOT_DIR/scripts/validate-production-package-clients.py"
+grep -Fq 'command.extend(("--env", f"WK_CA_BUNDLE={APT_CA_BUNDLE_PATH}"))' \
+  "$ROOT_DIR/scripts/validate-production-package-clients.py"
 grep -Fq 'test "$(gh api repos/WuKongIM/packages/git/ref/heads/main --jq .object.sha)" = "$GITHUB_SHA"' "$PUBLISH_WORKFLOW"
 grep -Fq 'actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e' "$PUBLISH_WORKFLOW"
 if grep -Eq 'gh release delete|--method DELETE|git push|refs/tags/v|source-attestation-summary|--source-attestation-summary|repos/WuKongIM/WuKongIM/contents' "$PUBLISH_WORKFLOW"; then

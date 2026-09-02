@@ -43,6 +43,7 @@ STATUS_SCHEMA = "wukongim.native_package_repository_status/v2"
 MAX_CONTROL_BYTES = 8 * 1024 * 1024
 MAX_CERTIFICATE_BYTES = 1024 * 1024
 MAX_DOWNLOAD_BYTES = 800 * 1024 * 1024
+APT_CA_BUNDLE_PATH = "/etc/ssl/certs/ca-certificates.crt"
 SHA1_RE = re.compile(r"^[0-9a-f]{40}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 FINGERPRINT_RE = re.compile(r"^[0-9A-F]{40}$")
@@ -124,6 +125,12 @@ apt_options=(
   -o Acquire::Check-Valid-Until=true
   -o APT::Sandbox::User=root
 )
+if [[ -n "${WK_CA_BUNDLE:-}" ]]; then
+  test -r "$WK_CA_BUNDLE"
+  apt_options+=(
+    -o Acquire::https::CaInfo="$WK_CA_BUNDLE"
+  )
+fi
 apt-get "${apt_options[@]}" update
 cd /downloads
 apt-get "${apt_options[@]}" download wukongim
@@ -731,7 +738,7 @@ def _base_docker_command(
     elif remote and family == "apt":
         ca_bundle = _host_ca_bundle()
         command.extend((
-            "--volume", f"{ca_bundle}:/etc/ssl/certs/ca-certificates.crt:ro",
+            "--volume", f"{ca_bundle}:{APT_CA_BUNDLE_PATH}:ro",
         ))
     return command
 
@@ -757,9 +764,10 @@ def _client_command(
             if remote else "file:///site/rpm/preview/el/9/x86_64"
         )
         script = RPM_SCRIPT
-    command.extend((
-        "--env", f"WK_REPOSITORY_URL={repository}", image, "bash", "-c", script,
-    ))
+    command.extend(("--env", f"WK_REPOSITORY_URL={repository}"))
+    if remote and family == "apt":
+        command.extend(("--env", f"WK_CA_BUNDLE={APT_CA_BUNDLE_PATH}"))
+    command.extend((image, "bash", "-c", script))
     return command
 
 
