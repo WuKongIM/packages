@@ -772,7 +772,11 @@ def _client_command(
 
 
 def _run(command: Sequence[str]) -> None:
-    subprocess.run(list(command), check=True)
+    # Container package-manager output is diagnostic. Keep stdout reserved for
+    # the canonical JSON receipt consumed by publication workflow checks.
+    subprocess.run(
+        list(command), check=True, stdout=sys.stderr, stderr=sys.stderr
+    )
 
 
 def _download_receipt(
