@@ -235,6 +235,7 @@ grep -Fq './scripts/bind-audit-release.py' "$AUDIT_BIND_WORKFLOW"
 grep -Fq -- '--expected-previous-control-sha "$EXPECTED_PREVIOUS_CONTROL_SHA"' "$AUDIT_BIND_WORKFLOW"
 grep -Fq -- '--expected-control-sha "$GITHUB_SHA"' "$AUDIT_BIND_WORKFLOW"
 grep -Fq -- '--expected-tag-state exact' "$AUDIT_BIND_WORKFLOW"
+grep -Fq '.release_tag_repaired | type' "$AUDIT_BIND_WORKFLOW"
 grep -Fq '.audit_tag_reserved == true' "$AUDIT_BIND_WORKFLOW"
 grep -Fq '.classification == "empty_draft"' "$AUDIT_BIND_WORKFLOW"
 if grep -Eq 'gh release delete|--method DELETE|git push|draft:[[:space:]]*false' "$AUDIT_BIND_WORKFLOW"; then
