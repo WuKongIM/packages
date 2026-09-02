@@ -778,6 +778,34 @@ for job in ("apt_sign", "rpm_sign"):
         raise SystemExit(
             f"publisher {job} must fence protected main immediately before and after signing"
         )
+family_path_contracts = {
+    "apt_sign": (
+        '--volume "$RUNNER_TEMP/apt-input/tree:/input:ro"',
+        "--family apt --input-root /input --output-root /work/deliver/tree",
+        "--apt-release dists/preview/Release",
+    ),
+    "rpm_sign": (
+        '--volume "$RUNNER_TEMP/rpm-input/tree:/input:ro"',
+        "--family rpm --input-root /input --output-root /work/deliver/tree",
+        "--rpm-repository preview/el/9/x86_64",
+    ),
+}
+for job, required_paths in family_path_contracts.items():
+    body = "\n".join(jobs[job])
+    if any(body.count(value) != 1 for value in required_paths):
+        raise SystemExit(
+            f"publisher {job} must strip the prepared family prefix before signing"
+        )
+prepare_body = "\n".join(jobs["prepare"])
+for family in ("apt", "rpm"):
+    flattened_copy = (
+        f"cp -a /work/prepared-repository/{family}/. "
+        f"/work/artifacts/{family}/tree/"
+    )
+    if prepare_body.count(flattened_copy) != 1:
+        raise SystemExit(
+            f"publisher prepare must flatten the {family.upper()} family-only boundary"
+        )
 trusted = "\n".join(jobs.get("trusted_source_tools", []))
 if "GH_TOKEN" in trusted or "gh api" in trusted:
     raise SystemExit("trusted source tools must be fetched without cross-repository credentials")
