@@ -255,6 +255,30 @@ grep -Eq '^[[:space:]]+environment: native-package-preview-audit-read$' "$PUBLIS
 grep -Eq '^[[:space:]]+environment: native-package-preview-audit$' "$PUBLISH_WORKFLOW"
 grep -Fq 'environment: native-package-source-read' "$PUBLISH_WORKFLOW"
 grep -Fq 'name: github-pages' "$PUBLISH_WORKFLOW"
+grep -Fq 'release_core="${TARGET_VERSION%%-*}"' "$PUBLISH_WORKFLOW"
+grep -Fq 'prerelease="${TARGET_VERSION#*-}"' "$PUBLISH_WORKFLOW"
+grep -Fq 'deb_version="${release_core}~${prerelease}"' "$PUBLISH_WORKFLOW"
+grep -Fq 'rpm_version="${deb_version//-/_}"' "$PUBLISH_WORKFLOW"
+if grep -Fq '${TARGET_VERSION/-/~}' "$PUBLISH_WORKFLOW"; then
+  echo 'publisher must not use Bash tilde-expanding replacement syntax' >&2
+  exit 1
+fi
+for TARGET_VERSION in '3.0.0-beta.6' '3.1.0-rc.1-hotfix'; do
+  release_core="${TARGET_VERSION%%-*}"
+  prerelease="${TARGET_VERSION#*-}"
+  deb_version="${release_core}~${prerelease}"
+  rpm_version="${deb_version//-/_}"
+  case "$TARGET_VERSION" in
+    3.0.0-beta.6)
+      test "$deb_version" = '3.0.0~beta.6'
+      test "$rpm_version" = '3.0.0~beta.6'
+      ;;
+    3.1.0-rc.1-hotfix)
+      test "$deb_version" = '3.1.0~rc.1-hotfix'
+      test "$rpm_version" = '3.1.0~rc.1_hotfix'
+      ;;
+  esac
+done
 grep -Fq 'actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1' "$PUBLISH_WORKFLOW"
 grep -Fq 'permission-contents: read' "$PUBLISH_WORKFLOW"
 grep -Fq 'permission-attestations: read' "$PUBLISH_WORKFLOW"

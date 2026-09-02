@@ -2,5 +2,5 @@
   "schema": "wukongim.native_package_repository_status/v1",
   "apt": false,
   "rpm": false,
-  "reason": "awaiting_first_release"
+  "reason": "ready"
 }
