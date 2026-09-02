@@ -341,6 +341,73 @@ if pattern.search(workflow) is not None:
         "publisher must not override the fixed non-root signing toolchain USER"
     )
 PY
+python3 - "$PUBLISH_WORKFLOW" <<'PY'
+import pathlib
+import re
+import sys
+
+workflow = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+job_markers = list(re.finditer(r"(?m)^  ([a-z][a-z0-9_]*):\n", workflow))
+jobs = {}
+for index, marker in enumerate(job_markers):
+    end = job_markers[index + 1].start() if index + 1 < len(job_markers) else len(workflow)
+    jobs[marker.group(1)] = workflow[marker.start():end]
+
+required_conditions = {
+    "apt_sign": (
+        "always() && needs.control.result == 'success' && "
+        "needs.prepare.result == 'success' && "
+        "needs.control.outputs.classification == 'empty_draft'"
+    ),
+    "rpm_sign": (
+        "always() && needs.control.result == 'success' && "
+        "needs.prepare.result == 'success' && "
+        "needs.control.outputs.classification == 'empty_draft'"
+    ),
+    "pages_artifact": (
+        "always() && needs.control.result == 'success' && "
+        "needs.sealed.result == 'success'"
+    ),
+    "deploy": (
+        "always() && needs.control.result == 'success' && "
+        "needs.pages_artifact.result == 'success' && "
+        "needs.pages_artifact.outputs.deploy_needed == 'true'"
+    ),
+    "postverify": (
+        "always() && needs.control.result == 'success' && "
+        "needs.pages_artifact.result == 'success' && "
+        "(needs.pages_artifact.outputs.deploy_needed != 'true' || "
+        "needs.deploy.result == 'success')"
+    ),
+}
+required_needs = {
+    "apt_sign": {"control", "prepare"},
+    "rpm_sign": {"control", "prepare"},
+    "pages_artifact": {"control", "sealed"},
+    "deploy": {"control", "pages_artifact"},
+    "postverify": {"control", "pages_artifact", "deploy"},
+}
+for job, expected_condition in required_conditions.items():
+    block = jobs.get(job)
+    if block is None:
+        raise SystemExit(f"publisher is missing required job: {job}")
+    needs_match = re.search(r"(?m)^    needs:\n((?:      - [a-z][a-z0-9_]*\n)+)", block)
+    if needs_match is None:
+        raise SystemExit(f"publisher job must have a multiline needs list: {job}")
+    needs = set(re.findall(r"(?m)^      - ([a-z][a-z0-9_]*)$", needs_match.group(1)))
+    if needs != required_needs[job]:
+        raise SystemExit(
+            f"publisher job {job} has unexpected dependencies: {sorted(needs)}"
+        )
+    condition_match = re.search(r"(?m)^    if: >-\n((?:      .*\n)+)", block)
+    if condition_match is None:
+        raise SystemExit(f"publisher job must have a multiline condition: {job}")
+    condition = " ".join(condition_match.group(1).split())
+    if condition != expected_condition:
+        raise SystemExit(
+            f"publisher job {job} has an unexpected condition: {condition}"
+        )
+PY
 grep -Fq 'repos/WuKongIM/packages/immutable-releases' "$PUBLISH_WORKFLOW"
 grep -Fq 'immutable Releases must remain enabled' "$ROOT_DIR/scripts/seal-audit-release.py"
 grep -Fq 'source-attestations' "$PUBLISH_WORKFLOW"
