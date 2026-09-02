@@ -42,10 +42,10 @@ the implicit Metadata read permission. Its client ID and private key exist
 only in the protected
 `native-package-preview-audit-read` Environment as
 `WK_PACKAGE_AUDIT_READER_APP_CLIENT_ID` and
-`WK_PACKAGE_AUDIT_READER_APP_PRIVATE_KEY`. Only the publisher control and
+`WK_PACKAGE_AUDIT_READER_APP_PRIVATE_KEY`. Only the publisher policy and
 immutable replay jobs use this App, and only for the Immutable Releases policy
-endpoint. Release, tag, and asset reads use those jobs' ordinary read-only
-workflow tokens instead.
+endpoint. Published Release, tag, and asset reads use those jobs' ordinary
+read-only workflow tokens instead.
 
 The separate private `WuKongIM Package Publisher` GitHub App is installed only
 on `WuKongIM/packages` with Administration read and Contents write permissions.
@@ -53,11 +53,19 @@ Its client ID and private key exist only in the protected
 `native-package-preview-audit` Environment as
 `WK_PACKAGE_PUBLISHER_APP_CLIENT_ID` and
 `WK_PACKAGE_PUBLISHER_APP_PRIVATE_KEY`. Only draft creation, audit-tag binding,
-and sealing use this App and request Contents write. The three Apps use three
-distinct private keys; a key must never be copied into another App's
-Environment. None of the Apps has webhook, OAuth, workflow, secret,
-environment, or organization permission. The ordinary workflow token remains
-read-only in these jobs.
+numeric draft classification, and sealing use this App. GitHub exposes draft
+Releases only to push-capable identities and offers no installation-token
+permission that is both read-only and draft-capable. The classification job
+therefore requests Contents write but injects the token only into an exact
+numeric GET/download resolver; the executable workflow contract forbids that
+job from using POST, PATCH, PUT, DELETE, Release upload/edit commands, or Git
+push. It does not request Administration permission. Draft creation,
+audit-tag binding, and sealing retain the exact Administration read and Contents
+write permissions needed for their policy checks and bounded mutations. The
+three Apps use three distinct private keys; a key must never be copied into
+another App's Environment. None of the Apps has webhook, OAuth, workflow,
+secret, environment, or organization permission. The ordinary workflow token
+remains read-only in these jobs.
 
 The checked-in `site/` tree always remains the disabled bootstrap page. Live
 APT/RPM content is generated from reviewed control plus immutable Releases,

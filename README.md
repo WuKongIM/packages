@@ -41,10 +41,14 @@ never committed to Git.
 - Immutable Release policy reads and audit Release/tag writes use separate
   package-only GitHub Apps. The Immutable Policy Reader credentials live only
   in the protected read Environment and have no Contents permission; ordinary
-  Release, tag, and asset reads use the workflow token. The Publisher
-  credentials live only in the protected write Environment and are exposed
-  only to the three audit writer jobs. All three App private keys are distinct
-  and remain isolated to their own Environment.
+  reads of published Releases, tags, and assets use the workflow token. GitHub
+  exposes draft Releases only to push-capable identities, so the numeric draft
+  classification job uses a repository-limited Publisher token while its
+  reviewed workflow contract forbids every write operation. The Publisher
+  credentials live only in the protected write Environment and are exposed to
+  exactly draft creation, draft classification, audit-tag binding, and
+  sealing. All three App private keys are distinct and remain isolated to
+  their own Environment.
 - `manifests/trusted-toolchain.json` pins the exact source commit and SHA-256
   bytes of the repository builder, supplemental legacy verifiers, and TEST
   ONLY drill. Production signing, snapshot composition, and final verification
