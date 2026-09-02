@@ -5,12 +5,14 @@ import hashlib
 import importlib.util
 import io
 import json
+import stat
 import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -213,6 +215,7 @@ class ResolveSourceReleaseTest(unittest.TestCase):
                     download_base_url=download_base,
                     token=None,
                 )
+            self.assertFalse(output.exists())
 
     def test_resolver_has_no_execution_unpacking_or_http_write_primitive(self) -> None:
         source = SCRIPT.read_text(encoding="utf-8")
@@ -252,14 +255,36 @@ class ResolveSourceReleaseTest(unittest.TestCase):
         self.assertEqual(
             sorted(state.asset_bytes), sorted(path.name for path in output.iterdir())
         )
+        self.assertEqual(0o555, stat.S_IMODE(output.stat().st_mode))
         for name, expected in state.asset_bytes.items():
-            self.assertEqual(expected, (output / name).read_bytes())
+            asset = output / name
+            self.assertEqual(expected, asset.read_bytes())
+            self.assertEqual(0o444, stat.S_IMODE(asset.stat().st_mode))
         release_path = f"/api/repos/{resolver.SOURCE_REPOSITORY}/releases/{RELEASE_ID}"
         self.assertEqual(2, state.requests.count(("GET", release_path)))
         branch_path = f"/api/repos/{resolver.SOURCE_REPOSITORY}/branches/main"
         self.assertEqual(2, state.requests.count(("GET", branch_path)))
         self.assertFalse(any(method != "GET" for method, _ in state.requests))
         self.assertFalse(any("/releases/tags/" in path for _, path in state.requests))
+
+    def test_cleans_up_when_cross_uid_boundary_cannot_be_sealed(self) -> None:
+        with mock.patch.object(resolver.os, "chmod", side_effect=OSError("denied")):
+            self.assert_resolution_error(
+                FixtureState(), "cannot seal downloaded assets for cross-UID read-only use"
+            )
+
+    def test_cleans_up_when_cross_uid_directory_cannot_be_sealed(self) -> None:
+        real_chmod = resolver.os.chmod
+
+        def fail_directory(path: Any, mode: int) -> None:
+            if not isinstance(path, int) and Path(path).name == "assets" and mode == 0o555:
+                raise OSError("denied")
+            real_chmod(path, mode)
+
+        with mock.patch.object(resolver.os, "chmod", side_effect=fail_directory):
+            self.assert_resolution_error(
+                FixtureState(), "cannot seal downloaded assets for cross-UID read-only use"
+            )
 
     def test_supports_lightweight_tag(self) -> None:
         state = FixtureState()

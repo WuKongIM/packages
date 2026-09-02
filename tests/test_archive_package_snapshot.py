@@ -9,6 +9,7 @@ import stat
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -91,6 +92,7 @@ class ArchivePackageSnapshotTest(unittest.TestCase):
             )
             self.assertEqual(first_receipt, extracted)
             self.assertEqual(b"ready\n", (output / "index.html").read_bytes())
+            self.assertEqual(0o755, stat.S_IMODE(output.stat().st_mode))
             self.assertEqual(0o644, stat.S_IMODE((output / "index.html").stat().st_mode))
             self.assertEqual(0o755, stat.S_IMODE((output / "apt").stat().st_mode))
 
@@ -267,6 +269,35 @@ class ArchivePackageSnapshotTest(unittest.TestCase):
             with self.assertRaisesRegex(archive.ArchiveError, "empty real directory"):
                 archive.extract_snapshot(archive_path=path, output_dir=symlink)
             self.assertEqual([], list(target.iterdir()))
+
+    def test_extract_fails_closed_when_root_export_mode_cannot_be_set(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            site = self._site(temporary)
+            path = root / "snapshot.tar"
+            archive.create_snapshot(source_dir=site, archive_path=path)
+            output = root / "output"
+            real_fchmod = os.fchmod
+
+            def fail_output_root(descriptor: int, mode: int) -> None:
+                metadata = os.fstat(descriptor)
+                if output.exists():
+                    output_metadata = output.stat()
+                    if (
+                        metadata.st_dev == output_metadata.st_dev
+                        and metadata.st_ino == output_metadata.st_ino
+                    ):
+                        raise OSError("denied")
+                real_fchmod(descriptor, mode)
+
+            with mock.patch.object(
+                archive.os, "fchmod", side_effect=fail_output_root
+            ), self.assertRaisesRegex(
+                archive.ArchiveError, "cannot export extraction directory"
+            ):
+                archive.extract_snapshot(archive_path=path, output_dir=output)
+
+            self.assertFalse(output.exists())
 
     def test_cli_can_write_an_exclusive_receipt_and_print_the_same_json(self) -> None:
         with TemporaryDirectory() as temporary:

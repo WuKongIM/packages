@@ -1727,6 +1727,12 @@ def compose(args: argparse.Namespace) -> dict[str, Any]:
             control["manifest"]["site_limit_bytes"],
         )
         require(not os.path.lexists(output), "output root appeared during composition")
+        try:
+            os.chmod(stage, 0o755)
+        except OSError as error:
+            raise CompositionError(
+                f"cannot export composed snapshot: {error}"
+            ) from error
         os.replace(stage, output)
     except BaseException:
         if os.path.lexists(stage):

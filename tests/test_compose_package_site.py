@@ -7,11 +7,13 @@ import importlib.util
 import io
 import json
 import shutil
+import stat
 import unittest
 from argparse import Namespace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -619,6 +621,7 @@ class ComposePackageSiteTest(unittest.TestCase):
 
         self.assertEqual(10, receipt["audit_release_id"])
         self.assertFalse(receipt["capacity_warning"])
+        self.assertEqual(0o755, stat.S_IMODE(fixture.output.stat().st_mode))
         status = json.loads((fixture.output / "site/status.json").read_text())
         self.assertEqual({
             "schema": composer.STATUS_SCHEMA,
@@ -661,6 +664,20 @@ class ComposePackageSiteTest(unittest.TestCase):
         self.assertEqual(b"signed-rpm-v1", (
             fixture.output / "site" / composer.expected_payload_path("rpm", V1)
         ).read_bytes())
+
+    def test_fails_closed_when_output_root_export_mode_cannot_be_set(self) -> None:
+        fixture, temporary = self.first_release()
+        self.addCleanup(temporary.cleanup)
+
+        with mock.patch.object(
+            composer.os, "chmod", side_effect=OSError("denied")
+        ), self.assertRaisesRegex(
+            composer.CompositionError, "cannot export composed snapshot"
+        ):
+            composer.compose(fixture.args())
+
+        self.assertFalse(fixture.output.exists())
+        self.assertEqual([], list(fixture.root.glob(".output.tmp.*")))
 
     def test_rejects_reviewed_fingerprints_with_colliding_key_ids(self) -> None:
         fixture, temporary = self.first_release()

@@ -13,6 +13,9 @@ PUBLISH_WORKFLOW="$ROOT_DIR/.github/workflows/native-package-publish.yml"
 TOOLCHAIN_WORKFLOW="$ROOT_DIR/.github/workflows/native-package-signing-toolchain.yml"
 SIGNING_PREFLIGHT_WORKFLOW="$ROOT_DIR/.github/workflows/native-package-signing-preflight.yml"
 TOOLCHAIN_DOCKERFILE="$ROOT_DIR/toolchain/native-package-signing/Dockerfile"
+SOURCE_RESOLVER="$ROOT_DIR/scripts/resolve-source-release.py"
+SNAPSHOT_ARCHIVER="$ROOT_DIR/scripts/archive-package-snapshot.py"
+SITE_COMPOSER="$ROOT_DIR/scripts/compose-package-site.py"
 
 "$ROOT_DIR/scripts/validate-control.py"
 
@@ -307,6 +310,37 @@ grep -Fq 'resolve-audit-release.py' "$PUBLISH_WORKFLOW"
 grep -Fq 'archive-package-snapshot.py' "$PUBLISH_WORKFLOW"
 grep -Fq 'package-audit-receipt.py' "$PUBLISH_WORKFLOW"
 grep -Fq -- '--network none' "$PUBLISH_WORKFLOW"
+grep -Fq -- '--volume "$source_dir:/source:ro"' "$PUBLISH_WORKFLOW"
+grep -Fq 'os.chmod(asset, 0o444)' "$SOURCE_RESOLVER"
+grep -Fq 'os.chmod(output_dir, 0o555)' "$SOURCE_RESOLVER"
+grep -Fq 'os.fchmod(output_root_descriptor, 0o755)' "$SNAPSHOT_ARCHIVER"
+grep -Fq 'os.chmod(stage, 0o755)' "$SITE_COMPOSER"
+python3 - "$PUBLISH_WORKFLOW" <<'PY'
+import pathlib
+import re
+import sys
+
+pattern = re.compile(
+    r"(?:^|[ \t])--user(?:=|[ \t])"
+    r"|^[ \t]*-u(?:=|[ \t])"
+    r"|docker(?:[ \t]+container)?[ \t]+run[^\n]*[ \t]-u(?:=|[ \t])",
+    re.MULTILINE,
+)
+examples = (
+    "docker run --user=0:0 image",
+    "docker run --user nobody image",
+    "docker run -u 0 image",
+    "docker container run -u 1001:1001 image",
+    "docker run \\\n  -u=65532:65532 image",
+)
+if any(pattern.search(example) is None for example in examples):
+    raise SystemExit("container USER override detector misses a required spelling")
+workflow = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+if pattern.search(workflow) is not None:
+    raise SystemExit(
+        "publisher must not override the fixed non-root signing toolchain USER"
+    )
+PY
 grep -Fq 'repos/WuKongIM/packages/immutable-releases' "$PUBLISH_WORKFLOW"
 grep -Fq 'immutable Releases must remain enabled' "$ROOT_DIR/scripts/seal-audit-release.py"
 grep -Fq 'source-attestations' "$PUBLISH_WORKFLOW"
