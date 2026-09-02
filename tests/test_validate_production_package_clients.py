@@ -358,13 +358,64 @@ class ValidateProductionPackageClientsTest(unittest.TestCase):
                         self.assertIn("signed-by=/keys/apt-preview.asc", rendered)
                     else:
                         self.assertIn("repo_gpgcheck=1", rendered)
-                        self.assertEqual(2, rendered.count("rpm -q wukongim"))
+                        self.assertIn(
+                            'cp -a /var/lib/rpm/. "$client_root/var/lib/rpm/"',
+                            rendered,
+                        )
+                        self.assertEqual(
+                            2,
+                            rendered.count(
+                                'rpm --root "$client_root" -q wukongim'
+                            ),
+                        )
+                        self.assertIn(
+                            'rpm --root "$client_root" -q systemd', rendered
+                        )
+                        self.assertIn('--installroot="$client_root"', rendered)
+                        self.assertIn("--releasever=9", rendered)
                         self.assertIn("dnf \"${dnf_options[@]}\" makecache", rendered)
                         self.assertIn("install --downloadonly", rendered)
                         self.assertIn("--downloaddir=/downloads wukongim", rendered)
                         self.assertIn("rpmkeys --dbpath /tmp/rpmdb --checksig", rendered)
                         self.assertNotIn("repoquery", rendered)
                         self.assertNotIn("curl ", rendered)
+
+    def test_docker_options_precede_image_and_container_command_follows_image(self) -> None:
+        with TemporaryDirectory() as temporary:
+            fixture = Fixture(Path(temporary))
+            downloads = Path(temporary) / "downloads"
+            downloads.mkdir()
+            clients = (
+                (
+                    "apt",
+                    validator.APT_CLIENTS,
+                    fixture.apt_certificate,
+                    "file:/site/apt",
+                    validator.APT_SCRIPT,
+                ),
+                (
+                    "rpm",
+                    validator.RPM_CLIENTS,
+                    fixture.rpm_certificate,
+                    "file:///site/rpm/preview/el/9/x86_64",
+                    validator.RPM_SCRIPT,
+                ),
+            )
+            for family, values, certificate, repository, script in clients:
+                for _, image in values:
+                    command = validator._client_command(
+                        image, downloads, certificate, family, fixture.site, None
+                    )
+                    image_index = command.index(image)
+                    environment_index = command.index("--env")
+                    self.assertLess(environment_index, image_index)
+                    self.assertEqual(
+                        f"WK_REPOSITORY_URL={repository}",
+                        command[environment_index + 1],
+                    )
+                    self.assertEqual(
+                        ["bash", "-c", script], command[image_index + 1:]
+                    )
 
     def test_remote_mode_pins_endpoint_keys_and_uses_https_clients(self) -> None:
         with TemporaryDirectory() as temporary:
@@ -811,6 +862,10 @@ class ValidateProductionPackageClientsTest(unittest.TestCase):
         self.assertEqual(len(images), len(set(images)))
         for image in images:
             self.assertIsNotNone(re.fullmatch(r"[^@]+@sha256:[0-9a-f]{64}", image))
+        self.assertRegex(
+            dict(validator.RPM_CLIENTS)["rocky-linux-9"],
+            r"^quay\.io/rockylinux/rockylinux@sha256:[0-9a-f]{64}$",
+        )
 
 
 if __name__ == "__main__":

@@ -7,7 +7,9 @@ its genuine ``install --downloadonly`` transaction against the one reviewed
 repository.  Both clients prove that ``wukongim`` is absent before and after
 the transaction; no maintainer script is executed.  The downloaded RPM is
 also checked against the reviewed public certificate in an isolated RPM
-database.
+database.  RPM clients clone the pinned image's package database into tmpfs so
+DNF can verify installed dependency providers and import the reviewed key while
+the image itself remains read-only.
 
 Local validation mounts an already verified Pages site read-only and also
 checks each downloaded payload against the snapshot inventory.  Remote
@@ -90,7 +92,9 @@ APT_CLIENTS = (
 RPM_CLIENTS = (
     (
         "rocky-linux-9",
-        "rockylinux:9@sha256:d644d203142cd5b54ad2a83a203e1dee68af2229f8fe32f52a30c6e1d3c3a9e0",
+        # The init variant contains systemd, which satisfies the package's
+        # runtime dependency while the reviewed repository remains offline.
+        "quay.io/rockylinux/rockylinux@sha256:0a384e1e9c7562251c9e2fdc4843b3ea21118e606dabfbe87d41f842f6f006ec",
     ),
     (
         "alma-linux-9",
@@ -136,11 +140,16 @@ fi
 RPM_SCRIPT = r"""
 set -euo pipefail
 export LC_ALL=C
-mkdir -p /tmp/repos.d /tmp/dnf-cache /tmp/dnf-state /tmp/rpmdb
-if rpm -q wukongim >/dev/null 2>&1; then
+client_root=/tmp/client-root
+mkdir -p \
+  /tmp/repos.d /tmp/dnf-cache /tmp/dnf-state /tmp/rpmdb \
+  "$client_root/var/lib/rpm"
+cp -a /var/lib/rpm/. "$client_root/var/lib/rpm/"
+if rpm --root "$client_root" -q wukongim >/dev/null 2>&1; then
   echo 'wukongim was already installed in the clean RPM client' >&2
   exit 1
 fi
+rpm --root "$client_root" -q systemd >/dev/null
 cat >/tmp/repos.d/wukongim-preview.repo <<EOF
 [wukongim-preview]
 name=WuKongIM preview
@@ -156,6 +165,8 @@ EOF
 dnf_options=(
   --quiet
   --assumeyes
+  --installroot="$client_root"
+  --releasever=9
   --disablerepo=*
   --enablerepo=wukongim-preview
   --setopt=reposdir=/tmp/repos.d
@@ -167,7 +178,7 @@ dnf_options=(
 dnf "${dnf_options[@]}" makecache --refresh
 dnf "${dnf_options[@]}" install --downloadonly \
   --downloaddir=/downloads wukongim
-if rpm -q wukongim >/dev/null 2>&1; then
+if rpm --root "$client_root" -q wukongim >/dev/null 2>&1; then
   echo 'DNF download-only validation installed wukongim' >&2
   exit 1
 fi
@@ -691,7 +702,6 @@ def _host_ca_bundle() -> Path:
 
 
 def _base_docker_command(
-    image: str,
     downloads: Path,
     certificate: Path,
     family: str,
@@ -723,7 +733,6 @@ def _base_docker_command(
         command.extend((
             "--volume", f"{ca_bundle}:/etc/ssl/certs/ca-certificates.crt:ro",
         ))
-    command.append(image)
     return command
 
 
@@ -737,7 +746,7 @@ def _client_command(
 ) -> list[str]:
     remote = base_url is not None
     command = _base_docker_command(
-        image, downloads, certificate, family, site, remote
+        downloads, certificate, family, site, remote
     )
     if family == "apt":
         repository = f"{base_url}/apt" if remote else "file:/site/apt"
@@ -748,7 +757,9 @@ def _client_command(
             if remote else "file:///site/rpm/preview/el/9/x86_64"
         )
         script = RPM_SCRIPT
-    command.extend(("--env", f"WK_REPOSITORY_URL={repository}", "bash", "-c", script))
+    command.extend((
+        "--env", f"WK_REPOSITORY_URL={repository}", image, "bash", "-c", script,
+    ))
     return command
 
 
