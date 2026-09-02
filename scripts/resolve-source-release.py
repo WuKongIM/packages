@@ -364,6 +364,24 @@ def _parse_checksum_closure(
     return checksums
 
 
+def _seal_cross_uid_boundary(output_dir: Path, asset_names: tuple[str, ...]) -> None:
+    """Make verified public assets readable but immutable across container UIDs."""
+    try:
+        for name in sorted(asset_names):
+            asset = output_dir / name
+            mode = asset.lstat().st_mode
+            if not stat.S_ISREG(mode):
+                raise ResolutionError(
+                    f"downloaded asset stopped being a regular file: {name}"
+                )
+            os.chmod(asset, 0o444)
+        os.chmod(output_dir, 0o555)
+    except OSError as error:
+        raise ResolutionError(
+            f"cannot seal downloaded assets for cross-UID read-only use: {error}"
+        ) from error
+
+
 def resolve_source_release(
     *,
     release_id: int,
@@ -413,7 +431,7 @@ def resolve_source_release(
         final_main_sha = _verify_main_ancestry(reader, source_sha)
 
         receipt_assets = [downloaded[name] for name in sorted(downloaded)]
-        return {
+        receipt = {
             "schema": RECEIPT_SCHEMA,
             "repository": SOURCE_REPOSITORY,
             "release_id": release_id,
@@ -437,6 +455,8 @@ def resolve_source_release(
             "tag_revalidated": True,
             "main_ancestry_revalidated": True,
         }
+        _seal_cross_uid_boundary(output_dir, tuple(sorted(downloaded)))
+        return receipt
     except Exception:
         if created_output:
             shutil.rmtree(output_dir, ignore_errors=True)

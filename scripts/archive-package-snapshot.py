@@ -655,6 +655,12 @@ def extract_snapshot(
             or final_stat.st_mtime_ns != scanned_stat.st_mtime_ns
         ):
             raise ArchiveError("archive changed during extraction")
+        try:
+            os.fchmod(output_root_descriptor, 0o755)
+        except OSError as error:
+            raise ArchiveError(
+                f"cannot export extraction directory: {error}"
+            ) from error
     except Exception:
         if descriptor >= 0:
             os.close(descriptor)

@@ -16,7 +16,7 @@
           "version": "3.0.0-beta.6",
           "source_sha": "6aec3253e3b7c9ca47088f259f4b6c80b55e18a4",
           "source_release_id": 380346817,
-          "package_release_id": 381004621,
+          "package_release_id": 381020415,
           "deb_sha256": "c2a911e8b407d9038584caa14c0edb22a7f1d93fe0ae7f6c52d2ee6021c5822d",
           "rpm_sha256": "6862496d76a3e0131944111be3b87570d9d0d60d2486457f862fc25287762903",
           "state": "active",
@@ -29,7 +29,7 @@
         "not_before": null
       },
       "publication": {
-        "audit_release_id": 381004621,
+        "audit_release_id": 381020415,
         "base_audit_release_id": null,
         "operation": "add_release",
         "target_version": "3.0.0-beta.6"

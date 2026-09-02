@@ -94,6 +94,12 @@ each asset by numeric asset ID, checks API and local SHA-256 values plus the
 checksum closure, then repeats the Release, tag, and ancestry checks after the
 downloads.
 
+After those checks succeed, the resolver seals the public source assets as
+read-only files in a read-and-traverse-only directory (`0444` files and a
+`0555` directory). This preserves immutability while allowing the separately
+UID-mapped, non-root signing-toolchain container to inspect package metadata
+through a read-only bind mount.
+
 All seven downloaded files must also verify against GitHub provenance signed
 by `.github/workflows/binary-release-publish.yml` at the exact source tag and
 commit on GitHub-hosted runners. DEB/RPM inspection is metadata-only: target
@@ -265,6 +271,14 @@ one Pages artifact. Production target automation never installs or runs a
 source Release payload. The credential-free TEST ONLY drill may install the
 packages it builds from the immutable trusted-tool commit. There is no in-place
 mutation of the live repository.
+
+Canonical snapshot archives use `0755` directories and `0644` files. After
+final archive validation, extraction also normalizes its root directory to
+`0755`; the composer does the same immediately before atomically exporting a
+completed snapshot. This makes the verified tree readable across the host
+runner and the fixed non-root signing-container UID while leaving every
+container consumption mount read-only. A failed mode transition aborts before
+publication and triggers cleanup of the unpublished output.
 
 The first `add_release` deployment accepts only the exact four-field v1
 provisioned bootstrap status with both package families disabled and reason
