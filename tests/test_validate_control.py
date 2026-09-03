@@ -285,6 +285,58 @@ class ValidateControlTest(unittest.TestCase):
 
             self.assert_rejected(root, "duplicate JSON key: schema")
 
+    def test_accepts_exact_enabled_bootstrap_package_control(self) -> None:
+        with copied_control_root() as root:
+            bootstrap = load_manifest(root, "bootstrap-packages.json")
+
+            self.assertEqual(
+                {
+                    "schema": "wukongim.native_package_bootstrap/v1",
+                    "enabled": True,
+                    "version": "1.0.0",
+                },
+                bootstrap,
+            )
+            result = self.run_validator(root)
+
+            self.assertEqual(0, result.returncode, result.stderr)
+
+    def test_rejects_malformed_bootstrap_package_control(self) -> None:
+        cases = (
+            (
+                "unknown field",
+                lambda value: value.update({"unexpected": True}),
+                "bootstrap-packages manifest fields must be exactly",
+            ),
+            (
+                "wrong schema",
+                lambda value: value.update({"schema": "wukongim.native_package_bootstrap/v2"}),
+                "bootstrap-packages schema must be",
+            ),
+            (
+                "non-boolean enabled",
+                lambda value: value.update({"enabled": "true"}),
+                "bootstrap-packages enabled must be boolean",
+            ),
+            (
+                "prefixed version",
+                lambda value: value.update({"version": "v1.0.0"}),
+                "bootstrap-packages version must be strict release SemVer",
+            ),
+            (
+                "prerelease version",
+                lambda value: value.update({"version": "1.0.0-rc.1"}),
+                "bootstrap-packages version must be strict release SemVer",
+            ),
+        )
+        for name, mutate, diagnostic in cases:
+            with self.subTest(case=name), copied_control_root() as root:
+                bootstrap = load_manifest(root, "bootstrap-packages.json")
+                mutate(bootstrap)
+                write_manifest(root, "bootstrap-packages.json", bootstrap)
+
+                self.assert_rejected(root, diagnostic)
+
     def test_accepts_exact_enabled_audit_access_boundary(self) -> None:
         with copied_control_root() as root:
             audit_access = load_manifest(root, "audit-access.json")
@@ -642,6 +694,17 @@ class ValidateControlTest(unittest.TestCase):
                 ),
                 None,
             ),
+            (
+                "update_bootstrap",
+                [first],
+                publication(
+                    "update_bootstrap",
+                    audit_release_id=3003,
+                    base_audit_release_id=2001,
+                    target_version="3.1.0-rc.1",
+                ),
+                None,
+            ),
         )
         with copied_control_root() as root:
             enable_signing(root)
@@ -769,6 +832,29 @@ class ValidateControlTest(unittest.TestCase):
                 None,
                 "target_version must be strict prerelease SemVer",
             ),
+            (
+                "update_bootstrap_without_base",
+                [first],
+                publication(
+                    "update_bootstrap",
+                    audit_release_id=3003,
+                    target_version="3.1.0-rc.1",
+                ),
+                None,
+                "update_bootstrap requires a base_audit_release_id",
+            ),
+            (
+                "update_bootstrap_with_inactive_target",
+                [removed_first, second],
+                publication(
+                    "update_bootstrap",
+                    audit_release_id=3003,
+                    base_audit_release_id=2002,
+                    target_version="3.1.0-rc.1",
+                ),
+                indexed_retirement,
+                "update_bootstrap target must be exactly one active preview release",
+            ),
         )
         for name, releases, requested_publication, retirement, diagnostic in cases:
             with self.subTest(operation=name), copied_control_root() as root:
@@ -779,6 +865,28 @@ class ValidateControlTest(unittest.TestCase):
                     retirement=retirement,
                 )
                 self.assert_rejected(root, diagnostic)
+
+    def test_update_bootstrap_requires_enabled_bootstrap_packages(self) -> None:
+        with copied_control_root() as root:
+            first = preview_release()
+            bootstrap = load_manifest(root, "bootstrap-packages.json")
+            bootstrap["enabled"] = False
+            write_manifest(root, "bootstrap-packages.json", bootstrap)
+            configure_ready_preview(
+                root,
+                [first],
+                publication(
+                    "update_bootstrap",
+                    audit_release_id=3003,
+                    base_audit_release_id=2001,
+                    target_version=first["version"],
+                ),
+            )
+
+            self.assert_rejected(
+                root,
+                "update_bootstrap requires enabled bootstrap-packages control",
+            )
 
     def test_rejects_extra_tracked_site_file(self) -> None:
         with copied_control_root() as root:

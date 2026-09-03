@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Derive exact RPM signer allowlists from one reviewed payload inventory."""
+"""Derive exact RPM signer allowlists from product and bootstrap inventories."""
 
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ from typing import Any
 
 
 INVENTORY_SCHEMA = "wukongim.native_package_payload_inventory/v1"
+BOOTSTRAP_INVENTORY_SCHEMA = "wukongim.native_package_bootstrap_inventory/v1"
 PACKAGE_ALLOWLIST_SCHEMA = "wukongim/rpm-package-allowlist/v1"
 ACTIVE_ALLOWLIST_SCHEMA = "wukongim/rpm-active-allowlist/v1"
 RECEIPT_SCHEMA = "wukongim/rpm-allowlist-derivation/v1"
@@ -35,7 +36,16 @@ INVENTORY_FIELDS = {
     "retained_versions",
     "schema",
 }
+BOOTSTRAP_INVENTORY_FIELDS = {"schema", "version", "packages"}
+BOOTSTRAP_ENTRY_FIELDS = {
+    "name", "version", "architecture", "filename", "repository_path",
+    "download_path", "source_sha256", "source_size", "published_sha256",
+    "published_size", "new",
+}
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+RELEASE_VERSION_RE = re.compile(
+    r"^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$"
+)
 SAFE_COMPONENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+~-]{0,254}$")
 MAX_INVENTORY_BYTES = 4 * 1024 * 1024
 MAX_RPM_BYTES = 1024 * 1024 * 1024
@@ -184,6 +194,70 @@ def load_inventory(path: Path) -> dict[str, Any]:
     return value
 
 
+def load_bootstrap_inventory(path: Path) -> dict[str, Any]:
+    raw, _ = read_regular_file(
+        path,
+        "bootstrap inventory",
+        maximum_bytes=MAX_INVENTORY_BYTES,
+        require_nonempty=True,
+    )
+    try:
+        value = json.loads(raw.decode("utf-8"), object_pairs_hook=reject_duplicate_pairs)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise DerivationError("bootstrap inventory is not valid UTF-8 JSON") from error
+    require(isinstance(value, dict) and set(value) == BOOTSTRAP_INVENTORY_FIELDS,
+            "bootstrap inventory has missing or unexpected fields")
+    require(value["schema"] == BOOTSTRAP_INVENTORY_SCHEMA,
+            f"bootstrap inventory schema must be {BOOTSTRAP_INVENTORY_SCHEMA}")
+    version = value["version"]
+    require(isinstance(version, str) and RELEASE_VERSION_RE.fullmatch(version) is not None,
+            "bootstrap inventory version must be strict release SemVer")
+    packages = value["packages"]
+    require(isinstance(packages, dict) and set(packages) == {"apt", "rpm"},
+            "bootstrap inventory packages must contain exactly apt and rpm")
+    specifications = {
+        "apt": ("wukongim-archive-keyring", "all", ".deb"),
+        "rpm": ("wukongim-release", "noarch", ".rpm"),
+    }
+    for family in ("apt", "rpm"):
+        item = packages[family]
+        require(isinstance(item, dict) and set(item) == BOOTSTRAP_ENTRY_FIELDS,
+                f"bootstrap {family} entry has missing or unexpected fields")
+        name, architecture, suffix = specifications[family]
+        filename = (
+            f"wukongim-archive-keyring_{version}_all.deb"
+            if family == "apt"
+            else f"wukongim-release-{version}-1.noarch.rpm"
+        )
+        repository_path = (
+            f"apt/pool/main/w/wukongim/{filename}"
+            if family == "apt"
+            else f"{RPM_PREFIX}Packages/{filename}"
+        )
+        require(item["name"] == name and item["version"] == version
+                and item["architecture"] == architecture,
+                f"bootstrap {family} package identity is invalid")
+        require(item["filename"] == filename and item["repository_path"] == repository_path
+                and item["download_path"] == f"bootstrap/{filename}"
+                and filename.endswith(suffix),
+                f"bootstrap {family} package paths are invalid")
+        for field in ("source_sha256", "published_sha256"):
+            require(isinstance(item[field], str) and SHA256_RE.fullmatch(item[field]) is not None,
+                    f"bootstrap {family} {field} is invalid")
+        for field in ("source_size", "published_size"):
+            require(type(item[field]) is int and item[field] > 0,
+                    f"bootstrap {family} {field} must be positive")
+        require(type(item["new"]) is bool,
+                f"bootstrap {family} new must be boolean")
+        if item["new"] or family == "apt":
+            require(item["source_sha256"] == item["published_sha256"]
+                    and item["source_size"] == item["published_size"],
+                    f"bootstrap {family} source and published bytes must match")
+    require(packages["apt"]["new"] == packages["rpm"]["new"],
+            "bootstrap package new states must match")
+    return value
+
+
 def version_set(value: Any, label: str) -> set[str]:
     require(isinstance(value, list), f"{label} must be an array")
     result: set[str] = set()
@@ -267,7 +341,11 @@ def package_tree_paths(root: Path) -> list[str]:
     return sorted(paths)
 
 
-def derive(inventory: dict[str, Any], repository_root: Path) -> tuple[dict[str, Any], ...]:
+def derive(
+    inventory: dict[str, Any],
+    bootstrap_inventory: dict[str, Any],
+    repository_root: Path,
+) -> tuple[dict[str, Any], ...]:
     try:
         root = repository_root.resolve(strict=True)
         original = repository_root.lstat()
@@ -325,6 +403,33 @@ def derive(inventory: dict[str, Any], repository_root: Path) -> tuple[dict[str, 
 
     require(versions == active_versions | retained_versions,
             "RPM inventory versions do not close over active and retained versions")
+    bootstrap_rpm = bootstrap_inventory["packages"]["rpm"]
+    bootstrap_relative = stripped_rpm_path(
+        bootstrap_rpm["repository_path"], "bootstrap RPM repository_path"
+    )
+    require(bootstrap_relative not in paths,
+            f"RPM inventories contain duplicate path: {bootstrap_relative}")
+    paths.add(bootstrap_relative)
+    bootstrap_path = repository_file(
+        root, bootstrap_relative, f"repository bootstrap RPM {bootstrap_relative}"
+    )
+    bootstrap_digest, bootstrap_size = digest_regular_rpm(
+        bootstrap_path, f"repository bootstrap RPM {bootstrap_relative}"
+    )
+    require(
+        bootstrap_digest == bootstrap_rpm["published_sha256"]
+        and bootstrap_size == bootstrap_rpm["published_size"],
+        "repository bootstrap RPM facts do not match inventory",
+    )
+    bootstrap_package = {
+        "path": bootstrap_relative,
+        "sha256": bootstrap_digest,
+        "size": bootstrap_size,
+    }
+    (new_packages if bootstrap_rpm["new"] else signed_packages).append(
+        bootstrap_package
+    )
+    active_paths.append(bootstrap_relative)
     actual_paths = package_tree_paths(root)
     require(sorted(paths) == actual_paths,
             "RPM inventory does not close over the exact repository Packages set")
@@ -430,8 +535,9 @@ def write_outputs_exclusively(outputs: list[tuple[Path, bytes]]) -> None:
 
 def run(args: argparse.Namespace) -> dict[str, object]:
     inventory = load_inventory(args.inventory)
+    bootstrap_inventory = load_bootstrap_inventory(args.bootstrap_inventory)
     new_output, signed_output, active_output, receipt = derive(
-        inventory, args.repository_root
+        inventory, bootstrap_inventory, args.repository_root
     )
     write_outputs_exclusively([
         (args.new_output, canonical_json(new_output)),
@@ -444,6 +550,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--inventory", required=True, type=Path)
+    parser.add_argument("--bootstrap-inventory", required=True, type=Path)
     parser.add_argument("--repository-root", required=True, type=Path)
     parser.add_argument("--new-output", required=True, type=Path)
     parser.add_argument("--signed-output", required=True, type=Path)

@@ -82,6 +82,14 @@ class VerifyProductionPackageSiteTest(unittest.TestCase):
                     f"Version: {verifier.apt_package_version(item['version'])}\n"
                     "Architecture: amd64\n",
                 )
+        bootstrap_path = fixture.output / "site/bootstrap/manifest.json"
+        if bootstrap_path.is_file():
+            bootstrap = json.loads(bootstrap_path.read_text())["packages"]["apt"]
+            packages_text = packages_text.replace(
+                f"Package: {bootstrap['name']}\nVersion: {bootstrap['version']}\n",
+                f"Package: {bootstrap['name']}\nVersion: {bootstrap['version']}\n"
+                f"Architecture: {bootstrap['architecture']}\n",
+            )
         packages = packages_text.encode()
         (binary / "Packages").write_bytes(packages)
         self._rewrite_apt_hashes(fixture)
@@ -120,30 +128,56 @@ class VerifyProductionPackageSiteTest(unittest.TestCase):
             f" {sha512(compressed)} {len(compressed)} main/binary-amd64/Packages.gz\n"
         ).encode())
 
-    def _close_secondary_rpm_metadata(self, fixture: fixtures.Fixture) -> None:
+    def _close_secondary_rpm_metadata(
+        self, fixture: fixtures.Fixture, *, include_bootstrap: bool = True
+    ) -> None:
         site = fixture.output / "site"
         snapshot = json.loads((fixture.output / "audit/snapshot.json").read_text())
         repository = site / "rpm/preview/el/9/x86_64"
         active = [item for item in snapshot["payloads"]["rpm"] if item["indexed"]]
-        secondary_packages = "".join(
-            f'<package pkgid="{item["published_sha256"]}" name="wukongim" arch="x86_64">'
-            f'<version epoch="0" ver="{verifier.rpm_package_version(item["version"])}" rel="1"/>'
-            "</package>"
+        entries = [
+            {
+                "name": "wukongim",
+                "architecture": "x86_64",
+                "version": verifier.rpm_package_version(item["version"]),
+                "release": "1",
+                "path": item["path"],
+                "sha256": item["published_sha256"],
+            }
             for item in active
+        ]
+        bootstrap_path = site / "bootstrap/manifest.json"
+        if include_bootstrap and bootstrap_path.is_file():
+            bootstrap = json.loads(bootstrap_path.read_text())["packages"]["rpm"]
+            entries.append({
+                "name": bootstrap["name"],
+                "architecture": bootstrap["architecture"],
+                "version": bootstrap["version"],
+                "release": "1",
+                "path": bootstrap["repository_path"],
+                "sha256": bootstrap["published_sha256"],
+            })
+        secondary_packages = "".join(
+            f'<package pkgid="{item["sha256"]}" name="{item["name"]}" '
+            f'arch="{item["architecture"]}">'
+            f'<version epoch="0" ver="{item["version"]}" rel="{item["release"]}"/>'
+            "</package>"
+            for item in entries
         )
         primary_packages = "".join(
-            '<package type="rpm"><name>wukongim</name><arch>x86_64</arch>'
-            f'<version epoch="0" ver="{verifier.rpm_package_version(item["version"])}" rel="1"/>'
-            f'<checksum type="sha256" pkgid="YES">{item["published_sha256"]}</checksum>'
+            f'<package type="rpm"><name>{item["name"]}</name>'
+            f'<arch>{item["architecture"]}</arch>'
+            f'<version epoch="0" ver="{item["version"]}" rel="{item["release"]}"/>'
+            f'<checksum type="sha256" pkgid="YES">{item["sha256"]}</checksum>'
             f'<size package="{(site / item["path"]).stat().st_size}"/>'
             f'<location href="{Path(item["path"]).relative_to("rpm/preview/el/9/x86_64").as_posix()}"/>'
             "</package>"
-            for item in active
+            for item in entries
         )
         metadata = {
-            "primary": f'<metadata packages="{len(active)}">{primary_packages}</metadata>\n'.encode(),
-            "filelists": f'<filelists packages="{len(active)}">{secondary_packages}</filelists>\n'.encode(),
-            "other": f'<otherdata packages="{len(active)}">{secondary_packages}</otherdata>\n'.encode(),
+            "primary": f'<metadata packages="{len(entries)}">{primary_packages}</metadata>\n'.encode(),
+            "filelists": f'<filelists packages="{len(entries)}">{secondary_packages}</filelists>\n'.encode(),
+            "other": f'<otherdata packages="{len(entries)}">{secondary_packages}</otherdata>\n'.encode(),
         }
         for data_type, contents in metadata.items():
             (repository / f"repodata/{data_type}.xml").write_bytes(contents)
@@ -178,6 +212,14 @@ class VerifyProductionPackageSiteTest(unittest.TestCase):
             }
             for item in snapshot["payloads"]["apt"]
         }
+        bootstrap_path = fixture.output / "site/bootstrap/manifest.json"
+        if bootstrap_path.is_file():
+            bootstrap = json.loads(bootstrap_path.read_text())["packages"]["apt"]
+            identities[str(fixture.output / "site" / bootstrap["repository_path"])] = {
+                "name": bootstrap["name"],
+                "version": bootstrap["version"],
+                "architecture": bootstrap["architecture"],
+            }
         return lambda path: identities[str(path)]
 
     def _rpm_query(self, fixture: fixtures.Fixture):
@@ -190,6 +232,14 @@ class VerifyProductionPackageSiteTest(unittest.TestCase):
             }
             for item in snapshot["payloads"]["rpm"]
         }
+        bootstrap_path = fixture.output / "site/bootstrap/manifest.json"
+        if bootstrap_path.is_file():
+            bootstrap = json.loads(bootstrap_path.read_text())["packages"]["rpm"]
+            identities[str(fixture.output / "site" / bootstrap["repository_path"])] = {
+                "name": bootstrap["name"], "epoch": "0",
+                "version": bootstrap["version"], "release": "1",
+                "architecture": bootstrap["architecture"],
+            }
         return lambda path: identities[str(path)]
 
     def _topology(self, fixture: fixtures.Fixture):
@@ -231,13 +281,16 @@ class VerifyProductionPackageSiteTest(unittest.TestCase):
 
     def verify(self, fixture: fixtures.Fixture, *, rpm_issuers=None,
                apt_issuer: str | None = None, rpm_metadata_issuer: str | None = None,
-               topology_inspector=None, deb_query=None, rpm_query=None):
+               topology_inspector=None, deb_query=None, rpm_query=None,
+               apt_bootstrap_inspector=None, rpm_bootstrap_inspector=None):
         rpm_issuers = rpm_issuers or (
             lambda _path, _cert, _allowed: fixtures.RPM_SUBKEY
         )
         topology_inspector = topology_inspector or self._topology(fixture)
         deb_query = deb_query or self._deb_query(fixture)
         rpm_query = rpm_query or self._rpm_query(fixture)
+        apt_bootstrap_inspector = apt_bootstrap_inspector or mock.Mock()
+        rpm_bootstrap_inspector = rpm_bootstrap_inspector or mock.Mock()
         with mock.patch.object(verifier, "inspect_public_certificate",
                                side_effect=topology_inspector), \
              mock.patch.object(verifier, "verify_openpgp_signature",
@@ -248,7 +301,11 @@ class VerifyProductionPackageSiteTest(unittest.TestCase):
              mock.patch.object(verifier, "verify_rpm_package_signature",
                                side_effect=rpm_issuers), \
              mock.patch.object(verifier, "query_deb_identity", side_effect=deb_query), \
-             mock.patch.object(verifier, "query_rpm_identity", side_effect=rpm_query):
+             mock.patch.object(verifier, "query_rpm_identity", side_effect=rpm_query), \
+             mock.patch.object(verifier, "inspect_apt_bootstrap_package",
+                               side_effect=apt_bootstrap_inspector), \
+             mock.patch.object(verifier, "inspect_rpm_bootstrap_package",
+                               side_effect=rpm_bootstrap_inspector):
             return verifier.verify(self.args(fixture))
 
     def _add_historical_control(self, fixture: fixtures.Fixture) -> None:
@@ -264,12 +321,264 @@ class VerifyProductionPackageSiteTest(unittest.TestCase):
         status["snapshot_sha256"] = sha256(snapshot_path.read_bytes())
         status_path.write_bytes(canonical(status))
 
+    def _remove_bootstrap_from_apt_index(self, fixture: fixtures.Fixture) -> None:
+        packages_path = (
+            fixture.output / "site/apt/dists/preview/main/binary-amd64/Packages"
+        )
+        paragraphs = [
+            paragraph for paragraph in packages_path.read_text().strip().split("\n\n")
+            if not paragraph.startswith("Package: wukongim-archive-keyring\n")
+        ]
+        packages_path.write_text("\n\n".join(paragraphs) + "\n\n")
+        self._rewrite_apt_hashes(fixture)
+
+    def _make_legacy_bootstrap_free_site(self, fixture: fixtures.Fixture) -> None:
+        site = fixture.output / "site"
+        manifest_path = site / verifier.BOOTSTRAP_MANIFEST_PATH
+        manifest = json.loads(manifest_path.read_text())
+        self._remove_bootstrap_from_apt_index(fixture)
+        self._close_secondary_rpm_metadata(fixture, include_bootstrap=False)
+        for item in manifest["packages"].values():
+            (site / item["repository_path"]).unlink()
+            (site / item["download_path"]).unlink()
+        manifest_path.unlink()
+        (site / "bootstrap").rmdir()
+        (site / "index.html").write_bytes(
+            b'<!doctype html>\n<meta charset="utf-8">\n'
+            b"<title>WuKongIM Linux packages</title>\n"
+            b"<h1>WuKongIM Linux packages</h1>\n"
+            b"<p>The signed preview APT and RPM repositories are ready.</p>\n"
+        )
+
+        audit_id, control_sha = next(iter(verifier.LEGACY_BOOTSTRAP_FREE_SNAPSHOTS))
+        channels = json.loads(fixture.channels.read_text())
+        channels["channels"]["preview"]["publication"]["audit_release_id"] = audit_id
+        channels["channels"]["preview"]["releases"][0]["package_release_id"] = audit_id
+        fixture.channels.write_text(json.dumps(channels, indent=2) + "\n")
+        snapshot_path = fixture.output / "audit/snapshot.json"
+        snapshot = json.loads(snapshot_path.read_text())
+        snapshot["audit_release_id"] = audit_id
+        snapshot["control_sha"] = control_sha
+        snapshot["releases"][0]["package_release_id"] = audit_id
+        snapshot_path.write_bytes(canonical(snapshot))
+        status_path = site / "status.json"
+        status = json.loads(status_path.read_text())
+        status["audit_release_id"] = audit_id
+        status["control_sha"] = control_sha
+        status["snapshot_sha256"] = sha256(snapshot_path.read_bytes())
+        status_path.write_bytes(canonical(status))
+
     def test_valid_add_release_site_is_fully_closed(self) -> None:
         fixture, temporary = self.compose()
         self.addCleanup(temporary.cleanup)
-        result = self.verify(fixture)
+        apt_inspector = mock.Mock()
+        rpm_inspector = mock.Mock()
+        result = self.verify(
+            fixture,
+            apt_bootstrap_inspector=apt_inspector,
+            rpm_bootstrap_inspector=rpm_inspector,
+        )
         self.assertEqual(10, result["audit_release_id"])
         self.assertEqual("add_release", result["operation"])
+        manifest = json.loads((
+            fixture.output / "site" / verifier.BOOTSTRAP_MANIFEST_PATH
+        ).read_text())
+        for item in manifest["packages"].values():
+            self.assertEqual(
+                (fixture.output / "site" / item["repository_path"]).read_bytes(),
+                (fixture.output / "site" / item["download_path"]).read_bytes(),
+            )
+        apt_inspector.assert_called_once()
+        rpm_inspector.assert_called_once()
+
+    def test_bootstrap_static_content_inspection_is_mandatory(self) -> None:
+        for family in ("apt", "rpm"):
+            with self.subTest(family=family):
+                fixture, temporary = self.compose()
+                with temporary:
+                    def reject(*_args) -> None:
+                        raise verifier.VerificationError(
+                            f"{family.upper()} bootstrap package content is invalid"
+                        )
+
+                    arguments = {
+                        f"{family}_bootstrap_inspector": reject,
+                    }
+                    with self.assertRaisesRegex(
+                        verifier.VerificationError,
+                        f"{family.upper()} bootstrap package content is invalid",
+                    ):
+                        self.verify(fixture, **arguments)
+
+    def test_apt_bootstrap_content_inspector_enforces_exact_repository_files(self) -> None:
+        certificate = ROOT / "keys/apt-preview.asc"
+        keyring = verifier.B.dearmor_public_certificate(
+            certificate.read_bytes(), "APT public certificate"
+        )
+        with TemporaryDirectory() as temporary:
+            package = Path(temporary) / "wukongim-archive-keyring_1.0.0_all.deb"
+            verifier.B.build_deb(package, "1.0.0", keyring)
+            verifier.inspect_apt_bootstrap_package(package, "1.0.0", certificate)
+
+            wrong_keyring = verifier.B.dearmor_public_certificate(
+                (ROOT / "keys/rpm-preview.asc").read_bytes(), "RPM public certificate"
+            )
+            verifier.B.build_deb(package, "1.0.0", wrong_keyring)
+            with self.assertRaisesRegex(
+                verifier.VerificationError, "keyring payload differs"
+            ):
+                verifier.inspect_apt_bootstrap_package(package, "1.0.0", certificate)
+
+    def test_rpm_bootstrap_content_inspector_is_bounded_and_data_only(self) -> None:
+        certificate = ROOT / "keys/rpm-preview.asc"
+        certificate_sha = sha256(certificate.read_bytes())
+        repository_sha = sha256(verifier.B.RPM_REPOSITORY)
+
+        def result(stdout: bytes = b"", returncode: int = 0):
+            return subprocess.CompletedProcess([], returncode, stdout, b"")
+
+        valid_results = [
+            result(
+                b"/etc/pki/rpm-gpg/RPM-GPG-KEY-wukongim-preview\n"
+                b"/etc/yum.repos.d/wukongim-preview.repo\n"
+            ),
+            result(),
+            result(b"8\n"),
+            result(
+                f"/etc/pki/rpm-gpg/RPM-GPG-KEY-wukongim-preview\t{certificate_sha}"
+                "\t0\t-rw-r--r--\n"
+                f"/etc/yum.repos.d/wukongim-preview.repo\t{repository_sha}"
+                "\t17\t-rw-r--r--\n".encode()
+            ),
+            result(),
+        ]
+        with mock.patch.object(verifier, "_tool", return_value="rpm"), \
+             mock.patch.object(verifier, "run_command", side_effect=valid_results) as run:
+            verifier.inspect_rpm_bootstrap_package(
+                Path("bootstrap.rpm"), "1.0.0", certificate
+            )
+        self.assertEqual(5, run.call_count)
+
+        with mock.patch.object(verifier, "_tool", return_value="rpm"), \
+             mock.patch.object(
+                 verifier,
+                 "run_command",
+                 side_effect=[valid_results[0], result(b"postinstall scriptlet\n")],
+             ):
+            with self.assertRaisesRegex(verifier.VerificationError, "contains scriptlets"):
+                verifier.inspect_rpm_bootstrap_package(
+                    Path("bootstrap.rpm"), "1.0.0", certificate
+                )
+
+    def test_bootstrap_manifest_and_direct_downloads_fail_closed(self) -> None:
+        for mutation, pattern in (
+            ("manifest", "fields must be exactly"),
+            ("direct", "direct APT bootstrap download differs"),
+            ("missing", "omits the required bootstrap package manifest"),
+        ):
+            with self.subTest(mutation=mutation):
+                fixture, temporary = self.compose()
+                with temporary:
+                    manifest_path = fixture.output / "site" / verifier.BOOTSTRAP_MANIFEST_PATH
+                    manifest = json.loads(manifest_path.read_text())
+                    if mutation == "manifest":
+                        manifest["unknown"] = True
+                        manifest_path.write_bytes(canonical(manifest))
+                    elif mutation == "direct":
+                        direct = fixture.output / "site" / manifest["packages"]["apt"]["download_path"]
+                        direct.write_bytes(direct.read_bytes() + b"tampered")
+                    else:
+                        manifest_path.unlink()
+                    with self.assertRaisesRegex(verifier.VerificationError, pattern):
+                        self.verify(fixture)
+
+    def test_bootstrap_packages_are_mandatory_members_of_both_indexes(self) -> None:
+        for family in ("apt", "rpm"):
+            with self.subTest(family=family):
+                fixture, temporary = self.compose()
+                with temporary:
+                    if family == "apt":
+                        self._remove_bootstrap_from_apt_index(fixture)
+                    else:
+                        self._close_secondary_rpm_metadata(
+                            fixture, include_bootstrap=False
+                        )
+                    with self.assertRaisesRegex(
+                        verifier.VerificationError,
+                        "active reviewed and bootstrap",
+                    ):
+                        self.verify(fixture)
+
+    def test_bootstrap_package_headers_are_bound_to_manifest_identity(self) -> None:
+        for family in ("apt", "rpm"):
+            with self.subTest(family=family):
+                fixture, temporary = self.compose()
+                with temporary:
+                    if family == "apt":
+                        ordinary = self._deb_query(fixture)
+
+                        def wrong(path: Path) -> dict[str, str]:
+                            result = dict(ordinary(path))
+                            if result["name"] == "wukongim-archive-keyring":
+                                result["architecture"] = "amd64"
+                            return result
+
+                        arguments = {"deb_query": wrong}
+                    else:
+                        ordinary = self._rpm_query(fixture)
+
+                        def wrong(path: Path) -> dict[str, str]:
+                            result = dict(ordinary(path))
+                            if result["name"] == "wukongim-release":
+                                result["architecture"] = "x86_64"
+                            return result
+
+                        arguments = {"rpm_query": wrong}
+                    with self.assertRaisesRegex(
+                        verifier.VerificationError,
+                        f"{family.upper()} bootstrap package header identity differs",
+                    ):
+                        self.verify(fixture, **arguments)
+
+    def test_only_the_exact_prebootstrap_audit_may_omit_bootstrap_packages(self) -> None:
+        fixture, temporary = self.compose()
+        self.addCleanup(temporary.cleanup)
+        self._make_legacy_bootstrap_free_site(fixture)
+
+        result = self.verify(fixture)
+
+        self.assertEqual(381152722, result["audit_release_id"])
+
+    def test_update_bootstrap_requires_new_packages_and_no_source_evidence(self) -> None:
+        fixture, temporary = self.compose()
+        self.addCleanup(temporary.cleanup)
+        channels = json.loads(fixture.channels.read_text())
+        publication = channels["channels"]["preview"]["publication"]
+        publication.update({"base_audit_release_id": 9, "operation": "update_bootstrap"})
+        fixture.channels.write_text(json.dumps(channels, indent=2) + "\n")
+        snapshot_path = fixture.output / "audit/snapshot.json"
+        snapshot = json.loads(snapshot_path.read_text())
+        snapshot["source_attestations"] = None
+        snapshot_path.write_bytes(canonical(snapshot))
+        for path in (fixture.output / "audit/source-attestations").iterdir():
+            path.unlink()
+        (fixture.output / "audit/source-attestations").rmdir()
+        status_path = fixture.output / "site/status.json"
+        status = json.loads(status_path.read_text())
+        status["operation"] = "update_bootstrap"
+        status["snapshot_sha256"] = sha256(snapshot_path.read_bytes())
+        status_path.write_bytes(canonical(status))
+
+        result = self.verify(fixture)
+        self.assertEqual("update_bootstrap", result["operation"])
+
+        manifest_path = fixture.output / "site" / verifier.BOOTSTRAP_MANIFEST_PATH
+        manifest = json.loads(manifest_path.read_text())
+        manifest["packages"]["apt"]["new"] = False
+        manifest["packages"]["rpm"]["new"] = False
+        manifest_path.write_bytes(canonical(manifest))
+        with self.assertRaisesRegex(verifier.VerificationError, "must publish new"):
+            self.verify(fixture)
 
     def test_new_rpm_requires_current_and_rejects_next_or_historical(self) -> None:
         for issuer in (fixtures.RPM_NEXT, RPM_HISTORICAL, RPM_UNKNOWN):

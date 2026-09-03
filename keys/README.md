@@ -45,8 +45,11 @@ other package-family Environment.
 
 The publisher copies these exact certificate bytes to the stable public paths
 `/keys/apt-preview.asc` and `/keys/rpm-preview.asc` and records their SHA-256,
-size, and topology in the snapshot and audit receipt. No keyring package exists
-yet. An existing APT client must manually replace its configured `Signed-By`
-certificate from the APT URL, and an existing RPM client must manually refresh
-its imported RPM certificate from the RPM URL, before a newly added successor
-is promoted. Do not describe this mechanism as automatic rotation.
+size, and topology in the snapshot and audit receipt. The reviewed bootstrap
+builder also embeds the complete APT certificate in
+`wukongim-archive-keyring` and the complete RPM certificate in
+`wukongim-release`. Both packages are indexed in their signed repositories, so
+an installed client can receive a later certificate before a newly added
+successor subkey is promoted. The first direct bootstrap-package download
+still trusts the HTTPS origin; automatic updates begin only after that package
+has installed its dedicated key and repository definition.

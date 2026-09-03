@@ -28,8 +28,22 @@ if SPEC is None or SPEC.loader is None:  # pragma: no cover - installation error
     raise RuntimeError("cannot load compose-package-site.py")
 C = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(C)
+BOOTSTRAP_BUILDER_PATH = SCRIPT_DIR / "build-repository-bootstrap-packages.py"
+BOOTSTRAP_BUILDER_SPEC = importlib.util.spec_from_file_location(
+    "_repository_bootstrap_builder", BOOTSTRAP_BUILDER_PATH
+)
+if BOOTSTRAP_BUILDER_SPEC is None or BOOTSTRAP_BUILDER_SPEC.loader is None:  # pragma: no cover
+    raise RuntimeError("cannot load build-repository-bootstrap-packages.py")
+B = importlib.util.module_from_spec(BOOTSTRAP_BUILDER_SPEC)
+BOOTSTRAP_BUILDER_SPEC.loader.exec_module(B)
 
 VERIFICATION_SCHEMA = "wukongim/production-package-site-verification/v1"
+BOOTSTRAP_MANIFEST_PATH = "bootstrap/manifest.json"
+# Audit r381152722 predates repository bootstrap packages.  Keep only that exact,
+# immutable snapshot verifiable without weakening bootstrap closure for new audits.
+LEGACY_BOOTSTRAP_FREE_SNAPSHOTS = {
+    (381152722, "637bc91bc8753a55dba0ebb346384a0a7e7387b6"),
+}
 SNAPSHOT_FIELDS = {
     "schema", "audit_release_id", "control_sha", "releases", "retirement",
     "payloads", "public_keys", "source_attestations", "toolchain",
@@ -606,6 +620,9 @@ def validate_snapshot_and_control(args: argparse.Namespace) -> dict[str, Any]:
     if operation == "add_release":
         require(target in control["releases"] and control["releases"][target]["state"] == "active",
                 "add_release target must be an active reviewed release")
+    elif operation == "update_bootstrap":
+        require(target in control["releases"] and control["releases"][target]["state"] == "active",
+                "update_bootstrap target must be an active reviewed release")
     elif operation == "remove_indexes":
         require(target in control["releases"] and control["releases"][target]["state"] == "index_removed",
                 "remove_indexes target must be the retained reviewed release")
@@ -621,6 +638,76 @@ def validate_snapshot_and_control(args: argparse.Namespace) -> dict[str, Any]:
         "target": target,
         "unusable_historical": unusable_historical,
     }
+
+
+def validate_bootstrap_manifest(
+    args: argparse.Namespace,
+    context: dict[str, Any],
+    site_files: dict[str, dict[str, Any]],
+) -> tuple[dict[str, Any] | None, set[str]]:
+    """Validate the package-manager bootstrap inventory and its byte aliases."""
+    snapshot_identity = (
+        context["snapshot"]["audit_release_id"],
+        context["snapshot"]["control_sha"],
+    )
+    if BOOTSTRAP_MANIFEST_PATH not in site_files:
+        require(
+            snapshot_identity in LEGACY_BOOTSTRAP_FREE_SNAPSHOTS,
+            "site omits the required bootstrap package manifest",
+        )
+        return None, set()
+
+    try:
+        manifest = C.validate_bootstrap_inventory(
+            load_json(
+                args.site_root / BOOTSTRAP_MANIFEST_PATH,
+                "site bootstrap manifest",
+                canonical=True,
+            ),
+            prepared=False,
+            label="site bootstrap manifest",
+        )
+    except C.CompositionError as error:
+        raise VerificationError(str(error)) from error
+
+    apt = manifest["packages"]["apt"]
+    rpm = manifest["packages"]["rpm"]
+    require(apt["new"] is rpm["new"],
+            "bootstrap package new states must agree across APT and RPM")
+    if context["operation"] == "update_bootstrap":
+        require(apt["new"] is True,
+                "update_bootstrap must publish new APT and RPM bootstrap packages")
+
+    expected = {BOOTSTRAP_MANIFEST_PATH}
+    for family, item in (("apt", apt), ("rpm", rpm)):
+        facts = {
+            "sha256": item["published_sha256"],
+            "size": item["published_size"],
+        }
+        repository_path = item["repository_path"]
+        download_path = item["download_path"]
+        require(repository_path in site_files,
+                f"site omits the indexed {family.upper()} bootstrap package")
+        require(download_path in site_files,
+                f"site omits the direct {family.upper()} bootstrap download")
+        require(site_files[repository_path] == facts,
+                f"indexed {family.upper()} bootstrap package differs from its manifest")
+        require(site_files[download_path] == facts,
+                f"direct {family.upper()} bootstrap download differs from its manifest")
+        repository_bytes = read_checked(
+            args.site_root / repository_path,
+            f"indexed {family.upper()} bootstrap package",
+            maximum=C.MAX_METADATA_BYTES,
+        )
+        direct_bytes = read_checked(
+            args.site_root / download_path,
+            f"direct {family.upper()} bootstrap download",
+            maximum=C.MAX_METADATA_BYTES,
+        )
+        require(repository_bytes == direct_bytes,
+                f"direct {family.upper()} bootstrap download is not byte-identical to the indexed package")
+        expected.update((repository_path, download_path))
+    return manifest, expected
 
 
 def parse_release_hashes(data: bytes) -> dict[str, dict[str, tuple[str, int]]]:
@@ -709,6 +796,89 @@ def query_rpm_identity(package: Path) -> dict[str, str]:
         "name": fields[0], "epoch": fields[1], "version": fields[2],
         "release": fields[3], "architecture": fields[4],
     }
+
+
+def inspect_apt_bootstrap_package(
+    package: Path,
+    version: str,
+    certificate: Path,
+) -> None:
+    """Require the DEB to contain only the reviewed keyring and source config."""
+    try:
+        certificate_bytes = read_checked(
+            certificate, "reviewed APT certificate", maximum=MAX_CERT_BYTES
+        )
+        keyring = B.dearmor_public_certificate(
+            certificate_bytes, "reviewed APT certificate"
+        )
+        B.inspect_deb(package, version, keyring)
+    except B.BootstrapBuildError as error:
+        raise VerificationError(f"APT bootstrap package content is invalid: {error}") from error
+
+
+def inspect_rpm_bootstrap_package(
+    package: Path,
+    _version: str,
+    certificate: Path,
+) -> None:
+    """Require the RPM to be data-only and contain the exact reviewed repo files."""
+    certificate_bytes = read_checked(
+        certificate, "reviewed RPM certificate", maximum=MAX_CERT_BYTES
+    )
+    expected_digests = {
+        f"/{B.RPM_KEY_PATH}": digest_bytes(certificate_bytes),
+        f"/{B.RPM_REPO_PATH}": digest_bytes(B.RPM_REPOSITORY),
+    }
+    rpm = _tool("rpm")
+    files = run_command([rpm, "-qpl", str(package)], "RPM bootstrap file-list query")
+    require(files.returncode == 0, "RPM bootstrap package content is invalid: file-list query failed")
+    try:
+        file_list = files.stdout.decode("utf-8", "strict").splitlines()
+    except UnicodeDecodeError as error:
+        raise VerificationError("RPM bootstrap package file list is not UTF-8") from error
+    require(set(file_list) == set(expected_digests) and len(file_list) == 2,
+            "RPM bootstrap package content is invalid: payload inventory differs")
+    scripts = run_command([rpm, "-qp", "--scripts", str(package)],
+                          "RPM bootstrap scriptlet query")
+    require(scripts.returncode == 0 and not scripts.stdout.strip(),
+            "RPM bootstrap package content is invalid: package contains scriptlets")
+    algorithm = run_command(
+        [rpm, "-qp", "--queryformat", "%{FILEDIGESTALGO}\n", str(package)],
+        "RPM bootstrap file-digest algorithm query",
+    )
+    require(algorithm.returncode == 0 and algorithm.stdout == b"8\n",
+            "RPM bootstrap package content is invalid: file digests are not SHA-256")
+    metadata = run_command(
+        [
+            rpm, "-qp", "--queryformat",
+            "[%{FILENAMES}\\t%{FILEDIGESTS}\\t%{FILEFLAGS}\\t%{FILEMODES:perms}\\n]",
+            str(package),
+        ],
+        "RPM bootstrap file-metadata query",
+    )
+    require(metadata.returncode == 0,
+            "RPM bootstrap package content is invalid: file-metadata query failed")
+    try:
+        lines = metadata.stdout.decode("utf-8", "strict").splitlines()
+        parsed = {parts[0]: parts[1:] for parts in (line.split("\t") for line in lines)}
+    except UnicodeDecodeError as error:
+        raise VerificationError("RPM bootstrap package file metadata is not UTF-8") from error
+    require(len(lines) == 2 and len(parsed) == 2
+            and all(len(value) == 3 for value in parsed.values()),
+            "RPM bootstrap package content is invalid: file metadata is malformed")
+    for filename, expected_digest in expected_digests.items():
+        require(filename in parsed,
+                "RPM bootstrap package content is invalid: expected payload is missing")
+        digest, flags, mode = parsed[filename]
+        expected_flags = "17" if filename == f"/{B.RPM_REPO_PATH}" else "0"
+        require(digest == expected_digest and flags == expected_flags and mode == "-rw-r--r--",
+                f"RPM bootstrap package content is invalid for {filename}")
+    digest_check = run_command(
+        [rpm, "-K", "--nosignature", str(package)],
+        "RPM bootstrap payload-digest verification",
+    )
+    require(digest_check.returncode == 0,
+            "RPM bootstrap package content is invalid: payload digest verification failed")
 
 
 def parse_apt_package_stanzas(data: bytes) -> list[dict[str, str]]:
@@ -801,6 +971,7 @@ def validate_apt(
     args: argparse.Namespace,
     context: dict[str, Any],
     site_files: dict[str, dict[str, Any]],
+    bootstrap_manifest: dict[str, Any] | None = None,
 ) -> set[str]:
     root = args.site_root / "apt"
     release_relative = "apt/dists/preview/Release"
@@ -871,7 +1042,7 @@ def validate_apt(
     except C.CompositionError as error:
         raise VerificationError(str(error)) from error
     expected_indexed: dict[str, dict[str, Any]] = {}
-    indexed_versions: dict[str, str] = {}
+    indexed_semantics: dict[str, dict[str, str]] = {}
     payload_paths: set[str] = set()
     for version, item in context["payloads"]["apt"].items():
         path = item["path"]
@@ -882,19 +1053,45 @@ def validate_apt(
         relative = PurePosixPath(path).relative_to("apt").as_posix()
         if item["indexed"]:
             expected_indexed[relative] = site_files[path]
-            indexed_versions[relative] = version
+            indexed_semantics[relative] = {
+                "name": "wukongim",
+                "version": apt_package_version(version),
+                "architecture": "amd64",
+                "label": version,
+            }
         identity = query_deb_identity(args.site_root / path)
         require(identity == {
             "name": "wukongim",
             "version": apt_package_version(version),
             "architecture": "amd64",
         }, f"DEB payload header identity differs from reviewed release {version}")
+    if bootstrap_manifest is not None:
+        bootstrap = bootstrap_manifest["packages"]["apt"]
+        path = bootstrap["repository_path"]
+        relative = PurePosixPath(path).relative_to("apt").as_posix()
+        expected_indexed[relative] = site_files[path]
+        indexed_semantics[relative] = {
+            "name": bootstrap["name"],
+            "version": bootstrap["version"],
+            "architecture": bootstrap["architecture"],
+            "label": f"bootstrap {bootstrap['version']}",
+        }
+        payload_paths.add(path)
+        identity = query_deb_identity(args.site_root / path)
+        require(identity == {
+            "name": bootstrap["name"],
+            "version": bootstrap["version"],
+            "architecture": bootstrap["architecture"],
+        }, "APT bootstrap package header identity differs from its manifest")
+        inspect_apt_bootstrap_package(
+            args.site_root / path, bootstrap["version"], args.apt_public_cert
+        )
     require(indexed == expected_indexed,
-            "APT Packages does not exactly contain active reviewed payloads")
+            "APT Packages does not exactly contain active reviewed and bootstrap payloads")
     stanzas = parse_apt_package_stanzas(packages_bytes)
-    require(len(stanzas) == len(indexed_versions),
-            "APT Packages stanza count differs from active reviewed releases")
-    seen_versions: set[str] = set()
+    require(len(stanzas) == len(indexed_semantics),
+            "APT Packages stanza count differs from active reviewed and bootstrap packages")
+    seen_paths: set[str] = set()
     for stanza in stanzas:
         required = {"Package", "Version", "Architecture", "Filename", "Size", "SHA256"}
         require(required.issubset(stanza), "APT Packages stanza omits package identity fields")
@@ -902,16 +1099,16 @@ def validate_apt(
             relative = C.safe_relative(stanza["Filename"], "APT Packages Filename").as_posix()
         except C.CompositionError as error:
             raise VerificationError(str(error)) from error
-        require(relative in indexed_versions, "APT Packages names an unreviewed payload")
-        version = indexed_versions[relative]
-        require(stanza["Package"] == "wukongim"
-                and stanza["Version"] == apt_package_version(version)
-                and stanza["Architecture"] == "amd64",
-                f"APT Packages semantic identity differs for {version}")
-        require(version not in seen_versions, "APT Packages duplicates a reviewed version")
-        seen_versions.add(version)
-    require(seen_versions == set(indexed_versions.values()),
-            "APT Packages does not semantically close over active reviewed versions")
+        require(relative in indexed_semantics, "APT Packages names an unreviewed payload")
+        expected = indexed_semantics[relative]
+        require(stanza["Package"] == expected["name"]
+                and stanza["Version"] == expected["version"]
+                and stanza["Architecture"] == expected["architecture"],
+                f"APT Packages semantic identity differs for {expected['label']}")
+        require(relative not in seen_paths, "APT Packages duplicates a reviewed package")
+        seen_paths.add(relative)
+    require(seen_paths == set(indexed_semantics),
+            "APT Packages does not semantically close over active reviewed and bootstrap packages")
 
     by_hash_paths: set[str] = set()
     for site_name in (packages_relative, packages_gz_relative):
@@ -950,7 +1147,7 @@ def _xml(data: bytes, root_name: str, label: str) -> ET.Element:
 def _validate_secondary_metadata(
     data: bytes,
     root_name: str,
-    expected_pkgids: dict[str, str],
+    expected_pkgids: dict[str, dict[str, str]],
     label: str,
 ) -> None:
     root = _xml(data, root_name, label)
@@ -966,26 +1163,33 @@ def _validate_secondary_metadata(
         require(C.SHA256_RE.fullmatch(pkgid) is not None and pkgid not in pkgids
                 and pkgid in expected_pkgids,
                 f"{label} contains an invalid or duplicate package identifier")
-        require(package.get("name") == "wukongim" and package.get("arch") == "x86_64",
+        expected = expected_pkgids[pkgid]
+        require(package.get("name") == expected["name"]
+                and package.get("arch") == expected["architecture"],
                 f"{label} contains an unexpected package identity")
-        _validate_rpm_version_node(package, expected_pkgids[pkgid], label)
+        _validate_rpm_version_node(package, expected, label)
         pkgids.add(pkgid)
     require(pkgids == set(expected_pkgids),
             f"{label} does not exactly close over active RPM package identifiers")
 
 
-def _validate_rpm_version_node(package: ET.Element, version: str, label: str) -> None:
+def _validate_rpm_version_node(
+    package: ET.Element,
+    expected: dict[str, str],
+    label: str,
+) -> None:
     node = _child(package, "version", label)
     require(node.get("epoch") in {None, "0"}
-            and node.get("ver") == rpm_package_version(version)
-            and node.get("rel") == "1",
-            f"{label} package version identity differs for {version}")
+            and node.get("ver") == expected["version"]
+            and node.get("rel") == expected["release"],
+            f"{label} package version identity differs for {expected['label']}")
 
 
 def validate_rpm(
     args: argparse.Namespace,
     context: dict[str, Any],
     site_files: dict[str, dict[str, Any]],
+    bootstrap_manifest: dict[str, Any] | None = None,
 ) -> set[str]:
     repository = "rpm/preview/el/9/x86_64"
     repomd_relative = f"{repository}/repodata/repomd.xml"
@@ -1052,7 +1256,7 @@ def validate_rpm(
             "RPM repomd data types must be exactly primary, filelists, and other")
 
     active_facts: dict[str, dict[str, Any]] = {}
-    active_versions: dict[str, str] = {}
+    active_semantics: dict[str, dict[str, str]] = {}
     payload_paths: set[str] = set()
     for version, item in context["payloads"]["rpm"].items():
         path = item["path"]
@@ -1063,13 +1267,41 @@ def validate_rpm(
         payload_paths.add(path)
         if item["indexed"]:
             active_facts[relative] = site_files[path]
-            active_versions[relative] = version
+            active_semantics[relative] = {
+                "name": "wukongim",
+                "architecture": "x86_64",
+                "version": rpm_package_version(version),
+                "release": "1",
+                "label": version,
+            }
         identity = query_rpm_identity(args.site_root / path)
         require(identity == {
             "name": "wukongim", "epoch": "0",
             "version": rpm_package_version(version), "release": "1",
             "architecture": "x86_64",
         }, f"RPM payload header identity differs from reviewed release {version}")
+    if bootstrap_manifest is not None:
+        bootstrap = bootstrap_manifest["packages"]["rpm"]
+        path = bootstrap["repository_path"]
+        relative = PurePosixPath(path).relative_to(repository).as_posix()
+        active_facts[relative] = site_files[path]
+        active_semantics[relative] = {
+            "name": bootstrap["name"],
+            "architecture": bootstrap["architecture"],
+            "version": bootstrap["version"],
+            "release": "1",
+            "label": f"bootstrap {bootstrap['version']}",
+        }
+        payload_paths.add(path)
+        identity = query_rpm_identity(args.site_root / path)
+        require(identity == {
+            "name": bootstrap["name"], "epoch": "0",
+            "version": bootstrap["version"], "release": "1",
+            "architecture": bootstrap["architecture"],
+        }, "RPM bootstrap package header identity differs from its manifest")
+        inspect_rpm_bootstrap_package(
+            args.site_root / path, bootstrap["version"], args.rpm_public_cert
+        )
 
     primary_root = _xml(records["primary"][1], "metadata", "RPM primary metadata")
     primary_packages = [item for item in primary_root if C.local_name(item.tag) == "package"]
@@ -1089,24 +1321,25 @@ def validate_rpm(
             relative = C.safe_relative(location.get("href"), "RPM primary location").as_posix()
         except C.CompositionError as error:
             raise VerificationError(str(error)) from error
-        require(relative in active_versions and relative not in semantic_paths,
+        require(relative in active_semantics and relative not in semantic_paths,
                 "RPM primary names an unreviewed or duplicate payload")
-        version = active_versions[relative]
-        require(name.text == "wukongim" and architecture.text == "x86_64",
-                f"RPM primary semantic identity differs for {version}")
-        _validate_rpm_version_node(package, version, "RPM primary package")
+        expected = active_semantics[relative]
+        require(name.text == expected["name"]
+                and architecture.text == expected["architecture"],
+                f"RPM primary semantic identity differs for {expected['label']}")
+        _validate_rpm_version_node(package, expected, "RPM primary package")
         semantic_paths.add(relative)
-    require(semantic_paths == set(active_versions),
-            "RPM primary does not semantically close over active reviewed versions")
+    require(semantic_paths == set(active_semantics),
+            "RPM primary does not semantically close over active reviewed and bootstrap packages")
     try:
         indexed_paths = C.parse_rpm_primary(records["primary"][1], active_facts)
     except C.CompositionError as error:
         raise VerificationError(str(error)) from error
     require(indexed_paths == set(active_facts),
-            "RPM primary metadata does not exactly contain active reviewed payloads")
+            "RPM primary metadata does not exactly contain active reviewed and bootstrap payloads")
     pkgids = {
-        active_facts[path]["sha256"]: version
-        for path, version in active_versions.items()
+        active_facts[path]["sha256"]: semantics
+        for path, semantics in active_semantics.items()
     }
     require(len(pkgids) == len(active_facts),
             "active RPM payload SHA-256 package identifiers must be unique")
@@ -1130,6 +1363,19 @@ def validate_rpm(
         require(issuer in allowed,
                 f"RPM payload {version} has an issuer outside its reviewed rotation allowlist")
 
+    if bootstrap_manifest is not None:
+        bootstrap = bootstrap_manifest["packages"]["rpm"]
+        allowed = {current} if bootstrap["new"] else {current, *historical}
+        issuer = verify_rpm_package_signature(
+            args.site_root / bootstrap["repository_path"], args.rpm_public_cert, allowed
+        )
+        require(issuer != next_fingerprint,
+                "RPM bootstrap package was signed by the staged next subkey")
+        require(issuer not in context["unusable_historical"]["rpm"],
+                "RPM bootstrap package was signed by an unusable historical subkey")
+        require(issuer in allowed,
+                "RPM bootstrap package has an issuer outside its reviewed rotation allowlist")
+
     return payload_paths | {repomd_relative, signature_relative} | {
         full for full, _ in records.values()
     }
@@ -1142,8 +1388,11 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
     limit = context["control"]["manifest"]["site_limit_bytes"]
     require(site_size <= limit, "production package site exceeds the reviewed Pages size limit")
 
-    apt_expected = validate_apt(args, context, site_files)
-    rpm_expected = validate_rpm(args, context, site_files)
+    bootstrap_manifest, bootstrap_expected = validate_bootstrap_manifest(
+        args, context, site_files
+    )
+    apt_expected = validate_apt(args, context, site_files, bootstrap_manifest)
+    rpm_expected = validate_rpm(args, context, site_files, bootstrap_manifest)
     apt_key = context["keys"]["apt"]
     rpm_key = context["keys"]["rpm"]
     manifest = (
@@ -1160,15 +1409,23 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
     require(read_checked(args.site_root / "signing-manifest.txt", "site signing manifest",
                          maximum=16 * 1024) == manifest,
             "site signing manifest differs from reviewed signing control")
-    index = (
-        "<!doctype html>\n<meta charset=\"utf-8\">\n"
-        "<title>WuKongIM Linux packages</title>\n"
-        "<h1>WuKongIM Linux packages</h1>\n"
-        "<p>The signed preview APT and RPM repositories are ready.</p>\n"
-    ).encode("utf-8")
+    if bootstrap_manifest is None:
+        index = (
+            "<!doctype html>\n<meta charset=\"utf-8\">\n"
+            "<title>WuKongIM Linux packages</title>\n"
+            "<h1>WuKongIM Linux packages</h1>\n"
+            "<p>The signed preview APT and RPM repositories are ready.</p>\n"
+        ).encode("utf-8")
+    else:
+        index = (
+            "<!doctype html>\n<meta charset=\"utf-8\">\n"
+            "<title>WuKongIM Linux packages</title>\n"
+            "<h1>WuKongIM Linux packages</h1>\n"
+            "<p>The signed preview APT and RPM repositories and bootstrap packages are ready.</p>\n"
+        ).encode("utf-8")
     require(read_checked(args.site_root / "index.html", "site index", maximum=64 * 1024) == index,
             "site index differs from the fixed production page")
-    expected_files = apt_expected | rpm_expected | {
+    expected_files = apt_expected | rpm_expected | bootstrap_expected | {
         "index.html", "status.json", "signing-manifest.txt",
         "keys/apt-preview.asc", "keys/rpm-preview.asc",
     }

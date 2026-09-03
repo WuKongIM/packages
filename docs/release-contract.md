@@ -16,7 +16,9 @@ data and never execute files from them.
 `manifests/channels.json` fixes the source repository, preview releases,
 capacity bounds, and any in-progress retirement. `manifests/preview-signing.json`
 fixes the protected Environment, public-key paths, fingerprints, secret names,
-and key-lifetime policy. `manifests/source-read.json` keeps cross-repository
+and key-lifetime policy. `manifests/bootstrap-packages.json` fixes whether the
+repository bootstrap packages are enabled and their strict release SemVer.
+`manifests/source-read.json` keeps cross-repository
 access disabled until the private `WuKongIM Source Release Reader` GitHub App
 has been installed only on `WuKongIM/WuKongIM` with Contents and Attestations
 read access. Its client ID and private key exist only in the protected
@@ -137,6 +139,13 @@ addition, all four clean-client checks must download bytes mapped exclusively
 to the reviewed target version, so successfully refreshing metadata without
 selecting the new package is not publication success.
 
+An `update_bootstrap` publication changes no product release, payload, or
+retirement state. It requires an immutable base snapshot and names one current
+active product version only so clean-client validation has an exact install
+target. The bootstrap package version must increase whenever either embedded
+public certificate or repository definition changes. Repeating any other
+publication preserves the exact existing bootstrap package bytes.
+
 Retirement is a two-run operation because package and metadata objects can
 remain in the Pages CDN cache for roughly ten minutes. The first reviewed run
 removes the oldest version from APT and RPM indexes while retaining its payload
@@ -236,12 +245,36 @@ minimal rotation keeps the same family primary: the old current moves to
 operator-retained primary certifies a new next. This promotion may happen at
 the 45-day rotation boundary without waiting for expiry or revoking a healthy
 former current. The next subkey must be present in the public certificate
-before the first signed publication. There is currently no repository keyring
-package, so this is not an automatic client key-rotation system. The initially
-pre-distributed next permits one promotion without a client update; clients
-must manually refresh the stable certificate URL while the current subkey is
-still valid to learn each later successor. Automatic ongoing delivery requires
-a separately designed and signed keyring package.
+before the first signed publication. The APT `wukongim-archive-keyring` and RPM
+`wukongim-release` packages carry the complete reviewed family certificate, so
+installed clients receive later certificate additions through normal
+authenticated package upgrades before a successor is promoted.
+
+## Repository bootstrap packages
+
+The APT bootstrap package is architecture `all`. It owns only
+`/usr/share/keyrings/wukongim-archive-keyring.pgp` and the Deb822 source
+`/etc/apt/sources.list.d/wukongim-preview.sources`, whose `Signed-By` points to
+that dedicated keyring. It never uses `apt-key`, the global trust store,
+`Trusted: yes`, or maintainer scripts.
+
+The RPM bootstrap package is `noarch`. It owns only
+`/etc/pki/rpm-gpg/RPM-GPG-KEY-wukongim-preview` and `%config(noreplace)`
+`/etc/yum.repos.d/wukongim-preview.repo`. The repository fixes the HTTPS EL9
+x86_64 base URL, enables both package and repository-metadata signature
+checking, keeps TLS verification enabled, and limits packages to `wukongim`
+and `wukongim-release`. It contains no scriptlets.
+
+Both bootstrap packages are built offline from reviewed control and public
+certificates. The APT bytes are copied unchanged; a new RPM is signed only in
+the RPM Environment. Each package is present in its signed repository index,
+and the composer creates a byte-identical convenience download below
+`/bootstrap/` only after signing. The canonical `/bootstrap/manifest.json`
+records source and published SHA-256 values, sizes, paths, version,
+architecture, and whether the publication introduced new bytes. The first
+direct download is authenticated by the HTTPS origin; it cannot bootstrap
+trust in itself. Subsequent updates are authenticated by the installed
+package-manager trust root.
 
 Preview primary-key generation currently uses an explicitly accepted
 single-operator online-workstation custody model. The named operator is

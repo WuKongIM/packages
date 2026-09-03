@@ -367,8 +367,16 @@ def build_plan(channels: dict[str, Any], base: dict[str, Any] | None, control_sh
         "preview publication",
     )
     operation = publication["operation"]
-    require(operation in {"none", "add_release", "remove_indexes", "remove_payloads"},
-            "unsupported publication operation")
+    require(
+        operation in {
+            "none",
+            "add_release",
+            "remove_indexes",
+            "remove_payloads",
+            "update_bootstrap",
+        },
+        "unsupported publication operation",
+    )
     current = release_map(preview.get("releases"), "preview releases")
     current_id = publication["audit_release_id"]
     base_id = publication["base_audit_release_id"]
@@ -417,6 +425,23 @@ def build_plan(channels: dict[str, Any], base: dict[str, Any] | None, control_sh
                     f"add_release target {target} must be newer than active {version}",
                 )
         new_versions = [target]
+    elif operation == "update_bootstrap":
+        require(
+            base_id is not None and base is not None,
+            "update_bootstrap requires a base audit Release",
+        )
+        require(
+            target in current and current[target]["state"] == "active",
+            "update_bootstrap target must be an active release",
+        )
+        require(
+            preview.get("releases") == base["releases"],
+            "update_bootstrap must not change releases",
+        )
+        require(
+            preview.get("retirement") == base["retirement"],
+            "update_bootstrap must not change retirement",
+        )
     elif operation == "remove_indexes":
         require(base is not None and target in current and target in base_releases,
                 "remove_indexes target must exist in current and base snapshots")

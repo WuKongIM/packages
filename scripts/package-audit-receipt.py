@@ -391,7 +391,9 @@ def validate_plan(value: Any, channel_facts: dict[str, Any]) -> dict[str, Any]:
     require(plan["base_audit_release_id"] != audit_id,
             "publication audit and base ids must differ")
     operation = plan["operation"]
-    require(operation in {"add_release", "remove_indexes", "remove_payloads"},
+    require(operation in {
+        "add_release", "update_bootstrap", "remove_indexes", "remove_payloads",
+    },
             "publication plan operation cannot produce an audit snapshot")
     target = plan["target_version"]
     require(isinstance(target, str) and target, "publication plan target_version is required")
@@ -412,6 +414,13 @@ def validate_plan(value: Any, channel_facts: dict[str, Any]) -> dict[str, Any]:
                 "add_release target does not match current channels")
         require(new == [target] and not removed and plan["not_before"] is None,
                 "add_release transition lists are inconsistent")
+    elif operation == "update_bootstrap":
+        positive_id(plan["base_audit_release_id"],
+                    "update_bootstrap base_audit_release_id")
+        require(target in releases and releases[target]["state"] == "active",
+                "update_bootstrap target does not match current channels")
+        require(not new and not removed and plan["not_before"] is None,
+                "update_bootstrap transition facts are inconsistent")
     elif operation == "remove_indexes":
         positive_id(plan["base_audit_release_id"],
                     "remove_indexes base_audit_release_id")
@@ -549,7 +558,7 @@ def validate_source_attestation(
 ) -> tuple[dict[str, Any] | None, dict[str, bytes]]:
     if plan["operation"] != "add_release":
         require(root is None,
-                "source attestation evidence is forbidden for a retirement publication")
+                "source attestation evidence is forbidden for a non-add-release publication")
         return None, {}
     require(root is not None,
             "add_release requires the complete source attestation evidence directory")
@@ -913,7 +922,7 @@ def validate_snapshot_source_attestations(
     evidence_root = extracted_root / "audit/source-attestations"
     if source is None:
         require(value is None and not os.path.lexists(evidence_root),
-                "retirement snapshot must not contain source attestation evidence")
+                "non-add-release snapshot must not contain source attestation evidence")
         return
     item = exact_object(value, SOURCE_ATTESTATION_SNAPSHOT_FIELDS,
                         "snapshot source attestations")
@@ -1222,7 +1231,9 @@ def validate_external_receipt(value: Any) -> dict[str, Any]:
     require(isinstance(receipt["control_sha"], str) and LOWER_SHA.fullmatch(receipt["control_sha"]),
             "external receipt control_sha is invalid")
     plan = exact_object(receipt["plan"], RECEIPT_PLAN_FIELDS, "external receipt plan")
-    require(plan["operation"] in {"add_release", "remove_indexes", "remove_payloads"},
+    require(plan["operation"] in {
+        "add_release", "update_bootstrap", "remove_indexes", "remove_payloads",
+    },
             "external receipt plan operation is invalid")
     sha256_string(plan["sha256"], "external receipt plan sha256")
     archive_value = exact_object(receipt["archive"], RECEIPT_ARCHIVE_FIELDS,
