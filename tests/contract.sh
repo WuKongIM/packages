@@ -28,7 +28,7 @@ jq -e '
   . == {
     schema: "wukongim.native_package_bootstrap/v1",
     enabled: true,
-    version: "1.0.0"
+    version: "1.1.0"
   }
 ' "$BOOTSTRAP_MANIFEST" >/dev/null
 
@@ -660,12 +660,28 @@ if (( $(grep -cF -- '--expected-version "$TARGET_VERSION"' "$PUBLISH_WORKFLOW") 
   exit 1
 fi
 grep -Fq '.expected_version == $target and .expected_version_verified == true' "$PUBLISH_WORKFLOW"
-grep -Fq '.schema == "wukongim/production-package-client-validation/v3"' "$PUBLISH_WORKFLOW"
+grep -Fq '.schema == "wukongim/production-package-client-validation/v4"' "$PUBLISH_WORKFLOW"
 grep -Fq '.bootstrap_verified == true and .bootstrap != null' "$PUBLISH_WORKFLOW"
+grep -Fq '.bootstrap.repository_entrypoint.path == "repo"' "$PUBLISH_WORKFLOW"
+grep -Fq '.schema == "wukongim/production-package-client-validation/v4"' "$IMMUTABLE_REVERIFY_WORKFLOW"
 grep -Fq 'all((.apt[], .rpm[]); .bootstrap_installed == true)' "$PUBLISH_WORKFLOW"
 grep -Fq -- '--bootstrap-builder /control/scripts/build-repository-bootstrap-packages.py' "$PUBLISH_WORKFLOW"
 grep -Fq -- '--bootstrap-inventory /metadata/bootstrap-inventory.json' "$PUBLISH_WORKFLOW"
 grep -Fq 'fetch_and_check bootstrap/manifest.json "$BOOTSTRAP_MANIFEST_SHA256"' "$PUBLISH_WORKFLOW"
+grep -Fq 'repo_sha256: ${{ steps.live.outputs.repo_sha256 }}' "$PUBLISH_WORKFLOW"
+grep -Fq 'echo "repo_sha256=$(sha256sum "$site/repo" | cut -d'"'"' '"'"' -f1)"' "$PUBLISH_WORKFLOW"
+grep -Fq 'fetch_and_check repo "$REPO_SHA256"' "$PUBLISH_WORKFLOW"
+grep -Fq '.repository_entrypoint_executed == true' "$PUBLISH_WORKFLOW"
+grep -Fq '(.entrypoint_execution | keys) == ["apt", "rpm"]' "$PUBLISH_WORKFLOW"
+grep -Fq -- '--arg repo "$REPO_SHA256"' "$PUBLISH_WORKFLOW"
+grep -Fq -- '--arg bootstrap "$BOOTSTRAP_MANIFEST_SHA256"' "$PUBLISH_WORKFLOW"
+grep -Fq 'REPO_SHA256: ${{ needs.pages_artifact.outputs.repo_sha256 }}' "$PUBLISH_WORKFLOW"
+grep -Fq 'BOOTSTRAP_MANIFEST_SHA256: ${{ needs.pages_artifact.outputs.bootstrap_manifest_sha256 }}' "$PUBLISH_WORKFLOW"
+grep -Fq '.bootstrap.repository_entrypoint.sha256 == $repo' "$PUBLISH_WORKFLOW"
+grep -Fq '.bootstrap.manifest_sha256 == $bootstrap' "$PUBLISH_WORKFLOW"
+grep -Fq ':/usr/bin/curl:ro' "$CLIENT_VALIDATOR"
+grep -Fq 'LEGACY_REPOSITORY_ENTRYPOINT_FREE_IDENTITIES' "$CLIENT_VALIDATOR"
+grep -Fq 'repository_entrypoint_bytes' "$SITE_COMPOSER"
 grep -Fq 'update_bootstrap' "$AUDIT_DRAFT_WORKFLOW"
 grep -Fq 'update_bootstrap' "$PUBLISH_WORKFLOW"
 grep -Fq 'https://raw.githubusercontent.com/WuKongIM/WuKongIM/${commit}/${relative}' "$PUBLISH_WORKFLOW"

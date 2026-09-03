@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -38,13 +39,24 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Sequence
 
 
-RECEIPT_SCHEMA = "wukongim/production-package-client-validation/v3"
+SCRIPT_DIR = Path(__file__).resolve().parent
+COMPOSER_PATH = SCRIPT_DIR / "compose-package-site.py"
+COMPOSER_SPEC = importlib.util.spec_from_file_location(
+    "_repository_entrypoint_composer", COMPOSER_PATH
+)
+if COMPOSER_SPEC is None or COMPOSER_SPEC.loader is None:  # pragma: no cover
+    raise RuntimeError("cannot load compose-package-site.py")
+COMPOSER = importlib.util.module_from_spec(COMPOSER_SPEC)
+COMPOSER_SPEC.loader.exec_module(COMPOSER)
+
+RECEIPT_SCHEMA = "wukongim/production-package-client-validation/v4"
 SNAPSHOT_SCHEMA = "wukongim.native_package_snapshot/v3"
 STATUS_SCHEMA = "wukongim.native_package_repository_status/v2"
 BOOTSTRAP_SCHEMA = "wukongim.native_package_bootstrap_inventory/v1"
 MAX_CONTROL_BYTES = 8 * 1024 * 1024
 MAX_CERTIFICATE_BYTES = 1024 * 1024
 MAX_BOOTSTRAP_BYTES = 16 * 1024 * 1024
+MAX_REPOSITORY_ENTRYPOINT_BYTES = 64 * 1024
 MAX_DOWNLOAD_BYTES = 800 * 1024 * 1024
 APT_CA_BUNDLE_PATH = "/etc/ssl/certs/ca-certificates.crt"
 SHA1_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -68,6 +80,9 @@ LEGACY_BOOTSTRAPLESS_IDENTITY = (
     381152722,
     "637bc91bc8753a55dba0ebb346384a0a7e7387b6",
 )
+LEGACY_REPOSITORY_ENTRYPOINT_FREE_IDENTITIES = {
+    (381713091, "46cfe4d94dc98830774918e4c68744aeb03ca926"),
+}
 
 SNAPSHOT_FIELDS = {
     "schema", "audit_release_id", "control_sha", "releases", "retirement",
@@ -330,6 +345,46 @@ grep -Eq 'digests signatures OK$' /tmp/rpm-checksig.txt
 """.strip()
 
 
+REPOSITORY_ENTRYPOINT_APT_SCRIPT = r"""
+set -eu
+export LC_ALL=C
+if dpkg-query -W -f='${db:Status-Abbrev}\n' wukongim 2>/dev/null | grep -q '^ii '; then
+  echo 'wukongim was already installed before repository setup' >&2
+  exit 1
+fi
+sh /repo
+dpkg-query -W -f='${db:Status-Abbrev}\n' wukongim-archive-keyring | grep -q '^ii '
+test -f /etc/apt/sources.list.d/wukongim-preview.sources
+test -f /usr/share/keyrings/wukongim-archive-keyring.pgp
+sh /repo
+dpkg-query -W -f='${db:Status-Abbrev}\n' wukongim-archive-keyring | grep -q '^ii '
+if dpkg-query -W -f='${db:Status-Abbrev}\n' wukongim 2>/dev/null | grep -q '^ii '; then
+  echo 'repository setup installed wukongim' >&2
+  exit 1
+fi
+""".strip()
+
+
+REPOSITORY_ENTRYPOINT_RPM_SCRIPT = r"""
+set -eu
+export LC_ALL=C
+if rpm -q wukongim >/dev/null 2>&1; then
+  echo 'wukongim was already installed before repository setup' >&2
+  exit 1
+fi
+sh /repo
+rpm -q wukongim-release >/dev/null
+test -f /etc/yum.repos.d/wukongim-preview.repo
+test -f /etc/pki/rpm-gpg/RPM-GPG-KEY-wukongim-preview
+sh /repo
+rpm -q wukongim-release >/dev/null
+if rpm -q wukongim >/dev/null 2>&1; then
+  echo 'repository setup installed wukongim' >&2
+  exit 1
+fi
+""".strip()
+
+
 class ClientValidationError(RuntimeError):
     """A clean package client failed a production publication invariant."""
 
@@ -548,8 +603,72 @@ def _validate_bootstrap_payload(
              f"{label} digest differs from the bootstrap manifest")
 
 
+def _repository_entrypoint_facts(
+    data: bytes,
+    manifest: dict[str, Any],
+    rpm_certificate: bytes,
+    label: str,
+) -> dict[str, Any]:
+    _require(isinstance(data, bytes)
+             and 0 < len(data) <= MAX_REPOSITORY_ENTRYPOINT_BYTES,
+             f"{label} has an invalid size")
+    try:
+        expected = COMPOSER.repository_entrypoint_bytes(
+            manifest, _sha256(rpm_certificate)
+        )
+    except COMPOSER.CompositionError as error:
+        raise ClientValidationError(str(error)) from error
+    _require(data == expected,
+             f"{label} differs from reviewed bootstrap identities")
+    return {
+        "path": COMPOSER.REPOSITORY_ENTRYPOINT_PATH,
+        "sha256": _sha256(data),
+        "size": len(data),
+    }
+
+
+def _repository_entrypoint_curl_shim(manifest: dict[str, Any]) -> bytes:
+    """Return a network-free curl shim exposing only already-verified inputs."""
+    apt = manifest["packages"]["apt"]
+    rpm = manifest["packages"]["rpm"]
+    return f"""#!/bin/sh
+set -eu
+output=
+url=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --output)
+      [ "$#" -ge 2 ] || exit 64
+      output=$2
+      shift 2
+      continue
+      ;;
+    https://*) url=$1 ;;
+  esac
+  shift
+done
+[ -n "$output" ] || exit 64
+case "$url" in
+  {COMPOSER.REPOSITORY_ORIGIN}/{apt['download_path']})
+    source_path=/bootstrap/{apt['filename']}
+    ;;
+  {COMPOSER.REPOSITORY_ORIGIN}/{rpm['download_path']})
+    source_path=/bootstrap/{rpm['filename']}
+    ;;
+  {COMPOSER.REPOSITORY_ORIGIN}/keys/rpm-preview.asc)
+    source_path=/keys/rpm-preview.asc
+    ;;
+  *)
+    printf '%s\n' "unexpected repository setup URL: $url" >&2
+    exit 65
+    ;;
+esac
+cp "$source_path" "$output"
+""".encode("ascii")
+
+
 def _validate_local_bootstrap(
-    site: Path, identity: tuple[Any, Any]
+    site: Path, identity: tuple[Any, Any], rpm_certificate: bytes
 ) -> dict[str, Any] | None:
     manifest_path = site / "bootstrap/manifest.json"
     try:
@@ -585,16 +704,39 @@ def _validate_local_bootstrap(
         _require(direct == repository,
                  f"published {family} bootstrap direct and repository packages differ")
         payloads[family] = direct
+    entrypoint_path = site / COMPOSER.REPOSITORY_ENTRYPOINT_PATH
+    if not os.path.lexists(entrypoint_path):
+        _require(
+            identity in LEGACY_REPOSITORY_ENTRYPOINT_FREE_IDENTITIES,
+            "published repository setup entrypoint is required",
+        )
+        entrypoint = None
+        entrypoint_data = None
+    else:
+        entrypoint_data = _read_regular(
+            entrypoint_path,
+            "published repository setup entrypoint",
+            MAX_REPOSITORY_ENTRYPOINT_BYTES,
+        )
+        entrypoint = _repository_entrypoint_facts(
+            entrypoint_data,
+            manifest,
+            rpm_certificate,
+            "published repository setup entrypoint",
+        )
     return {
         "manifest": manifest,
         "manifest_sha256": manifest_sha256,
         "payloads": payloads,
+        "repository_entrypoint": entrypoint,
+        "repository_entrypoint_bytes": entrypoint_data,
     }
 
 
 def _validate_remote_bootstrap(
     base_url: str,
     identity: tuple[Any, Any],
+    rpm_certificate: bytes,
     fetcher: Callable[[str, int], bytes],
 ) -> dict[str, Any] | None:
     manifest_url = f"{base_url}/bootstrap/manifest.json"
@@ -627,10 +769,32 @@ def _validate_remote_bootstrap(
         _require(direct == repository,
                  f"remote {family} bootstrap direct and repository packages differ")
         payloads[family] = direct
+    try:
+        entrypoint_data = fetcher(
+            f"{base_url}/{COMPOSER.REPOSITORY_ENTRYPOINT_PATH}",
+            MAX_REPOSITORY_ENTRYPOINT_BYTES,
+        )
+    except (ClientValidationError, KeyError, OSError, urllib.error.HTTPError) as error:
+        if identity not in LEGACY_REPOSITORY_ENTRYPOINT_FREE_IDENTITIES:
+            raise ClientValidationError(
+                f"remote repository setup entrypoint is required for audit identity {identity[0]}"
+            ) from error
+        entrypoint = None
+    else:
+        entrypoint = _repository_entrypoint_facts(
+            entrypoint_data,
+            manifest,
+            rpm_certificate,
+            "remote repository setup entrypoint",
+        )
     return {
         "manifest": manifest,
         "manifest_sha256": manifest_sha256,
         "payloads": payloads,
+        "repository_entrypoint": entrypoint,
+        "repository_entrypoint_bytes": (
+            None if entrypoint is None else entrypoint_data
+        ),
     }
 
 
@@ -1116,6 +1280,45 @@ def _client_command(
     return command
 
 
+def _repository_entrypoint_command(
+    image: str,
+    downloads: Path,
+    family: str,
+    entrypoint: Path,
+    curl_shim: Path,
+    bootstrap_package: Path,
+    rpm_certificate: Path,
+) -> list[str]:
+    """Build one isolated, network-free execution of the public /repo path."""
+    _require(family in {"apt", "rpm"}, "repository entrypoint family is invalid")
+    command = [
+        "docker", "run", "--rm", "--platform", "linux/amd64",
+        "--network", "none", "--cap-drop", "ALL",
+        "--cap-add", "CHOWN", "--cap-add", "DAC_OVERRIDE",
+        "--cap-add", "FOWNER", "--cap-add", "SETGID", "--cap-add", "SETUID",
+        "--security-opt", "no-new-privileges", "--pids-limit", "256",
+        "--tmpfs", "/tmp:rw,noexec,nosuid,nodev,size=256m",
+        "--volume", f"{downloads.resolve(strict=True)}:/downloads:rw",
+        "--volume", f"{entrypoint.resolve(strict=True)}:/repo:ro",
+        "--volume", f"{curl_shim.resolve(strict=True)}:/usr/bin/curl:ro",
+        "--volume", (
+            f"{bootstrap_package.resolve(strict=True)}:"
+            f"/bootstrap/{bootstrap_package.name}:ro"
+        ),
+    ]
+    if family == "apt":
+        command.extend(("--env", "DEBIAN_FRONTEND=noninteractive"))
+        script = REPOSITORY_ENTRYPOINT_APT_SCRIPT
+    else:
+        command.extend((
+            "--volume",
+            f"{rpm_certificate.resolve(strict=True)}:/keys/rpm-preview.asc:ro",
+        ))
+        script = REPOSITORY_ENTRYPOINT_RPM_SCRIPT
+    command.extend((image, "sh", "-c", script))
+    return command
+
+
 def _run(command: Sequence[str]) -> None:
     # Container package-manager output is diagnostic. Keep stdout reserved for
     # the canonical JSON receipt consumed by publication workflow checks.
@@ -1210,7 +1413,9 @@ def validate_clients(
         resolved_site, expected, snapshot_sha256, identity = _validate_local_inputs(
             site_root, snapshot_path, certificates
         )
-        bootstrap = _validate_local_bootstrap(resolved_site, identity)
+        bootstrap = _validate_local_bootstrap(
+            resolved_site, identity, certificates["rpm"][1]
+        )
         normalized_base_url = None
     else:
         assert base_url is not None
@@ -1229,10 +1434,12 @@ def validate_clients(
         bootstrap = _validate_remote_bootstrap(
             normalized_base_url,
             (status["audit_release_id"], status["control_sha"]),
+            certificates["rpm"][1],
             fetcher,
         )
 
     results: dict[str, list[dict[str, Any]]] = {"apt": [], "rpm": []}
+    entrypoint_execution: dict[str, dict[str, Any]] = {}
     if expected_version is not None:
         assert expected is not None
         for family in ("apt", "rpm"):
@@ -1254,6 +1461,47 @@ def validate_clients(
                 package.write_bytes(bootstrap["payloads"][family])
                 package.chmod(0o444)
                 bootstrap_paths[family] = package
+        if (
+            bootstrap is not None
+            and bootstrap["repository_entrypoint_bytes"] is not None
+        ):
+            entrypoint_path = root / "repo"
+            entrypoint_path.write_bytes(bootstrap["repository_entrypoint_bytes"])
+            entrypoint_path.chmod(0o444)
+            curl_shim = root / "curl"
+            curl_shim.write_bytes(
+                _repository_entrypoint_curl_shim(bootstrap["manifest"])
+            )
+            curl_shim.chmod(0o555)
+            for family, (distribution, image) in (
+                ("apt", APT_CLIENTS[0]),
+                ("rpm", RPM_CLIENTS[0]),
+            ):
+                smoke_output = root / f"repository-entrypoint-{family}"
+                smoke_output.mkdir(mode=0o700)
+                smoke_output.chmod(0o777)
+                command = _repository_entrypoint_command(
+                    image,
+                    smoke_output,
+                    family,
+                    entrypoint_path,
+                    curl_shim,
+                    bootstrap_paths[family],
+                    certificates["rpm"][0],
+                )
+                try:
+                    runner(command)
+                except (OSError, subprocess.CalledProcessError) as error:
+                    raise ClientValidationError(
+                        f"{distribution} repository setup entrypoint failed: {error}"
+                    ) from error
+                entrypoint_execution[family] = {
+                    "distribution": distribution,
+                    "image": image,
+                    "executions": 2,
+                    "idempotent": True,
+                    "product_absent": True,
+                }
         for family, clients in (("apt", APT_CLIENTS), ("rpm", RPM_CLIENTS)):
             for distribution, image in clients:
                 downloads = root / distribution
@@ -1306,6 +1554,8 @@ def validate_clients(
         "expected_version": expected_version,
         "expected_version_verified": expected_version is not None,
         "bootstrap_verified": bootstrap is not None,
+        "repository_entrypoint_executed": set(entrypoint_execution) == {"apt", "rpm"},
+        "entrypoint_execution": entrypoint_execution,
         "apt": results["apt"],
         "rpm": results["rpm"],
     }
@@ -1318,6 +1568,7 @@ def validate_clients(
             "version": manifest["version"],
             "manifest_sha256": bootstrap["manifest_sha256"],
             "packages": manifest["packages"],
+            "repository_entrypoint": bootstrap["repository_entrypoint"],
         }
     if local:
         output["snapshot_sha256"] = snapshot_sha256

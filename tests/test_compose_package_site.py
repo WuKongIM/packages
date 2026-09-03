@@ -8,6 +8,7 @@ import io
 import json
 import shutil
 import stat
+import subprocess
 import unittest
 from argparse import Namespace
 from pathlib import Path
@@ -766,6 +767,40 @@ class ComposePackageSiteTest(unittest.TestCase):
             self.assertEqual(expected, (fixture.output / "site" / package["download_path"]).read_bytes())
             self.assertEqual(digest(expected), package["published_sha256"])
             self.assertEqual(len(expected), package["published_size"])
+
+    def test_repository_entrypoint_is_fixed_posix_sh_and_binds_bootstrap_bytes(self) -> None:
+        fixture, temporary = self.first_release()
+        self.addCleanup(temporary.cleanup)
+
+        composer.compose(fixture.args())
+
+        site = fixture.output / "site"
+        bootstrap = json.loads((site / "bootstrap/manifest.json").read_text())
+        entrypoint = (site / composer.REPOSITORY_ENTRYPOINT_PATH).read_bytes()
+        self.assertEqual(
+            composer.repository_entrypoint_bytes(bootstrap, digest(RPM_CERT)),
+            entrypoint,
+        )
+        syntax = subprocess.run(
+            ["sh", "-n"], input=entrypoint, capture_output=True, check=False
+        )
+        self.assertEqual(b"", syntax.stderr)
+        self.assertEqual(0, syntax.returncode)
+        rendered = entrypoint.decode("ascii")
+        self.assertTrue(rendered.startswith("#!/bin/sh\nfail()"))
+        self.assertTrue(rendered.rstrip().endswith('main "$@"'))
+        self.assertEqual(1, rendered.count('\nmain "$@"\n'))
+        self.assertIn("debian|ubuntu)", rendered)
+        self.assertIn("rhel|rocky|almalinux)", rendered)
+        self.assertIn("9|9.*)", rendered)
+        self.assertIn(bootstrap["packages"]["apt"]["published_sha256"], rendered)
+        self.assertIn(bootstrap["packages"]["rpm"]["published_sha256"], rendered)
+        self.assertIn(digest(RPM_CERT), rendered)
+        self.assertIn("trap cleanup 0", rendered)
+        self.assertIn("--disablerepo='*'", rendered)
+        self.assertIn(
+            "curl -fsSL https://packages.githubim.com/repo | sudo sh", rendered
+        )
 
     def test_fails_closed_when_output_root_export_mode_cannot_be_set(self) -> None:
         fixture, temporary = self.first_release()

@@ -14,10 +14,7 @@ upgrades no longer require downloading a WuKongIM deb file manually:
 
 ```bash
 # 1. Add the WuKongIM preview repository
-curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
-  --output /tmp/wukongim-archive-keyring_1.0.0_all.deb \
-  https://packages.githubim.com/bootstrap/wukongim-archive-keyring_1.0.0_all.deb && \
-  sudo apt install -y /tmp/wukongim-archive-keyring_1.0.0_all.deb
+curl -fsSL https://packages.githubim.com/repo | sudo sh
 
 # 2. Refresh the package index
 sudo apt update
@@ -31,10 +28,7 @@ compatible `yum` command):
 
 ```bash
 # 1. Add the WuKongIM preview repository
-curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
-  --output /tmp/wukongim-release-1.0.0-1.noarch.rpm \
-  https://packages.githubim.com/bootstrap/wukongim-release-1.0.0-1.noarch.rpm && \
-  sudo dnf install -y /tmp/wukongim-release-1.0.0-1.noarch.rpm
+curl -fsSL https://packages.githubim.com/repo | sudo sh
 
 # 2. Refresh the package index
 sudo dnf -y --disablerepo='*' --enablerepo=wukongim-preview makecache --refresh
@@ -43,9 +37,18 @@ sudo dnf -y --disablerepo='*' --enablerepo=wukongim-preview makecache --refresh
 sudo dnf install -y wukongim
 ```
 
-The first bootstrap download necessarily trusts the HTTPS origin. The package
-then installs only the reviewed repository key and dedicated source file; it
-does not run network commands, start services, or weaken signature checks.
+The `/repo` entrypoint is POSIX `sh`. It detects Debian/Ubuntu amd64 or
+RHEL/Rocky/AlmaLinux 9 x86_64, downloads the matching reviewed bootstrap
+package, verifies its exact published SHA-256, and installs only that package.
+It does not refresh package indexes or install WuKongIM. Temporary downloads
+are removed on exit. The RPM path additionally verifies the reviewed public
+certificate bytes and package signature while keeping every other DNF
+repository disabled.
+
+The first `/repo` download necessarily trusts the HTTPS origin. Its bytes and
+the exact bootstrap package identities are closed over by the immutable audit
+snapshot. The bootstrap package installs only the reviewed repository key and
+dedicated source file; it does not start services or weaken signature checks.
 After that first step, APT/DNF authenticates repository metadata and packages,
 and upgrades the bootstrap package through the same signed repository.
 
@@ -112,5 +115,6 @@ Reviewed public certificates are published at the stable URLs
 `https://packages.githubim.com/keys/rpm-preview.asc`. The APT
 `wukongim-archive-keyring` and RPM `wukongim-release` packages distribute those
 certificates and dedicated repository definitions. Their indexed bytes and
-friendly `/bootstrap/` downloads are identical and are closed over by each
-immutable package audit snapshot.
+friendly `/bootstrap/` downloads are identical. The stable `/repo` entrypoint
+is generated from those exact paths and digests; all three are closed over by
+each immutable package audit snapshot.
