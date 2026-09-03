@@ -116,6 +116,7 @@ or sign anything.
 
 The intended public layouts are:
 
+- `/repo` for the stable, generated POSIX `sh` repository-setup entrypoint;
 - `/apt/dists/preview` and `/rpm/preview/el/9/x86_64` for pre-releases on
   GitHub Pages;
 - `/apt/dists/stable` and `/rpm/stable/el/9/x86_64` for stable releases only
@@ -145,6 +146,12 @@ active product version only so clean-client validation has an exact install
 target. The bootstrap package version must increase whenever either embedded
 public certificate or repository definition changes. Repeating any other
 publication preserves the exact existing bootstrap package bytes.
+
+Bootstrap version `1.1.0` is the publication boundary that first adds the
+unified `/repo` entrypoint. It therefore uses `update_bootstrap` against the
+immutable `1.0.0` base without changing product releases. Only the exact
+published `1.0.0` audit identity may be reverified without `/repo`; every new
+snapshot must contain it.
 
 Retirement is a two-run operation because package and metadata objects can
 remain in the Pages CDN cache for roughly ten minutes. The first reviewed run
@@ -275,6 +282,25 @@ architecture, and whether the publication introduced new bytes. The first
 direct download is authenticated by the HTTPS origin; it cannot bootstrap
 trust in itself. Subsequent updates are authenticated by the installed
 package-manager trust root.
+
+The composer generates `/repo` as fixed POSIX `sh` bytes from the canonical
+HTTPS origin, both bootstrap download paths and published SHA-256 values, and
+the reviewed RPM certificate SHA-256. It supports Debian and Ubuntu on amd64,
+plus RHEL, Rocky Linux, and AlmaLinux 9 on x86_64. The entrypoint installs only
+the matching data-only bootstrap package; it never refreshes an index, installs
+`wukongim`, starts a service, or enables access to unrelated DNF repositories.
+It uses a private temporary directory, removes it on normal or signal exit, and
+refuses non-root execution with the exact public `sudo sh` command. All
+mutations live inside a `main` function whose invocation is the final line, so
+a response truncated before that complete invocation arrives does not enter
+the setup path.
+
+Offline site verification reconstructs and byte-compares `/repo` before
+accepting the complete file closure. Clean-client validation repeats that
+comparison for local artifacts and the public endpoint, then executes the
+entrypoint twice on one pinned APT client and one pinned EL9 DNF client with a
+network-disabled, exact-input curl shim. Both executions must be idempotent,
+must install the bootstrap package, and must leave `wukongim` absent.
 
 Preview primary-key generation currently uses an explicitly accepted
 single-operator online-workstation custody model. The named operator is

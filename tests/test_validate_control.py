@@ -293,7 +293,7 @@ class ValidateControlTest(unittest.TestCase):
                 {
                     "schema": "wukongim.native_package_bootstrap/v1",
                     "enabled": True,
-                    "version": "1.0.0",
+                    "version": "1.1.0",
                 },
                 bootstrap,
             )

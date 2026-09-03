@@ -341,6 +341,7 @@ class VerifyProductionPackageSiteTest(unittest.TestCase):
         for item in manifest["packages"].values():
             (site / item["repository_path"]).unlink()
             (site / item["download_path"]).unlink()
+        (site / verifier.C.REPOSITORY_ENTRYPOINT_PATH).unlink()
         manifest_path.unlink()
         (site / "bootstrap").rmdir()
         (site / "index.html").write_bytes(
@@ -491,6 +492,61 @@ class VerifyProductionPackageSiteTest(unittest.TestCase):
                         manifest_path.unlink()
                     with self.assertRaisesRegex(verifier.VerificationError, pattern):
                         self.verify(fixture)
+
+    def test_repository_setup_entrypoint_is_exact_and_in_the_site_closure(self) -> None:
+        for mutation, pattern in (
+            ("missing", "omits the required repository setup entrypoint"),
+            ("tampered", "differs from reviewed bootstrap identities"),
+        ):
+            with self.subTest(mutation=mutation):
+                fixture, temporary = self.compose()
+                with temporary:
+                    entrypoint = (
+                        fixture.output / "site" / verifier.C.REPOSITORY_ENTRYPOINT_PATH
+                    )
+                    if mutation == "missing":
+                        entrypoint.unlink()
+                    else:
+                        entrypoint.write_bytes(entrypoint.read_bytes() + b"# tampered\n")
+                    with self.assertRaisesRegex(verifier.VerificationError, pattern):
+                        self.verify(fixture)
+
+    def test_only_the_exact_first_bootstrap_audit_may_omit_repo_entrypoint(self) -> None:
+        fixture, temporary = self.compose()
+        self.addCleanup(temporary.cleanup)
+        site = fixture.output / "site"
+        (site / verifier.C.REPOSITORY_ENTRYPOINT_PATH).unlink()
+        audit_id, control_sha = next(
+            iter(verifier.LEGACY_REPOSITORY_ENTRYPOINT_FREE_SNAPSHOTS)
+        )
+        channels = json.loads(fixture.channels.read_text())
+        channels["channels"]["preview"]["publication"]["audit_release_id"] = audit_id
+        channels["channels"]["preview"]["releases"][0]["package_release_id"] = audit_id
+        fixture.channels.write_text(json.dumps(channels, indent=2) + "\n")
+        snapshot_path = fixture.output / "audit/snapshot.json"
+        snapshot = json.loads(snapshot_path.read_text())
+        snapshot["audit_release_id"] = audit_id
+        snapshot["control_sha"] = control_sha
+        snapshot["releases"][0]["package_release_id"] = audit_id
+        snapshot_path.write_bytes(canonical(snapshot))
+        status_path = site / "status.json"
+        status = json.loads(status_path.read_text())
+        status["audit_release_id"] = audit_id
+        status["control_sha"] = control_sha
+        status["snapshot_sha256"] = sha256(snapshot_path.read_bytes())
+        status_path.write_bytes(canonical(status))
+
+        self.verify(fixture)
+
+        snapshot["control_sha"] = "0" * 40
+        snapshot_path.write_bytes(canonical(snapshot))
+        status["control_sha"] = "0" * 40
+        status["snapshot_sha256"] = sha256(snapshot_path.read_bytes())
+        status_path.write_bytes(canonical(status))
+        with self.assertRaisesRegex(
+            verifier.VerificationError, "omits the required repository setup entrypoint"
+        ):
+            self.verify(fixture)
 
     def test_bootstrap_packages_are_mandatory_members_of_both_indexes(self) -> None:
         for family in ("apt", "rpm"):

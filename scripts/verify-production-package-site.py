@@ -44,6 +44,12 @@ BOOTSTRAP_MANIFEST_PATH = "bootstrap/manifest.json"
 LEGACY_BOOTSTRAP_FREE_SNAPSHOTS = {
     (381152722, "637bc91bc8753a55dba0ebb346384a0a7e7387b6"),
 }
+# The first immutable bootstrap snapshot predates the unified /repo entrypoint.
+# Keep only that exact archive re-verifiable; every newer snapshot must publish
+# and close over the generated entrypoint bytes.
+LEGACY_REPOSITORY_ENTRYPOINT_FREE_SNAPSHOTS = {
+    (381713091, "46cfe4d94dc98830774918e4c68744aeb03ca926"),
+}
 SNAPSHOT_FIELDS = {
     "schema", "audit_release_id", "control_sha", "releases", "retirement",
     "payloads", "public_keys", "source_attestations", "toolchain",
@@ -707,6 +713,25 @@ def validate_bootstrap_manifest(
         require(repository_bytes == direct_bytes,
                 f"direct {family.upper()} bootstrap download is not byte-identical to the indexed package")
         expected.update((repository_path, download_path))
+
+    entrypoint_path = C.REPOSITORY_ENTRYPOINT_PATH
+    if entrypoint_path not in site_files:
+        require(
+            snapshot_identity in LEGACY_REPOSITORY_ENTRYPOINT_FREE_SNAPSHOTS,
+            "site omits the required repository setup entrypoint",
+        )
+        return manifest, expected
+    entrypoint = read_checked(
+        args.site_root / entrypoint_path,
+        "repository setup entrypoint",
+        maximum=C.MAX_REPOSITORY_ENTRYPOINT_BYTES,
+    )
+    expected_entrypoint = C.repository_entrypoint_bytes(
+        manifest, context["keys"]["rpm"]["sha256"]
+    )
+    require(entrypoint == expected_entrypoint,
+            "repository setup entrypoint differs from reviewed bootstrap identities")
+    expected.add(entrypoint_path)
     return manifest, expected
 
 

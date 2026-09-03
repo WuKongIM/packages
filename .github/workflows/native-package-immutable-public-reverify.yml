@@ -389,7 +389,8 @@ jobs:
             --arg control "$artifact_control_sha" \
             --arg snapshot "$snapshot_sha256" \
             --arg target "$target_version" \
-            '.mode == "remote" and .audit_release_id == $id and
+            '.schema == "wukongim/production-package-client-validation/v4" and
+             .mode == "remote" and .audit_release_id == $id and
              .control_sha == $control and .snapshot_sha256 == $snapshot and
              .snapshot_verified == true and .status_revalidated == true and
              (.apt | length) == 2 and (.rpm | length) == 2 and

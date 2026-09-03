@@ -27,6 +27,9 @@ SIGNING_SCHEMA = "wukongim.native_package_signing/v3"
 PLAN_SCHEMA = "wukongim.native_package_publication_plan/v1"
 INVENTORY_SCHEMA = "wukongim.native_package_payload_inventory/v1"
 BOOTSTRAP_INVENTORY_SCHEMA = "wukongim.native_package_bootstrap_inventory/v1"
+REPOSITORY_ENTRYPOINT_PATH = "repo"
+REPOSITORY_ORIGIN = "https://packages.githubim.com"
+MAX_REPOSITORY_ENTRYPOINT_BYTES = 64 * 1024
 SIGNING_RECEIPT_SCHEMA = "wukongim/package-family-signing-receipt/v1"
 SNAPSHOT_SCHEMA = "wukongim.native_package_snapshot/v3"
 COMPOSITION_SCHEMA = "wukongim.native_package_site_composition/v1"
@@ -776,6 +779,134 @@ def validate_bootstrap_inventory(
                     "new RPM bootstrap inventory must describe unsigned source bytes")
         validated[family] = dict(item)
     return {"schema": inventory["schema"], "version": version, "packages": validated}
+
+
+def repository_entrypoint_bytes(
+    bootstrap: dict[str, Any], rpm_certificate_sha256: str
+) -> bytes:
+    """Render the fixed POSIX-sh repository bootstrap from reviewed byte identities."""
+    apt = bootstrap["packages"]["apt"]
+    rpm = bootstrap["packages"]["rpm"]
+    require(SHA256_RE.fullmatch(rpm_certificate_sha256) is not None,
+            "RPM public-certificate digest is invalid for the repository entrypoint")
+    script = fr"""#!/bin/sh
+fail() {{
+  printf '%s\n' "wukongim repository setup: $*" >&2
+  exit 1
+}}
+
+need() {{
+  command -v "$1" >/dev/null 2>&1 || fail "required command is unavailable: $1"
+}}
+
+download_and_verify() {{
+  download_url=$1
+  download_path=$2
+  expected_sha256=$3
+  curl --proto '=https' --proto-redir '=https' --tlsv1.2 \
+    --fail --silent --show-error --location --max-redirs 3 \
+    --connect-timeout 10 --max-time 120 --max-filesize 16777216 \
+    --output "$download_path" "$download_url"
+  actual_sha256=$(sha256sum "$download_path")
+  actual_sha256=${{actual_sha256%% *}}
+  [ "$actual_sha256" = "$expected_sha256" ] || \
+    fail "download digest mismatch: $download_url"
+}}
+
+temporary_directory=
+cleanup() {{
+  case "$temporary_directory" in
+    /tmp/wukongim-repo.*)
+      [ ! -d "$temporary_directory" ] || rm -rf "$temporary_directory"
+      ;;
+  esac
+}}
+
+main() {{
+  set -eu
+  PATH=/usr/sbin:/usr/bin:/sbin:/bin
+  export PATH
+  export LC_ALL=C
+  umask 077
+
+  if [ "$(id -u)" != 0 ]; then
+    printf '%s\n' 'This command must run as root. Re-run it with:' >&2
+    printf '%s\n' '  curl -fsSL https://packages.githubim.com/repo | sudo sh' >&2
+    exit 1
+  fi
+
+  [ -r /etc/os-release ] || fail '/etc/os-release is unavailable'
+  ID=
+  VERSION_ID=
+  # /etc/os-release is the distribution-owned POSIX environment file.
+  . /etc/os-release
+  PATH=/usr/sbin:/usr/bin:/sbin:/bin
+  export PATH
+
+  trap cleanup 0
+  trap 'exit 1' 1 2 3 15
+  need curl
+  need sha256sum
+  need mktemp
+  temporary_directory=$(mktemp -d /tmp/wukongim-repo.XXXXXX) || \
+    fail 'cannot create a temporary directory'
+
+  case "${{ID:-}}" in
+    debian|ubuntu)
+      need apt-get
+      need dpkg
+      [ "$(dpkg --print-architecture)" = amd64 ] || \
+        fail 'the Preview APT repository supports only amd64'
+      package_path="$temporary_directory/{apt['filename']}"
+      download_and_verify \
+        "{REPOSITORY_ORIGIN}/{apt['download_path']}" \
+        "$package_path" \
+        "{apt['published_sha256']}"
+      apt-get install --yes --no-install-recommends "$package_path"
+      printf '%s\n' 'WuKongIM Preview repository configured; WuKongIM was not installed.'
+      printf '%s\n' 'Next: sudo apt update'
+      printf '%s\n' 'Then: sudo apt install -y wukongim'
+      ;;
+    rhel|rocky|almalinux)
+      case "${{VERSION_ID:-}}" in
+        9|9.*) ;;
+        *) fail 'the Preview DNF repository supports only EL9' ;;
+      esac
+      need dnf
+      need rpm
+      need rpmkeys
+      [ "$(rpm --eval '%{{_arch}}')" = x86_64 ] || \
+        fail 'the Preview DNF repository supports only x86_64'
+      key_path="$temporary_directory/rpm-preview.asc"
+      package_path="$temporary_directory/{rpm['filename']}"
+      download_and_verify \
+        "{REPOSITORY_ORIGIN}/keys/rpm-preview.asc" \
+        "$key_path" \
+        "{rpm_certificate_sha256}"
+      download_and_verify \
+        "{REPOSITORY_ORIGIN}/{rpm['download_path']}" \
+        "$package_path" \
+        "{rpm['published_sha256']}"
+      rpm --import "$key_path"
+      rpmkeys --checksig "$package_path" >/dev/null
+      dnf --assumeyes --disablerepo='*' --setopt=localpkg_gpgcheck=True \
+        install "$package_path"
+      printf '%s\n' 'WuKongIM Preview repository configured; WuKongIM was not installed.'
+      printf '%s\n' "Next: sudo dnf -y --disablerepo='*' --enablerepo=wukongim-preview makecache --refresh"
+      printf '%s\n' 'Then: sudo dnf install -y wukongim'
+      ;;
+    *)
+      fail "unsupported distribution: ${{ID:-unknown}} (supported: Debian, Ubuntu, RHEL 9, Rocky Linux 9, AlmaLinux 9)"
+      ;;
+  esac
+}}
+
+main "$@"
+"""
+    rendered = script.encode("ascii")
+    require(0 < len(rendered) <= MAX_REPOSITORY_ENTRYPOINT_BYTES,
+            "repository entrypoint exceeds its fixed size limit")
+    return rendered
 
 
 def validate_bootstrap_transition(
@@ -1892,6 +2023,13 @@ def compose(args: argparse.Namespace) -> dict[str, Any]:
             site / "bootstrap/manifest.json",
             canonical_json(published_bootstrap),
             "bootstrap manifest",
+        )
+        write_exclusive(
+            site / REPOSITORY_ENTRYPOINT_PATH,
+            repository_entrypoint_bytes(
+                published_bootstrap, reviewed_keys["rpm"]["sha256"]
+            ),
+            "repository setup entrypoint",
         )
 
         snapshot = {

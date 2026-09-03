@@ -187,6 +187,11 @@ class Fixture:
                 path = self.site.joinpath(*Path(item[field]).parts)
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_bytes(payload)
+        (self.site / validator.COMPOSER.REPOSITORY_ENTRYPOINT_PATH).write_bytes(
+            validator.COMPOSER.repository_entrypoint_bytes(
+                self.bootstrap_value, digest(RPM_CERTIFICATE)
+            )
+        )
 
     def remove_bootstrap(self) -> None:
         for family in ("apt", "rpm"):
@@ -194,6 +199,7 @@ class Fixture:
             for field in ("repository_path", "download_path"):
                 self.site.joinpath(*Path(item[field]).parts).unlink()
         (self.site / "bootstrap/manifest.json").unlink()
+        (self.site / validator.COMPOSER.REPOSITORY_ENTRYPOINT_PATH).unlink()
 
     def add_retained_payloads(self) -> None:
         not_before = "2026-09-02T00:00:00Z"
@@ -258,6 +264,9 @@ class Fixture:
             "https://packages.example/keys/rpm-preview.asc": RPM_CERTIFICATE,
             "https://packages.example/bootstrap/manifest.json": (
                 self.site / "bootstrap/manifest.json"
+            ).read_bytes(),
+            "https://packages.example/repo": (
+                self.site / validator.COMPOSER.REPOSITORY_ENTRYPOINT_PATH
             ).read_bytes(),
         }
         for family, payload in (("apt", APT_BOOTSTRAP), ("rpm", RPM_BOOTSTRAP)):
@@ -324,12 +333,17 @@ class ValidateProductionPackageClientsTest(unittest.TestCase):
         self.assertEqual("local", receipt["mode"])
         self.assertEqual(2, len(receipt["apt"]))
         self.assertEqual(2, len(receipt["rpm"]))
-        self.assertEqual(4, len(fixture.commands))
+        self.assertEqual(6, len(fixture.commands))
         self.assertIsNone(receipt["expected_version"])
         self.assertFalse(receipt["expected_version_verified"])
         self.assertTrue(receipt["bootstrap_verified"])
+        self.assertTrue(receipt["repository_entrypoint_executed"])
+        self.assertEqual({"apt", "rpm"}, set(receipt["entrypoint_execution"]))
         self.assertEqual(BOOTSTRAP_VERSION, receipt["bootstrap"]["version"])
         self.assertRegex(receipt["bootstrap"]["manifest_sha256"], r"^[0-9a-f]{64}$")
+        self.assertEqual(
+            "repo", receipt["bootstrap"]["repository_entrypoint"]["path"]
+        )
         self.assertNotIn("base_url", receipt)
         self.assertRegex(receipt["snapshot_sha256"], r"^[0-9a-f]{64}$")
         for family, payload in (("apt", DEB_PAYLOAD), ("rpm", RPM_PAYLOAD)):
@@ -608,14 +622,33 @@ class ValidateProductionPackageClientsTest(unittest.TestCase):
         self.assertFalse(receipt["snapshot_verified"])
         self.assertTrue(receipt["status_revalidated"])
         self.assertTrue(receipt["bootstrap_verified"])
-        self.assertEqual(9, len(fetched))
+        self.assertEqual(10, len(fetched))
         self.assertEqual(2, fetched.count("https://packages.example/status.json"))
-        for command in fixture.commands:
+        entrypoint_commands = [
+            command for command in fixture.commands
+            if ":/repo:ro" in "\n".join(command)
+        ]
+        client_commands = [
+            command for command in fixture.commands if command not in entrypoint_commands
+        ]
+        self.assertEqual(2, len(entrypoint_commands))
+        self.assertEqual(4, len(client_commands))
+        self.assertTrue(receipt["repository_entrypoint_executed"])
+        self.assertEqual({"apt", "rpm"}, set(receipt["entrypoint_execution"]))
+        for value in receipt["entrypoint_execution"].values():
+            self.assertEqual(2, value["executions"])
+            self.assertTrue(value["idempotent"])
+            self.assertTrue(value["product_absent"])
+        for command in entrypoint_commands:
+            self.assertEqual("none", command[command.index("--network") + 1])
+            self.assertIn(":/usr/bin/curl:ro", "\n".join(command))
+            self.assertEqual(2, command[-1].count("sh /repo"))
+        for command in client_commands:
             self.assertNotIn("--network", command)
             rendered = "\n".join(command)
             self.assertIn("https://packages.example/", rendered)
         apt_commands = [
-            command for command in fixture.commands
+            command for command in client_commands
             if any(image in command for _, image in validator.APT_CLIENTS)
         ]
         self.assertEqual(2, len(apt_commands))
@@ -627,7 +660,7 @@ class ValidateProductionPackageClientsTest(unittest.TestCase):
             )
         )
         rpm_commands = [
-            command for command in fixture.commands
+            command for command in client_commands
             if any(image in command for _, image in validator.RPM_CLIENTS)
         ]
         self.assertEqual(2, len(rpm_commands))
@@ -720,7 +753,7 @@ class ValidateProductionPackageClientsTest(unittest.TestCase):
                     )
 
             self.assertEqual(2, status_reads)
-            self.assertEqual(4, len(fixture.commands))
+            self.assertEqual(6, len(fixture.commands))
 
     def test_remote_snapshot_rejects_missing_and_tampered_payloads(self) -> None:
         with TemporaryDirectory() as temporary:
@@ -971,6 +1004,90 @@ class ValidateProductionPackageClientsTest(unittest.TestCase):
                     fetcher=lambda url, maximum: files[url],
                 )
 
+    def test_repository_entrypoint_bytes_are_verified_before_clean_clients(self) -> None:
+        with TemporaryDirectory() as temporary:
+            fixture = Fixture(Path(temporary))
+            entrypoint = fixture.site / validator.COMPOSER.REPOSITORY_ENTRYPOINT_PATH
+            entrypoint.write_bytes(entrypoint.read_bytes() + b"# tampered\n")
+            runner = mock.Mock()
+            with self.assertRaisesRegex(
+                validator.ClientValidationError,
+                "published repository setup entrypoint differs",
+            ):
+                fixture.local_validate(runner)
+            runner.assert_not_called()
+
+        with TemporaryDirectory() as temporary:
+            fixture = Fixture(Path(temporary))
+            files = fixture.remote_files()
+            files["https://packages.example/repo"] += b"# tampered\n"
+            runner = mock.Mock()
+            with self.assertRaisesRegex(
+                validator.ClientValidationError,
+                "remote repository setup entrypoint differs",
+            ):
+                validator.validate_clients(
+                    site_root=None,
+                    snapshot_path=fixture.snapshot,
+                    base_url="https://packages.example",
+                    apt_public_cert=fixture.apt_certificate,
+                    rpm_public_cert=fixture.rpm_certificate,
+                    runner=runner,
+                    fetcher=lambda url, maximum: files[url],
+                )
+            runner.assert_not_called()
+
+    def test_exact_first_bootstrap_audit_may_omit_repository_entrypoint(self) -> None:
+        with TemporaryDirectory() as temporary:
+            fixture = Fixture(Path(temporary))
+            audit_id, control_sha = next(
+                iter(validator.LEGACY_REPOSITORY_ENTRYPOINT_FREE_IDENTITIES)
+            )
+            fixture.snapshot_value["audit_release_id"] = audit_id
+            fixture.snapshot_value["control_sha"] = control_sha
+            fixture.write_snapshot()
+            status = fixture.status(
+                audit_release_id=audit_id,
+                control_sha=control_sha,
+                snapshot_sha256=digest(fixture.snapshot.read_bytes()),
+            )
+            files = fixture.remote_files(status)
+            files.pop("https://packages.example/repo")
+            ca_bundle = Path(temporary) / "ca-certificates.crt"
+            ca_bundle.write_bytes(b"host ca\n")
+            with mock.patch.object(validator, "_host_ca_bundle", return_value=ca_bundle):
+                receipt = validator.validate_clients(
+                    site_root=None,
+                    snapshot_path=fixture.snapshot,
+                    base_url="https://packages.example",
+                    apt_public_cert=fixture.apt_certificate,
+                    rpm_public_cert=fixture.rpm_certificate,
+                    runner=fixture.runner,
+                    fetcher=lambda url, maximum: files[url],
+                )
+            self.assertIsNone(receipt["bootstrap"]["repository_entrypoint"])
+
+            files["https://packages.example/status.json"] = json.dumps(
+                fixture.status(
+                    audit_release_id=audit_id,
+                    control_sha="0" * 40,
+                    snapshot_sha256=digest(fixture.snapshot.read_bytes()),
+                )
+            ).encode()
+            with self.assertRaisesRegex(
+                validator.ClientValidationError,
+                "remote repository setup entrypoint is required",
+            ):
+                validator.validate_clients(
+                    site_root=None,
+                    snapshot_path=None,
+                    base_url="https://packages.example",
+                    apt_public_cert=fixture.apt_certificate,
+                    rpm_public_cert=fixture.rpm_certificate,
+                    runner=mock.Mock(),
+                    fetcher=lambda url, maximum: files[url],
+                )
+
     def test_only_the_reviewed_legacy_identity_may_omit_bootstrap(self) -> None:
         with TemporaryDirectory() as temporary:
             fixture = Fixture(Path(temporary))
@@ -1159,7 +1276,7 @@ class ValidateProductionPackageClientsTest(unittest.TestCase):
 
             with self.assertRaisesRegex(
                 validator.ClientValidationError,
-                "ubuntu-24.04 clean APT client failed",
+                "ubuntu-24.04 repository setup entrypoint failed",
             ):
                 fixture.local_validate(failing_runner)
 

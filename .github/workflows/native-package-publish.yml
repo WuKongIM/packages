@@ -1330,6 +1330,7 @@ jobs:
       rpm_repomd_sha256: ${{ steps.live.outputs.rpm_repomd_sha256 }}
       apt_key_sha256: ${{ steps.live.outputs.apt_key_sha256 }}
       rpm_key_sha256: ${{ steps.live.outputs.rpm_key_sha256 }}
+      repo_sha256: ${{ steps.live.outputs.repo_sha256 }}
       bootstrap_manifest_sha256: ${{ steps.live.outputs.bootstrap_manifest_sha256 }}
       apt_bootstrap_path: ${{ steps.live.outputs.apt_bootstrap_path }}
       apt_bootstrap_repository_path: ${{ steps.live.outputs.apt_bootstrap_repository_path }}
@@ -1489,6 +1490,7 @@ jobs:
           rpm_bootstrap_path="$(jq -er '.packages.rpm.download_path' "$bootstrap")"
           rpm_bootstrap_repository_path="$(jq -er '.packages.rpm.repository_path' "$bootstrap")"
           rpm_bootstrap_sha256="$(jq -er '.packages.rpm.published_sha256' "$bootstrap")"
+          test -s "$site/repo"
           test "$(sha256sum "$site/$apt_bootstrap_path" | cut -d' ' -f1)" = "$apt_bootstrap_sha256"
           test "$(sha256sum "$site/$apt_bootstrap_repository_path" | cut -d' ' -f1)" = "$apt_bootstrap_sha256"
           test "$(sha256sum "$site/$rpm_bootstrap_path" | cut -d' ' -f1)" = "$rpm_bootstrap_sha256"
@@ -1502,6 +1504,7 @@ jobs:
             echo "rpm_repomd_sha256=$(sha256sum "$site/rpm/preview/el/9/x86_64/repodata/repomd.xml" | cut -d' ' -f1)"
             echo "apt_key_sha256=$(sha256sum "$site/keys/apt-preview.asc" | cut -d' ' -f1)"
             echo "rpm_key_sha256=$(sha256sum "$site/keys/rpm-preview.asc" | cut -d' ' -f1)"
+            echo "repo_sha256=$(sha256sum "$site/repo" | cut -d' ' -f1)"
             echo "bootstrap_manifest_sha256=$(sha256sum "$bootstrap" | cut -d' ' -f1)"
             echo "apt_bootstrap_path=$apt_bootstrap_path"
             echo "apt_bootstrap_repository_path=$apt_bootstrap_repository_path"
@@ -1626,6 +1629,7 @@ jobs:
           RPM_REPOMD_SHA256: ${{ needs.pages_artifact.outputs.rpm_repomd_sha256 }}
           APT_KEY_SHA256: ${{ needs.pages_artifact.outputs.apt_key_sha256 }}
           RPM_KEY_SHA256: ${{ needs.pages_artifact.outputs.rpm_key_sha256 }}
+          REPO_SHA256: ${{ needs.pages_artifact.outputs.repo_sha256 }}
           BOOTSTRAP_MANIFEST_SHA256: ${{ needs.pages_artifact.outputs.bootstrap_manifest_sha256 }}
           APT_BOOTSTRAP_PATH: ${{ needs.pages_artifact.outputs.apt_bootstrap_path }}
           APT_BOOTSTRAP_REPOSITORY_PATH: ${{ needs.pages_artifact.outputs.apt_bootstrap_repository_path }}
@@ -1654,6 +1658,7 @@ jobs:
           fetch_and_check rpm/preview/el/9/x86_64/repodata/repomd.xml "$RPM_REPOMD_SHA256"
           fetch_and_check keys/apt-preview.asc "$APT_KEY_SHA256"
           fetch_and_check keys/rpm-preview.asc "$RPM_KEY_SHA256"
+          fetch_and_check repo "$REPO_SHA256"
           fetch_and_check bootstrap/manifest.json "$BOOTSTRAP_MANIFEST_SHA256"
           fetch_and_check "$APT_BOOTSTRAP_PATH" "$APT_BOOTSTRAP_SHA256"
           fetch_and_check "$APT_BOOTSTRAP_REPOSITORY_PATH" "$APT_BOOTSTRAP_SHA256"
@@ -1666,6 +1671,8 @@ jobs:
           AUDIT_RELEASE_ID: ${{ needs.control.outputs.audit_release_id }}
           OPERATION: ${{ needs.control.outputs.operation }}
           TARGET_VERSION: ${{ needs.control.outputs.target_version }}
+          REPO_SHA256: ${{ needs.pages_artifact.outputs.repo_sha256 }}
+          BOOTSTRAP_MANIFEST_SHA256: ${{ needs.pages_artifact.outputs.bootstrap_manifest_sha256 }}
         run: |
           set -euo pipefail
           snapshot="$RUNNER_TEMP/public-snapshot/snapshot.json"
@@ -1685,13 +1692,23 @@ jobs:
             --argjson id "$AUDIT_RELEASE_ID" \
             --arg control "$GITHUB_SHA" \
             --arg snapshot "$snapshot_sha256" \
+            --arg repo "$REPO_SHA256" \
+            --arg bootstrap "$BOOTSTRAP_MANIFEST_SHA256" \
             --arg operation "$OPERATION" \
             --arg target "$TARGET_VERSION" \
-            '.schema == "wukongim/production-package-client-validation/v3" and
+            '.schema == "wukongim/production-package-client-validation/v4" and
              .mode == "remote" and .audit_release_id == $id and
              .control_sha == $control and .snapshot_sha256 == $snapshot and
              .snapshot_verified == true and .status_revalidated == true and
              .bootstrap_verified == true and .bootstrap != null and
+             .repository_entrypoint_executed == true and
+             (.entrypoint_execution | keys) == ["apt", "rpm"] and
+             all(.entrypoint_execution[];
+               .executions == 2 and .idempotent == true and .product_absent == true) and
+             .bootstrap.repository_entrypoint.path == "repo" and
+             .bootstrap.repository_entrypoint.sha256 == $repo and
+             .bootstrap.manifest_sha256 == $bootstrap and
+             (.bootstrap.repository_entrypoint.size > 0) and
              (.apt | length) == 2 and (.rpm | length) == 2 and
              all((.apt[], .rpm[]); .bootstrap_installed == true) and
              (if ($operation == "add_release" or $operation == "update_bootstrap") then
