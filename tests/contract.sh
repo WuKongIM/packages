@@ -671,6 +671,13 @@ grep -Fq 'fetch_and_check bootstrap/manifest.json "$BOOTSTRAP_MANIFEST_SHA256"' 
 grep -Fq 'repo_sha256: ${{ steps.live.outputs.repo_sha256 }}' "$PUBLISH_WORKFLOW"
 grep -Fq 'echo "repo_sha256=$(sha256sum "$site/repo" | cut -d'"'"' '"'"' -f1)"' "$PUBLISH_WORKFLOW"
 grep -Fq 'fetch_and_check repo "$REPO_SHA256"' "$PUBLISH_WORKFLOW"
+grep -Fq 'local relative="$1"' "$PUBLISH_WORKFLOW"
+grep -Fq 'local expected="$2"' "$PUBLISH_WORKFLOW"
+grep -Fq 'local output="$RUNNER_TEMP/public-$(basename "$relative")"' "$PUBLISH_WORKFLOW"
+if grep -Fq 'local relative="$1" expected="$2" output=' "$PUBLISH_WORKFLOW"; then
+  echo 'publisher public-byte verifier must not reference a local in its declaring command' >&2
+  exit 1
+fi
 grep -Fq '.repository_entrypoint_executed == true' "$PUBLISH_WORKFLOW"
 grep -Fq '(.entrypoint_execution | keys) == ["apt", "rpm"]' "$PUBLISH_WORKFLOW"
 grep -Fq -- '--arg repo "$REPO_SHA256"' "$PUBLISH_WORKFLOW"
