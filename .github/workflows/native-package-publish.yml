@@ -1640,7 +1640,9 @@ jobs:
         run: |
           set -euo pipefail
           fetch_and_check() {
-            local relative="$1" expected="$2" output="$RUNNER_TEMP/public-$(basename "$relative")"
+            local relative="$1"
+            local expected="$2"
+            local output="$RUNNER_TEMP/public-$(basename "$relative")"
             for attempt in {1..10}; do
               if curl --proto '=https' --tlsv1.2 --fail --silent --show-error \
                 --max-time 30 --max-filesize 16777216 \
