@@ -26,6 +26,7 @@ CHANNELS_SCHEMA = "wukongim.native_package_channels/v3"
 SIGNING_SCHEMA = "wukongim.native_package_signing/v3"
 PLAN_SCHEMA = "wukongim.native_package_publication_plan/v1"
 INVENTORY_SCHEMA = "wukongim.native_package_payload_inventory/v1"
+BOOTSTRAP_INVENTORY_SCHEMA = "wukongim.native_package_bootstrap_inventory/v1"
 SIGNING_RECEIPT_SCHEMA = "wukongim/package-family-signing-receipt/v1"
 SNAPSHOT_SCHEMA = "wukongim.native_package_snapshot/v3"
 COMPOSITION_SCHEMA = "wukongim.native_package_site_composition/v1"
@@ -51,6 +52,9 @@ VERSION_RE = re.compile(
     r"(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)"
     r"(?:\.(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*$"
 )
+RELEASE_VERSION_RE = re.compile(
+    r"^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$"
+)
 SAFE_COMPONENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+~-]{0,254}$")
 
 CHANNEL_FIELDS = {
@@ -75,6 +79,11 @@ INVENTORY_FIELDS = {
 }
 INVENTORY_ENTRY_FIELDS = {
     "version", "path", "source_sha256", "published_sha256", "indexed", "new",
+}
+BOOTSTRAP_INVENTORY_FIELDS = {"schema", "version", "packages"}
+BOOTSTRAP_PACKAGE_FIELDS = {
+    "name", "version", "architecture", "filename", "repository_path", "download_path",
+    "source_sha256", "source_size", "published_sha256", "published_size", "new",
 }
 SNAPSHOT_ENTRY_FIELDS = {
     "version", "path", "source_sha256", "published_sha256", "indexed",
@@ -390,13 +399,16 @@ def validate_channels(value: Any) -> dict[str, Any]:
                 and retirement["not_before"] == retained_releases[0]["not_before"],
                 "indexes_removed retirement differs from the retained release")
     publication = exact(preview["publication"], PUBLICATION_FIELDS, "preview publication")
-    require(publication["operation"] in {"add_release", "remove_indexes", "remove_payloads"},
+    require(publication["operation"] in {
+        "add_release", "update_bootstrap", "remove_indexes", "remove_payloads",
+    },
             "composer requires a concrete publication operation")
-    require(
-        (publication["operation"] == "remove_indexes")
-        == (retirement["phase"] == "indexes_removed"),
-        "reviewed retirement phase differs from the publication operation",
-    )
+    if publication["operation"] == "remove_indexes":
+        require(retirement["phase"] == "indexes_removed",
+                "reviewed retirement phase differs from the publication operation")
+    elif publication["operation"] != "update_bootstrap":
+        require(retirement["phase"] == "none",
+                "reviewed retirement phase differs from the publication operation")
     return {"manifest": channels, "preview": preview, "releases": releases,
             "retirement": retirement, "publication": publication}
 
@@ -622,6 +634,10 @@ def validate_plan(value: Any, control: dict[str, Any]) -> dict[str, Any]:
     if operation == "add_release":
         require(new == [target] and removed == [] and plan["not_before"] is None,
                 "add_release plan has an invalid version transition")
+    elif operation == "update_bootstrap":
+        require(new == [] and removed == [] and target in active
+                and plan["not_before"] is None,
+                "update_bootstrap plan has an invalid version transition")
     elif operation == "remove_indexes":
         require(new == [] and removed == [] and target in retained,
                 "remove_indexes plan has an invalid version transition")
@@ -692,6 +708,127 @@ def validate_inventory(
                 f"payload inventory {family} does not close over reviewed versions")
         result[family] = versions
     return result
+
+
+def expected_bootstrap_package(family: str, version: str) -> dict[str, str]:
+    if family == "apt":
+        filename = f"wukongim-archive-keyring_{version}_all.deb"
+        return {
+            "name": "wukongim-archive-keyring",
+            "architecture": "all",
+            "filename": filename,
+            "repository_path": f"apt/pool/main/w/wukongim/{filename}",
+            "download_path": f"bootstrap/{filename}",
+        }
+    require(family == "rpm", "bootstrap package family is unsupported")
+    filename = f"wukongim-release-{version}-1.noarch.rpm"
+    return {
+        "name": "wukongim-release",
+        "architecture": "noarch",
+        "filename": filename,
+        "repository_path": f"rpm/preview/el/9/x86_64/Packages/{filename}",
+        "download_path": f"bootstrap/{filename}",
+    }
+
+
+def release_version_order(version: str) -> tuple[int, int, int]:
+    require(RELEASE_VERSION_RE.fullmatch(version) is not None,
+            "bootstrap package version must be strict release SemVer")
+    major, minor, patch = version.split(".")
+    return int(major), int(minor), int(patch)
+
+
+def validate_bootstrap_inventory(
+    value: Any, *, prepared: bool, label: str = "bootstrap inventory"
+) -> dict[str, Any]:
+    inventory = exact(value, BOOTSTRAP_INVENTORY_FIELDS, label)
+    require(inventory["schema"] == BOOTSTRAP_INVENTORY_SCHEMA,
+            f"{label} schema must be {BOOTSTRAP_INVENTORY_SCHEMA}")
+    version = inventory["version"]
+    require(isinstance(version, str) and RELEASE_VERSION_RE.fullmatch(version),
+            f"{label} version must be strict release SemVer")
+    packages = exact(inventory["packages"], {"apt", "rpm"}, f"{label} packages")
+    validated: dict[str, dict[str, Any]] = {}
+    for family in ("apt", "rpm"):
+        item = exact(packages[family], BOOTSTRAP_PACKAGE_FIELDS,
+                     f"{label} {family} package")
+        expected = expected_bootstrap_package(family, version)
+        require(item["version"] == version,
+                f"{label} {family} package version differs from the inventory version")
+        for field, expected_value in expected.items():
+            require(item[field] == expected_value,
+                    f"{label} {family} package {field} must be {expected_value}")
+        safe_relative(item["repository_path"], f"{label} {family} repository path")
+        safe_relative(item["download_path"], f"{label} {family} download path")
+        for field in ("source_sha256", "published_sha256"):
+            require(isinstance(item[field], str) and SHA256_RE.fullmatch(item[field]),
+                    f"{label} {family} {field} is invalid")
+        for field in ("source_size", "published_size"):
+            positive_integer(item[field], f"{label} {family} {field}")
+        require(type(item["new"]) is bool, f"{label} {family} new must be boolean")
+        if family == "apt":
+            require((item["published_sha256"], item["published_size"])
+                    == (item["source_sha256"], item["source_size"]),
+                    "APT bootstrap package bytes must remain unchanged")
+        elif prepared and item["new"]:
+            require((item["published_sha256"], item["published_size"])
+                    == (item["source_sha256"], item["source_size"]),
+                    "new RPM bootstrap inventory must describe unsigned source bytes")
+        validated[family] = dict(item)
+    return {"schema": inventory["schema"], "version": version, "packages": validated}
+
+
+def validate_bootstrap_transition(
+    base_site: Path | None, plan: dict[str, Any], current: dict[str, Any]
+) -> dict[str, Any] | None:
+    if base_site is None:
+        require(all(item["new"] for item in current["packages"].values()),
+                "first publication bootstrap packages must both be new")
+        return None
+    manifest_path = base_site / "bootstrap/manifest.json"
+    if not os.path.lexists(manifest_path):
+        require(plan["operation"] == "update_bootstrap",
+                "a base without bootstrap packages requires update_bootstrap")
+        require(all(item["new"] for item in current["packages"].values()),
+                "initial bootstrap packages must both be new")
+        return None
+    base = validate_bootstrap_inventory(
+        load_json(manifest_path, "base bootstrap manifest", canonical=True),
+        prepared=False,
+        label="base bootstrap manifest",
+    )
+    for family, item in base["packages"].items():
+        facts = {"sha256": item["published_sha256"], "size": item["published_size"]}
+        for field in ("repository_path", "download_path"):
+            require(hash_file(base_site / item[field], f"base bootstrap {family} {field}") == facts,
+                    f"base bootstrap {family} {field} differs from its manifest")
+    changed = current["version"] != base["version"]
+    if changed:
+        require(
+            release_version_order(current["version"])
+            > release_version_order(base["version"]),
+            "bootstrap package version must increase",
+        )
+        require(all(item["new"] for item in current["packages"].values()),
+                "changed bootstrap packages must both be new")
+    else:
+        for family in ("apt", "rpm"):
+            item = current["packages"][family]
+            previous = base["packages"][family]
+            require((item["source_sha256"], item["source_size"])
+                    == (previous["source_sha256"], previous["source_size"]),
+                    f"bootstrap {family} source changed without a version bump")
+            require(item["new"] is False,
+                    f"unchanged bootstrap {family} package must be preserved")
+            require((item["published_sha256"], item["published_size"])
+                    == (previous["published_sha256"], previous["published_size"]),
+                    f"preserved bootstrap {family} package differs from the base")
+    if plan["operation"] == "update_bootstrap":
+        require(changed, "update_bootstrap must change the bootstrap package version")
+    else:
+        require(not changed,
+                "bootstrap package version changes require update_bootstrap")
+    return base
 
 
 def validate_snapshot_entry(raw: Any, family: str, index: int) -> dict[str, Any]:
@@ -911,6 +1048,11 @@ def load_base(
                 "base inventory does not match the add_release transition")
         require(base_retirement == {"phase": "none", "version": None, "not_before": None},
                 "add_release base must not have a retirement in progress")
+    elif plan["operation"] == "update_bootstrap":
+        require(base_versions == current_versions,
+                "base inventory does not match the update_bootstrap transition")
+        require(base_retirement == control["retirement"],
+                "update_bootstrap must not change retirement state")
     elif plan["operation"] == "remove_indexes":
         require(base_versions == current_versions and target in base_versions,
                 "base inventory does not match the remove_indexes transition")
@@ -929,6 +1071,9 @@ def load_base(
         for version in base_releases:
             require(base_releases[version] == current_releases[version],
                     f"add_release changed existing release {version}")
+    elif plan["operation"] == "update_bootstrap":
+        require(base_releases == current_releases,
+                "update_bootstrap must not change product releases")
     elif plan["operation"] == "remove_indexes":
         require(set(base_releases) == set(current_releases),
                 "base releases do not match the remove_indexes transition")
@@ -1140,6 +1285,7 @@ def validate_apt_tree(
     root: Path,
     receipt_path: Path,
     inventory: dict[str, dict[str, Any]],
+    bootstrap: dict[str, Any],
     active_versions: list[str],
     retained_versions: list[str],
 ) -> tuple[dict[str, dict[str, Any]], dict[str, Path], dict[str, Any]]:
@@ -1184,6 +1330,9 @@ def validate_apt_tree(
         : files[PurePosixPath(inventory[version]["path"]).relative_to("apt").as_posix()]
         for version in active_versions
     }
+    bootstrap_relative = PurePosixPath(bootstrap["repository_path"]).relative_to("apt").as_posix()
+    require(bootstrap_relative in files, "APT signer tree is missing the bootstrap package")
+    active_payloads[bootstrap_relative] = files[bootstrap_relative]
     retained_paths = {
         PurePosixPath(inventory[version]["path"]).relative_to("apt").as_posix()
         for version in retained_versions
@@ -1219,6 +1368,7 @@ def validate_apt_tree(
         PurePosixPath(item["path"]).relative_to("apt").as_posix()
         for item in inventory.values()
     }
+    payload_paths.add(bootstrap_relative)
     expected_files = payload_paths | set(expected_receipt_paths.values()) | {
         packages_path, compressed_path,
     } | by_hash_paths
@@ -1227,6 +1377,9 @@ def validate_apt_tree(
         relative = PurePosixPath(item["path"]).relative_to("apt").as_posix()
         require(files[relative]["sha256"] == item["published_sha256"],
                 f"APT signer payload digest differs from inventory for {version}")
+    require(files[bootstrap_relative] == {
+        "sha256": bootstrap["published_sha256"], "size": bootstrap["published_size"],
+    }, "APT signer bootstrap package differs from inventory")
     sources = {relative: root / relative for relative in expected_files}
     return files, sources, receipt["key"]
 
@@ -1420,6 +1573,7 @@ def validate_rpm_tree(
     root: Path,
     receipt_path: Path,
     inventory: dict[str, dict[str, Any]],
+    bootstrap: dict[str, Any],
     active_versions: list[str],
     retained_versions: list[str],
 ) -> tuple[dict[str, dict[str, Any]], dict[str, Path], dict[str, Any]]:
@@ -1439,15 +1593,27 @@ def validate_rpm_tree(
         )
     }
     expected_relative = {
-        version: PurePosixPath(item["path"]).relative_to(
+        f"product:{version}": PurePosixPath(item["path"]).relative_to(
             PurePosixPath("rpm") / repository
         ).as_posix()
         for version, item in inventory.items()
     }
-    expected_new = {expected_relative[version] for version, item in inventory.items() if item["new"]}
+    expected_relative["bootstrap"] = PurePosixPath(bootstrap["repository_path"]).relative_to(
+        PurePosixPath("rpm") / repository
+    ).as_posix()
+    expected_new = {
+        expected_relative[f"product:{version}"]
+        for version, item in inventory.items() if item["new"]
+    }
+    if bootstrap["new"]:
+        expected_new.add(expected_relative["bootstrap"])
     expected_preserved = set(expected_relative.values()) - expected_new
-    expected_active = {expected_relative[version] for version in active_versions}
-    expected_retired = {expected_relative[version] for version in retained_versions}
+    expected_active = {
+        expected_relative[f"product:{version}"] for version in active_versions
+    } | {expected_relative["bootstrap"]}
+    expected_retired = {
+        expected_relative[f"product:{version}"] for version in retained_versions
+    }
     require(set(categories["newly_signed"]) == expected_new,
             "RPM newly-signed receipt differs from new inventory payloads")
     require(set(categories["new_unsigned_inputs"]) == expected_new,
@@ -1462,7 +1628,7 @@ def validate_rpm_tree(
     require(set(all_payloads) == expected_active | expected_retired,
             "RPM signing receipt does not close over exact payloads")
     for version, item in inventory.items():
-        relative = expected_relative[version]
+        relative = expected_relative[f"product:{version}"]
         if item["new"]:
             require(categories["new_unsigned_inputs"][relative]["sha256"]
                     == item["source_sha256"],
@@ -1472,6 +1638,21 @@ def validate_rpm_tree(
         else:
             require(all_payloads[relative]["sha256"] == item["published_sha256"],
                     f"preserved RPM digest differs from inventory for {version}")
+    bootstrap_relative = expected_relative["bootstrap"]
+    if bootstrap["new"]:
+        require(categories["new_unsigned_inputs"][bootstrap_relative] == {
+            "path": bootstrap_relative,
+            "sha256": bootstrap["source_sha256"],
+            "size": bootstrap["source_size"],
+        }, "new RPM bootstrap unsigned receipt differs from inventory")
+        require(all_payloads[bootstrap_relative]["sha256"] != bootstrap["source_sha256"],
+                "new RPM bootstrap package bytes were not changed by signing")
+    else:
+        require(all_payloads[bootstrap_relative] == {
+            "path": bootstrap_relative,
+            "sha256": bootstrap["published_sha256"],
+            "size": bootstrap["published_size"],
+        }, "preserved RPM bootstrap package differs from inventory")
     for name in ("active", "retired"):
         for relative, artifact in categories[name].items():
             require(relative in all_payloads and artifact == all_payloads[relative],
@@ -1577,13 +1758,20 @@ def compose(args: argparse.Namespace) -> dict[str, Any]:
     inventory = validate_inventory(
         load_json(args.inventory, "payload inventory", canonical=True), plan, control
     )
+    bootstrap_inventory = validate_bootstrap_inventory(
+        load_json(args.bootstrap_inventory, "bootstrap inventory", canonical=True),
+        prepared=True,
+    )
     _, base_site, base_entries = load_base(args.base_root, plan, inventory, control)
+    validate_bootstrap_transition(base_site, plan, bootstrap_inventory)
     apt_files, apt_sources, apt_key = validate_apt_tree(
         args.apt_tree, args.apt_receipt, inventory["apt"],
+        bootstrap_inventory["packages"]["apt"],
         plan["active_versions"], plan["retained_versions"],
     )
     rpm_files, rpm_sources, rpm_key = validate_rpm_tree(
         args.rpm_tree, args.rpm_receipt, inventory["rpm"],
+        bootstrap_inventory["packages"]["rpm"],
         plan["active_versions"], plan["retained_versions"],
     )
     require_reviewed_key_receipt(apt_key, reviewed_keys["apt"], "apt")
@@ -1673,6 +1861,39 @@ def compose(args: argparse.Namespace) -> dict[str, Any]:
                     "indexed": item["indexed"],
                 })
 
+        published_bootstrap = {
+            "schema": BOOTSTRAP_INVENTORY_SCHEMA,
+            "version": bootstrap_inventory["version"],
+            "packages": {},
+        }
+        for family, files in (("apt", apt_files), ("rpm", rpm_files)):
+            item = dict(bootstrap_inventory["packages"][family])
+            relative = PurePosixPath(item["repository_path"]).relative_to(family).as_posix()
+            facts = files[relative]
+            if family == "apt":
+                require(facts == {
+                    "sha256": item["source_sha256"], "size": item["source_size"],
+                }, "published APT bootstrap package differs from its source bytes")
+            elif not item["new"]:
+                require(facts == {
+                    "sha256": item["published_sha256"], "size": item["published_size"],
+                }, "preserved RPM bootstrap package differs from its inventory")
+            item["published_sha256"] = facts["sha256"]
+            item["published_size"] = facts["size"]
+            published_bootstrap["packages"][family] = item
+            repository_file = site.joinpath(*PurePosixPath(item["repository_path"]).parts)
+            copy_checked(
+                repository_file,
+                site.joinpath(*PurePosixPath(item["download_path"]).parts),
+                facts,
+                f"{family} bootstrap download",
+            )
+        write_exclusive(
+            site / "bootstrap/manifest.json",
+            canonical_json(published_bootstrap),
+            "bootstrap manifest",
+        )
+
         snapshot = {
             "schema": SNAPSHOT_SCHEMA,
             "audit_release_id": plan["audit_release_id"],
@@ -1716,7 +1937,7 @@ def compose(args: argparse.Namespace) -> dict[str, Any]:
             "<!doctype html>\n<meta charset=\"utf-8\">\n"
             "<title>WuKongIM Linux packages</title>\n"
             "<h1>WuKongIM Linux packages</h1>\n"
-            "<p>The signed preview APT and RPM repositories are ready.</p>\n"
+            "<p>The signed preview APT and RPM repositories and bootstrap packages are ready.</p>\n"
         ).encode("utf-8")
         write_exclusive(site / "index.html", index, "site index")
 
@@ -1760,6 +1981,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--signing-toolchain", required=True, type=Path)
     parser.add_argument("--plan", required=True, type=Path)
     parser.add_argument("--inventory", required=True, type=Path)
+    parser.add_argument("--bootstrap-inventory", required=True, type=Path)
     parser.add_argument("--apt-tree", required=True, type=Path)
     parser.add_argument("--apt-receipt", required=True, type=Path)
     parser.add_argument("--apt-public-cert", required=True, type=Path)

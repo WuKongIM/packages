@@ -33,6 +33,10 @@ RPM_NEXT = "F" * 40
 APT_HISTORICAL = "7" * 40
 APT_CERT = b"-----BEGIN PGP PUBLIC KEY BLOCK-----\nAPT-TEST-ONLY\n-----END PGP PUBLIC KEY BLOCK-----\n"
 RPM_CERT = b"-----BEGIN PGP PUBLIC KEY BLOCK-----\nRPM-TEST-ONLY\n-----END PGP PUBLIC KEY BLOCK-----\n"
+BOOTSTRAP_VERSION = "1.0.0"
+APT_BOOTSTRAP = b"apt-bootstrap-v1"
+RPM_BOOTSTRAP_UNSIGNED = b"unsigned-rpm-bootstrap-v1"
+RPM_BOOTSTRAP_SIGNED = b"signed-rpm-bootstrap-v1"
 V1 = "3.1.0-rc.1"
 V2 = "3.1.0-rc.2"
 REMOVED_AT = "2026-09-01T01:00:00Z"
@@ -103,6 +107,7 @@ class Fixture:
         self.rpm_public_cert = root / "rpm-preview.asc"
         self.plan = root / "plan.json"
         self.inventory = root / "inventory.json"
+        self.bootstrap_inventory = root / "bootstrap-inventory.json"
         self.apt_tree = root / "apt-tree"
         self.apt_receipt = root / "apt-receipt.json"
         self.rpm_tree = root / "rpm-tree"
@@ -141,6 +146,47 @@ class Fixture:
             "digest": "sha256:" + "8" * 64,
             "workflow_sha": "9" * 40,
         }, indent=2) + "\n", encoding="utf-8")
+        self.write_bootstrap_inventory(new=True)
+
+    def write_bootstrap_inventory(
+        self,
+        *,
+        new: bool,
+        version: str = BOOTSTRAP_VERSION,
+        apt_source: bytes = APT_BOOTSTRAP,
+        rpm_source: bytes = RPM_BOOTSTRAP_UNSIGNED,
+        rpm_published: bytes = RPM_BOOTSTRAP_SIGNED,
+    ) -> None:
+        self.apt_bootstrap = apt_source
+        self.rpm_bootstrap_source = rpm_source
+        self.rpm_bootstrap_published = rpm_published
+        packages = {}
+        for family, source, published in (
+            ("apt", apt_source, apt_source),
+            (
+                "rpm",
+                rpm_source,
+                rpm_source if new else rpm_published,
+            ),
+        ):
+            fixed = composer.expected_bootstrap_package(family, version)
+            packages[family] = {
+                **fixed,
+                "version": version,
+                "source_sha256": digest(source),
+                "source_size": len(source),
+                "published_sha256": digest(published),
+                "published_size": len(published),
+                "new": new,
+            }
+        self.bootstrap_inventory.write_bytes(canonical({
+            "schema": composer.BOOTSTRAP_INVENTORY_SCHEMA,
+            "version": version,
+            "packages": packages,
+        }))
+
+    def bootstrap(self, family: str) -> dict[str, Any]:
+        return json.loads(self.bootstrap_inventory.read_text())["packages"][family]
 
     def write_source_attestations(self, item: dict[str, Any]) -> None:
         self.source_attestations = self.root / "source-attestations"
@@ -292,6 +338,11 @@ class Fixture:
             path = self.apt_tree / composer.expected_payload_path("apt", version).removeprefix("apt/")
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(data)
+        bootstrap = self.bootstrap("apt")
+        bootstrap_relative = bootstrap["repository_path"].removeprefix("apt/")
+        bootstrap_path = self.apt_tree / bootstrap_relative
+        bootstrap_path.parent.mkdir(parents=True, exist_ok=True)
+        bootstrap_path.write_bytes(self.apt_bootstrap)
         packages = b""
         for version in indexed:
             relative = composer.expected_payload_path("apt", version).removeprefix("apt/")
@@ -300,6 +351,11 @@ class Fixture:
                 f"Package: wukongim\nVersion: {version}\nFilename: {relative}\n"
                 f"Size: {len(payload)}\nSHA256: {digest(payload)}\n\n"
             ).encode()
+        packages += (
+            f"Package: {bootstrap['name']}\nVersion: {bootstrap['version']}\n"
+            f"Filename: {bootstrap_relative}\nSize: {len(self.apt_bootstrap)}\n"
+            f"SHA256: {digest(self.apt_bootstrap)}\n\n"
+        ).encode()
         binary = self.apt_tree / "dists/preview/main/binary-amd64"
         binary.mkdir(parents=True, exist_ok=True)
         packages_path = binary / "Packages"
@@ -355,9 +411,17 @@ class Fixture:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(data)
             package_artifacts[relative] = artifact(path, relative)
+        bootstrap = self.bootstrap("rpm")
+        bootstrap_relative = Path(bootstrap["repository_path"]).relative_to(
+            Path("rpm") / repository
+        ).as_posix()
+        bootstrap_path = repo / bootstrap_relative
+        bootstrap_path.parent.mkdir(parents=True, exist_ok=True)
+        bootstrap_path.write_bytes(self.rpm_bootstrap_published)
+        package_artifacts[bootstrap_relative] = artifact(bootstrap_path, bootstrap_relative)
         primary = (
             '<metadata packages="{}">{}</metadata>\n'.format(
-                len(indexed),
+                len(indexed) + 1,
                 "".join(
                     '<package type="rpm">'
                     f'<checksum type="sha256" pkgid="YES">{digest(payloads[version])}</checksum>'
@@ -365,7 +429,12 @@ class Fixture:
                     f'<location href="{Path(composer.expected_payload_path("rpm", version)).relative_to(Path("rpm") / repository).as_posix()}"/>'
                     '</package>'
                     for version in indexed
-                ),
+                )
+                + '<package type="rpm">'
+                f'<checksum type="sha256" pkgid="YES">{digest(self.rpm_bootstrap_published)}</checksum>'
+                f'<size package="{len(self.rpm_bootstrap_published)}"/>'
+                f'<location href="{bootstrap_relative}"/>'
+                '</package>',
             )
         ).encode()
         repodata = repo / "repodata"
@@ -402,13 +471,15 @@ class Fixture:
                 Path("rpm") / repository
             ).as_posix()
             for version in active
-        }
+        } | {bootstrap_relative}
         new_paths = {
             Path(composer.expected_payload_path("rpm", version)).relative_to(
                 Path("rpm") / repository
             ).as_posix()
             for version in new
         }
+        if bootstrap["new"]:
+            new_paths.add(bootstrap_relative)
         unsigned_payloads = unsigned_payloads or {}
         unsigned_artifacts = {
             Path(composer.expected_payload_path("rpm", version)).relative_to(
@@ -422,6 +493,12 @@ class Fixture:
             }
             for version in new
         }
+        if bootstrap["new"]:
+            unsigned_artifacts[bootstrap_relative] = {
+                "path": bootstrap_relative,
+                "sha256": digest(self.rpm_bootstrap_source),
+                "size": len(self.rpm_bootstrap_source),
+            }
         result = {
             "active": [package_artifacts[path] for path in sorted(active_paths)],
             "new_unsigned_inputs": [
@@ -470,6 +547,20 @@ class Fixture:
                     "published_sha256": digest(payloads[family][version]),
                     "indexed": indexed[version],
                 })
+        bootstrap_manifest = json.loads(self.bootstrap_inventory.read_text())
+        for family, data in (
+            ("apt", self.apt_bootstrap), ("rpm", self.rpm_bootstrap_published)
+        ):
+            item = bootstrap_manifest["packages"][family]
+            item["published_sha256"] = digest(data)
+            item["published_size"] = len(data)
+            repository = site / item["repository_path"]
+            repository.parent.mkdir(parents=True, exist_ok=True)
+            repository.write_bytes(data)
+            direct = site / item["download_path"]
+            direct.parent.mkdir(parents=True, exist_ok=True)
+            direct.write_bytes(data)
+        (site / "bootstrap/manifest.json").write_bytes(canonical(bootstrap_manifest))
         snapshot = {
             "schema": composer.SNAPSHOT_SCHEMA,
             "audit_release_id": audit_id,
@@ -520,6 +611,7 @@ class Fixture:
             source_attestations=self.source_attestations,
             plan=self.plan,
             inventory=self.inventory,
+            bootstrap_inventory=self.bootstrap_inventory,
             apt_tree=self.apt_tree,
             apt_receipt=self.apt_receipt,
             apt_public_cert=self.apt_public_cert,
@@ -560,6 +652,7 @@ class ComposePackageSiteTest(unittest.TestCase):
 
     def phase_one(self) -> tuple[Fixture, TemporaryDirectory[str]]:
         fixture, temporary = self.fixture()
+        fixture.write_bootstrap_inventory(new=False)
         deb = {V1: b"deb-v1", V2: b"deb-v2"}
         unsigned = {V1: b"unsigned-rpm-v1", V2: b"unsigned-rpm-v2"}
         signed = {V1: b"signed-rpm-v1", V2: b"signed-rpm-v2"}
@@ -587,6 +680,7 @@ class ComposePackageSiteTest(unittest.TestCase):
 
     def phase_two(self) -> tuple[Fixture, TemporaryDirectory[str]]:
         fixture, temporary = self.fixture()
+        fixture.write_bootstrap_inventory(new=False)
         deb = {V1: b"deb-v1", V2: b"deb-v2"}
         unsigned = {V1: b"unsigned-rpm-v1", V2: b"unsigned-rpm-v2"}
         signed = {V1: b"signed-rpm-v1", V2: b"signed-rpm-v2"}
@@ -664,6 +758,14 @@ class ComposePackageSiteTest(unittest.TestCase):
         self.assertEqual(b"signed-rpm-v1", (
             fixture.output / "site" / composer.expected_payload_path("rpm", V1)
         ).read_bytes())
+        bootstrap = json.loads((fixture.output / "site/bootstrap/manifest.json").read_text())
+        self.assertEqual(BOOTSTRAP_VERSION, bootstrap["version"])
+        for family, expected in (("apt", APT_BOOTSTRAP), ("rpm", RPM_BOOTSTRAP_SIGNED)):
+            package = bootstrap["packages"][family]
+            self.assertEqual(expected, (fixture.output / "site" / package["repository_path"]).read_bytes())
+            self.assertEqual(expected, (fixture.output / "site" / package["download_path"]).read_bytes())
+            self.assertEqual(digest(expected), package["published_sha256"])
+            self.assertEqual(len(expected), package["published_size"])
 
     def test_fails_closed_when_output_root_export_mode_cannot_be_set(self) -> None:
         fixture, temporary = self.first_release()
@@ -720,6 +822,7 @@ class ComposePackageSiteTest(unittest.TestCase):
                 "--source-attestations", str(fixture.source_attestations),
                 "--plan", str(fixture.plan),
                 "--inventory", str(fixture.inventory),
+                "--bootstrap-inventory", str(fixture.bootstrap_inventory),
                 "--apt-tree", str(fixture.apt_tree),
                 "--apt-receipt", str(fixture.apt_receipt),
                 "--apt-public-cert", str(fixture.apt_public_cert),
@@ -753,6 +856,94 @@ class ComposePackageSiteTest(unittest.TestCase):
         self.assertFalse(snapshot["payloads"]["apt"][0]["indexed"])
         self.assertIsNone(snapshot["source_attestations"])
         self.assertFalse((fixture.output / "audit/source-attestations").exists())
+
+    def test_update_bootstrap_changes_only_bootstrap_packages(self) -> None:
+        fixture, temporary = self.fixture()
+        self.addCleanup(temporary.cleanup)
+        deb = b"deb-v1"
+        signed_rpm = b"signed-rpm-v1"
+        item = release(V1, deb, b"unsigned-rpm-v1", source_release_id=101, package_release_id=10)
+        fixture.write_inventory(
+            {V1: item}, {"apt": {V1: deb}, "rpm": {V1: signed_rpm}},
+            audit_id=20, active=[V1], retained=[], new=[],
+        )
+        fixture.write_base(
+            10, [item], {"apt": {V1: deb}, "rpm": {V1: signed_rpm}},
+            {V1: True}, {"phase": "none", "version": None, "not_before": None},
+        )
+        fixture.write_control(
+            [item], operation="update_bootstrap", audit_id=20, base_id=10, target=V1,
+            active=[V1], retained=[], new=[], removed=[], not_before=None,
+        )
+        new_apt = b"apt-bootstrap-v2"
+        new_rpm_source = b"unsigned-rpm-bootstrap-v2"
+        new_rpm_signed = b"signed-rpm-bootstrap-v2"
+        fixture.write_bootstrap_inventory(
+            new=True,
+            version="1.1.0",
+            apt_source=new_apt,
+            rpm_source=new_rpm_source,
+            rpm_published=new_rpm_signed,
+        )
+        fixture.write_apt({V1: deb}, [V1])
+        fixture.write_rpm(
+            {V1: signed_rpm}, [V1], [], unsigned_payloads={}
+        )
+
+        composer.compose(fixture.args())
+
+        snapshot = json.loads((fixture.output / "audit/snapshot.json").read_text())
+        self.assertEqual([item], snapshot["releases"])
+        bootstrap = json.loads((fixture.output / "site/bootstrap/manifest.json").read_text())
+        self.assertEqual("1.1.0", bootstrap["version"])
+        self.assertEqual(digest(new_apt), bootstrap["packages"]["apt"]["published_sha256"])
+        self.assertEqual(digest(new_rpm_signed), bootstrap["packages"]["rpm"]["published_sha256"])
+
+    def test_rejects_bootstrap_source_change_without_version_bump(self) -> None:
+        fixture, temporary = self.phase_one()
+        self.addCleanup(temporary.cleanup)
+        fixture.write_bootstrap_inventory(
+            new=True,
+            apt_source=b"changed-apt-bootstrap",
+            rpm_source=b"changed-rpm-bootstrap",
+            rpm_published=b"signed-changed-rpm-bootstrap",
+        )
+        fixture.write_apt({V1: b"deb-v1", V2: b"deb-v2"}, [V2])
+        fixture.write_rpm(
+            {V1: b"signed-rpm-v1", V2: b"signed-rpm-v2"}, [V2], []
+        )
+
+        with self.assertRaisesRegex(composer.CompositionError, "without a version bump"):
+            composer.compose(fixture.args())
+
+    def test_rejects_bootstrap_version_downgrade(self) -> None:
+        fixture, temporary = self.phase_one()
+        self.addCleanup(temporary.cleanup)
+        assert fixture.base is not None
+        fixture.write_bootstrap_inventory(
+            new=True,
+            version="0.9.0",
+            apt_source=b"downgraded-apt-bootstrap",
+            rpm_source=b"downgraded-rpm-bootstrap",
+            rpm_published=b"signed-downgraded-rpm-bootstrap",
+        )
+        current = composer.validate_bootstrap_inventory(
+            composer.load_json(
+                fixture.bootstrap_inventory,
+                "bootstrap inventory",
+                canonical=True,
+            ),
+            prepared=True,
+        )
+
+        with self.assertRaisesRegex(
+            composer.CompositionError, "bootstrap package version must increase"
+        ):
+            composer.validate_bootstrap_transition(
+                fixture.base / "site",
+                {"operation": "update_bootstrap"},
+                current,
+            )
 
     def test_remove_payloads_drops_only_previously_retained_bytes(self) -> None:
         fixture, temporary = self.phase_two()

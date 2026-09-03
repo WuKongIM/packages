@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare unsigned active indexes while preserving reviewed retired payload bytes."""
+"""Prepare active package indexes while preserving reviewed signed payload bytes."""
 
 from __future__ import annotations
 
@@ -22,12 +22,34 @@ from typing import Any
 PLAN_SCHEMA = "wukongim.native_package_publication_plan/v1"
 SNAPSHOT_SCHEMA = "wukongim.native_package_snapshot/v3"
 INVENTORY_SCHEMA = "wukongim.native_package_payload_inventory/v1"
+BOOTSTRAP_MANIFEST_SCHEMA = "wukongim.native_package_bootstrap/v1"
+BOOTSTRAP_INVENTORY_SCHEMA = "wukongim.native_package_bootstrap_inventory/v1"
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 FINGERPRINT_RE = re.compile(r"^[0-9A-F]{40}$")
 OCI_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+RELEASE_VERSION_RE = re.compile(
+    r"^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$"
+)
 ASSET_RE = re.compile(r"^wukongim_[0-9A-Za-z.-]+_linux_amd64\.(deb|rpm)$")
 ENTRY_FIELDS = {"version", "path", "source_sha256", "published_sha256", "indexed"}
+BOOTSTRAP_MANIFEST_FIELDS = {"schema", "enabled", "version"}
+BOOTSTRAP_INVENTORY_FIELDS = {"schema", "version", "packages"}
+BOOTSTRAP_ENTRY_FIELDS = {
+    "name", "version", "architecture", "filename", "repository_path",
+    "download_path", "source_sha256", "source_size", "published_sha256",
+    "published_size", "new",
+}
+BOOTSTRAP_SPECS = {
+    "apt": {
+        "name": "wukongim-archive-keyring",
+        "architecture": "all",
+    },
+    "rpm": {
+        "name": "wukongim-release",
+        "architecture": "noarch",
+    },
+}
 SNAPSHOT_FIELDS = {
     "schema", "audit_release_id", "control_sha", "releases", "retirement",
     "payloads", "public_keys", "source_attestations", "toolchain",
@@ -67,6 +89,10 @@ def load_json(path: Path) -> Any:
         return json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=reject_duplicate_pairs)
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
         raise PreparationError(f"cannot read {path.name}: {error}") from error
+
+
+def canonical_json(value: object) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8") + b"\n"
 
 
 def exact_object(value: Any, fields: set[str], label: str) -> dict[str, Any]:
@@ -123,6 +149,119 @@ def validate_fingerprint(value: Any, label: str) -> str:
     require(isinstance(value, str) and FINGERPRINT_RE.fullmatch(value) is not None,
             f"{label} must be an uppercase 40-hex fingerprint")
     return value
+
+
+def expected_bootstrap_filename(family: str, version: str) -> str:
+    if family == "apt":
+        return f"wukongim-archive-keyring_{version}_all.deb"
+    return f"wukongim-release-{version}-1.noarch.rpm"
+
+
+def expected_bootstrap_repository_path(family: str, filename: str) -> str:
+    if family == "apt":
+        return f"apt/pool/main/w/wukongim/{filename}"
+    return f"rpm/preview/el/9/x86_64/Packages/{filename}"
+
+
+def release_version_order(version: str) -> tuple[int, int, int]:
+    require(RELEASE_VERSION_RE.fullmatch(version) is not None,
+            "bootstrap package version must be strict release SemVer")
+    major, minor, patch = version.split(".")
+    return int(major), int(minor), int(patch)
+
+
+def validate_bootstrap_inventory(
+    value: Any,
+    *,
+    label: str,
+    expected_version: str | None = None,
+    require_builder_state: bool = False,
+) -> dict[str, Any]:
+    inventory = exact_object(value, BOOTSTRAP_INVENTORY_FIELDS, label)
+    require(inventory["schema"] == BOOTSTRAP_INVENTORY_SCHEMA,
+            f"{label} schema must be {BOOTSTRAP_INVENTORY_SCHEMA}")
+    version = inventory["version"]
+    require(isinstance(version, str) and RELEASE_VERSION_RE.fullmatch(version) is not None,
+            f"{label} version must be strict release SemVer")
+    if expected_version is not None:
+        require(version == expected_version, f"{label} version differs from bootstrap manifest")
+    packages = exact_object(inventory["packages"], {"apt", "rpm"}, f"{label} packages")
+    for family in ("apt", "rpm"):
+        item = exact_object(packages[family], BOOTSTRAP_ENTRY_FIELDS,
+                            f"{label} {family} package")
+        spec = BOOTSTRAP_SPECS[family]
+        filename = expected_bootstrap_filename(family, version)
+        require(item["name"] == spec["name"],
+                f"{label} {family} package name is invalid")
+        require(item["version"] == version,
+                f"{label} {family} package version is invalid")
+        require(item["architecture"] == spec["architecture"],
+                f"{label} {family} package architecture is invalid")
+        require(item["filename"] == filename,
+                f"{label} {family} package filename is invalid")
+        require(item["repository_path"]
+                == expected_bootstrap_repository_path(family, filename),
+                f"{label} {family} repository_path is invalid")
+        require(item["download_path"] == f"bootstrap/{filename}",
+                f"{label} {family} download_path is invalid")
+        safe_relative(item["repository_path"], f"{label} {family} repository_path")
+        safe_relative(item["download_path"], f"{label} {family} download_path")
+        for field in ("source_sha256", "published_sha256"):
+            validate_sha256(item[field], f"{label} {family} {field}")
+        for field in ("source_size", "published_size"):
+            require(type(item[field]) is int and item[field] > 0,
+                    f"{label} {family} {field} must be positive")
+        require(type(item["new"]) is bool,
+                f"{label} {family} new must be boolean")
+        if family == "apt":
+            require(item["published_sha256"] == item["source_sha256"]
+                    and item["published_size"] == item["source_size"],
+                    f"{label} APT source and published bytes must match")
+        if require_builder_state:
+            require(item["published_sha256"] == item["source_sha256"]
+                    and item["published_size"] == item["source_size"]
+                    and item["new"] is True,
+                    f"{label} {family} package is not a new source package")
+    require(packages["apt"]["new"] == packages["rpm"]["new"],
+            f"{label} package new states must match")
+    return inventory
+
+
+def load_bootstrap_manifest(path: Path) -> dict[str, Any]:
+    checked_file(path, "bootstrap manifest")
+    manifest = exact_object(load_json(path), BOOTSTRAP_MANIFEST_FIELDS,
+                            "bootstrap manifest")
+    require(manifest["schema"] == BOOTSTRAP_MANIFEST_SCHEMA,
+            f"bootstrap manifest schema must be {BOOTSTRAP_MANIFEST_SCHEMA}")
+    require(manifest["enabled"] is True, "bootstrap manifest must be enabled")
+    require(isinstance(manifest["version"], str)
+            and RELEASE_VERSION_RE.fullmatch(manifest["version"]) is not None,
+            "bootstrap manifest version must be strict release SemVer")
+    return manifest
+
+
+def load_base_bootstrap(site: Path | None) -> dict[str, Any] | None:
+    if site is None:
+        return None
+    path = site / "bootstrap/manifest.json"
+    if not os.path.lexists(path):
+        return None
+    checked_file(path, "base bootstrap inventory")
+    inventory = validate_bootstrap_inventory(
+        load_json(path), label="base bootstrap inventory"
+    )
+    for family in ("apt", "rpm"):
+        item = inventory["packages"][family]
+        expected = {
+            "sha256": item["published_sha256"],
+            "size": item["published_size"],
+        }
+        for field in ("repository_path", "download_path"):
+            relative = safe_relative(item[field], f"base bootstrap {family} {field}")
+            require(file_facts(site.joinpath(*relative.parts),
+                               f"base bootstrap {family} {field}") == expected,
+                    f"base bootstrap {family} {field} differs from its inventory")
+    return inventory
 
 
 def validate_base_public_keys(snapshot: dict[str, Any], site: Path) -> None:
@@ -334,6 +473,58 @@ def copy_payload(source: Path, destination: Path, expected: str, label: str) -> 
     require(digest(destination) == expected, f"prepared {label} changed during copy")
 
 
+def build_bootstrap_packages(
+    args: argparse.Namespace,
+    output: Path,
+    manifest: dict[str, Any],
+) -> dict[str, Any]:
+    command = [
+        str(args.bootstrap_builder.resolve()),
+        "--manifest", str(args.bootstrap_manifest.resolve()),
+        "--apt-public-cert", str(args.apt_public_cert.resolve()),
+        "--rpm-public-cert", str(args.rpm_public_cert.resolve()),
+        "--output-dir", str(output),
+    ]
+    result = subprocess.run(command, check=False, capture_output=True)
+    require(result.returncode == 0, "trusted bootstrap package builder failed")
+    require(len(result.stdout) <= 4 * 1024 * 1024,
+            "trusted bootstrap package builder inventory is too large")
+    try:
+        value = json.loads(
+            result.stdout.decode("utf-8"), object_pairs_hook=reject_duplicate_pairs
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise PreparationError(
+            "trusted bootstrap package builder returned invalid inventory"
+        ) from error
+    require(result.stdout == canonical_json(value),
+            "trusted bootstrap package builder inventory is not canonical JSON")
+    inventory = validate_bootstrap_inventory(
+        value,
+        label="bootstrap builder inventory",
+        expected_version=manifest["version"],
+        require_builder_state=True,
+    )
+    try:
+        output_metadata = output.lstat()
+        entries = list(output.iterdir())
+    except OSError as error:
+        raise PreparationError("cannot inspect bootstrap package builder output") from error
+    require(stat.S_ISDIR(output_metadata.st_mode),
+            "bootstrap package builder output must be a real directory")
+    expected_names = {
+        inventory["packages"][family]["filename"] for family in ("apt", "rpm")
+    }
+    require({entry.name for entry in entries} == expected_names,
+            "bootstrap package builder output differs from its exact inventory")
+    for family in ("apt", "rpm"):
+        item = inventory["packages"][family]
+        require(file_facts(output / item["filename"], f"built bootstrap {family} package")
+                == {"sha256": item["source_sha256"], "size": item["source_size"]},
+                f"built bootstrap {family} package differs from its inventory")
+    return inventory
+
+
 def _remove_owned_file(path: Path, identity: tuple[int, int]) -> None:
     try:
         metadata = path.lstat()
@@ -436,6 +627,7 @@ def rename_directory_exclusive(source: Path, destination: Path) -> None:
 def prepare(args: argparse.Namespace) -> dict[str, Any]:
     channels = load_json(args.channels)
     plan = load_json(args.plan)
+    bootstrap_manifest = load_bootstrap_manifest(args.bootstrap_manifest)
     require(isinstance(channels, dict) and channels.get("schema") == "wukongim.native_package_channels/v3",
             "channels manifest must use schema v3")
     require(isinstance(plan, dict) and plan.get("schema") == PLAN_SCHEMA,
@@ -444,6 +636,7 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
     require(type(audit_id) is int and audit_id > 0, "publication plan has no audit Release")
     base_id = plan.get("base_audit_release_id")
     base_snapshot, base_site = load_base(args.base_root, base_id)
+    base_bootstrap = load_base_bootstrap(base_site)
     preview = channels.get("channels", {}).get("preview", {})
     releases = preview.get("releases")
     require(isinstance(releases, list), "preview releases must be an array")
@@ -465,13 +658,20 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
     require(not os.path.lexists(args.output), "output must not already exist or be a link")
     require(not os.path.lexists(args.inventory),
             "inventory output must not already exist or be a link")
+    require(not os.path.lexists(args.bootstrap_inventory),
+            "bootstrap inventory output must not already exist or be a link")
     output_absolute = Path(os.path.abspath(args.output))
     inventory_absolute = Path(os.path.abspath(args.inventory))
-    require(output_absolute != inventory_absolute,
+    bootstrap_inventory_absolute = Path(os.path.abspath(args.bootstrap_inventory))
+    require(len({output_absolute, inventory_absolute, bootstrap_inventory_absolute}) == 3,
             "repository and inventory outputs must differ")
-    require(not inventory_absolute.is_relative_to(output_absolute),
-            "inventory output must not be inside repository output")
+    for candidate in (inventory_absolute, bootstrap_inventory_absolute):
+        require(not candidate.is_relative_to(output_absolute),
+                "inventory output must not be inside repository output")
     checked_file(args.builder, "trusted repository builder")
+    checked_file(args.bootstrap_builder, "trusted bootstrap package builder")
+    checked_file(args.apt_public_cert, "APT public certificate")
+    checked_file(args.rpm_public_cert, "RPM public certificate")
     try:
         source_metadata = args.source_assets.lstat()
     except OSError as error:
@@ -482,20 +682,32 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.inventory.parent.mkdir(parents=True, exist_ok=True)
+    args.bootstrap_inventory.parent.mkdir(parents=True, exist_ok=True)
     for parent, label in (
         (args.output.parent, "output parent"),
         (args.inventory.parent, "inventory output parent"),
+        (args.bootstrap_inventory.parent, "bootstrap inventory output parent"),
     ):
         require(stat.S_ISDIR(parent.lstat().st_mode), f"{label} must be a real directory")
     output = args.output.parent.resolve(strict=True) / args.output.name
     inventory_output = args.inventory.parent.resolve(strict=True) / args.inventory.name
-    require(output != inventory_output, "repository and inventory outputs must differ")
+    bootstrap_inventory_output = (
+        args.bootstrap_inventory.parent.resolve(strict=True) / args.bootstrap_inventory.name
+    )
+    require(len({output, inventory_output, bootstrap_inventory_output}) == 3,
+            "repository and inventory outputs must differ")
+    for candidate in (inventory_output, bootstrap_inventory_output):
+        require(not candidate.is_relative_to(output),
+                "inventory output must not be inside repository output")
     require(not os.path.lexists(output), "output must not already exist or be a link")
     require(not os.path.lexists(inventory_output),
             "inventory output must not already exist or be a link")
+    require(not os.path.lexists(bootstrap_inventory_output),
+            "bootstrap inventory output must not already exist or be a link")
 
     output_identity: tuple[int, int] | None = None
     inventory_identity: tuple[int, int] | None = None
+    bootstrap_inventory_identity: tuple[int, int] | None = None
     try:
         with tempfile.TemporaryDirectory(prefix="wk-package-prepare-", dir=output.parent) as temporary:
             stage = Path(temporary)
@@ -548,6 +760,69 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
                         "new": is_new,
                     })
 
+            bootstrap_build = stage / "bootstrap-build"
+            built_bootstrap = build_bootstrap_packages(
+                args, bootstrap_build, bootstrap_manifest
+            )
+            if (
+                base_bootstrap is not None
+                and built_bootstrap["version"] != base_bootstrap["version"]
+            ):
+                require(
+                    release_version_order(built_bootstrap["version"])
+                    > release_version_order(base_bootstrap["version"]),
+                    "bootstrap package version must increase",
+                )
+            same_bootstrap_source = (
+                base_bootstrap is not None
+                and base_bootstrap["version"] == built_bootstrap["version"]
+                and all(
+                    base_bootstrap["packages"][family][field]
+                    == built_bootstrap["packages"][family][field]
+                    for family in ("apt", "rpm")
+                    for field in ("source_sha256", "source_size")
+                )
+            )
+            bootstrap_prepared = {
+                "schema": BOOTSTRAP_INVENTORY_SCHEMA,
+                "version": built_bootstrap["version"],
+                "packages": {},
+            }
+            for family in ("apt", "rpm"):
+                built_item = built_bootstrap["packages"][family]
+                source = bootstrap_build / built_item["filename"]
+                published_sha256 = built_item["source_sha256"]
+                published_size = built_item["source_size"]
+                if same_bootstrap_source:
+                    assert base_bootstrap is not None and base_site is not None
+                    base_item = base_bootstrap["packages"][family]
+                    published_sha256 = base_item["published_sha256"]
+                    published_size = base_item["published_size"]
+                    if family == "apt":
+                        require(
+                            file_facts(source, "rebuilt bootstrap APT package")
+                            == {"sha256": published_sha256, "size": published_size},
+                            "rebuilt bootstrap APT package differs from the base bytes",
+                        )
+                    else:
+                        relative = safe_relative(
+                            base_item["repository_path"],
+                            "base bootstrap RPM repository_path",
+                        )
+                        source = base_site.joinpath(*relative.parts)
+                copy_payload(
+                    source,
+                    active_packages / built_item["filename"],
+                    published_sha256,
+                    f"bootstrap {family} package",
+                )
+                bootstrap_prepared["packages"][family] = {
+                    **built_item,
+                    "published_sha256": published_sha256,
+                    "published_size": published_size,
+                    "new": not same_bootstrap_source,
+                }
+
             repository = stage / "repository"
             command = [
                 str(args.builder.resolve()),
@@ -573,6 +848,19 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
                         checked_file(destination, f"built {family} payload",
                                      entry["published_sha256"])
 
+            for family in ("apt", "rpm"):
+                entry = bootstrap_prepared["packages"][family]
+                repository_relative = safe_relative(
+                    entry["repository_path"], f"bootstrap {family} repository_path"
+                )
+                repository_package = repository.joinpath(*repository_relative.parts)
+                require(
+                    file_facts(repository_package, f"repository bootstrap {family} package")
+                    == {"sha256": entry["published_sha256"],
+                        "size": entry["published_size"]},
+                    f"repository bootstrap {family} package differs from its inventory",
+                )
+
             inventory = {
                 "schema": INVENTORY_SCHEMA,
                 "audit_release_id": audit_id,
@@ -583,10 +871,12 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
                     for family in ("apt", "rpm")
                 },
             }
-            inventory_raw = (
-                json.dumps(inventory, sort_keys=True, separators=(",", ":")) + "\n"
-            ).encode("utf-8")
+            inventory_raw = canonical_json(inventory)
+            bootstrap_inventory_raw = canonical_json(bootstrap_prepared)
             inventory_identity = write_inventory_exclusive(inventory_output, inventory_raw)
+            bootstrap_inventory_identity = write_inventory_exclusive(
+                bootstrap_inventory_output, bootstrap_inventory_raw
+            )
             require(not os.path.lexists(output), "output appeared during preparation")
             repository_metadata = repository.lstat()
             require(stat.S_ISDIR(repository_metadata.st_mode),
@@ -598,6 +888,10 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
             _remove_owned_tree(output, output_identity)
         if inventory_identity is not None:
             _remove_owned_file(inventory_output, inventory_identity)
+        if bootstrap_inventory_identity is not None:
+            _remove_owned_file(
+                bootstrap_inventory_output, bootstrap_inventory_identity
+            )
         raise
     return inventory
 
@@ -608,9 +902,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--plan", required=True, type=Path)
     parser.add_argument("--base-root", type=Path)
     parser.add_argument("--source-assets", required=True, type=Path)
+    parser.add_argument("--bootstrap-manifest", required=True, type=Path)
+    parser.add_argument("--apt-public-cert", required=True, type=Path)
+    parser.add_argument("--rpm-public-cert", required=True, type=Path)
+    parser.add_argument("--bootstrap-builder", required=True, type=Path)
     parser.add_argument("--builder", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--inventory", required=True, type=Path)
+    parser.add_argument("--bootstrap-inventory", required=True, type=Path)
     return parser
 
 

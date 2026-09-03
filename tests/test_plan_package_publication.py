@@ -37,12 +37,17 @@ def release(version: str, audit_id: int, state: str = "active", not_before=None)
     }
 
 
-def channels(operation: str, audit_id, base_id, target, releases):
+def channels(operation: str, audit_id, base_id, target, releases, *, retirement=None):
     return {
         "schema": MODULE.CHANNELS_SCHEMA,
         "channels": {
             "preview": {
                 "releases": releases,
+                "retirement": retirement or {
+                    "phase": "none",
+                    "version": None,
+                    "not_before": None,
+                },
                 "publication": {
                     "audit_release_id": audit_id,
                     "base_audit_release_id": base_id,
@@ -174,6 +179,92 @@ class PublicationPlanTests(unittest.TestCase):
         desired = channels("add_release", 20, 10, new["version"], [changed, new])
         with self.assertRaisesRegex(MODULE.PlanError, "changed existing"):
             MODULE.build_plan(desired, snapshot(10, [old]), SHA, datetime.now(timezone.utc))
+
+    def test_update_bootstrap_preserves_the_active_product_snapshot(self):
+        active = release("3.0.0-beta.6", 10)
+        desired = channels(
+            "update_bootstrap", 20, 10, active["version"], [active]
+        )
+
+        plan = MODULE.build_plan(
+            desired,
+            snapshot(10, [active]),
+            SHA,
+            datetime.now(timezone.utc),
+        )
+
+        self.assertEqual("update_bootstrap", plan["operation"])
+        self.assertEqual([active["version"]], plan["active_versions"])
+        self.assertEqual([], plan["retained_versions"])
+        self.assertEqual([], plan["new_versions"])
+        self.assertEqual([], plan["removed_versions"])
+        self.assertIsNone(plan["not_before"])
+
+    def test_update_bootstrap_requires_a_base_and_an_active_target(self):
+        active = release("3.0.0-beta.6", 10)
+        base = snapshot(10, [active])
+
+        without_base = channels(
+            "update_bootstrap", 20, None, active["version"], [active]
+        )
+        with self.assertRaisesRegex(MODULE.PlanError, "requires a base audit Release"):
+            MODULE.build_plan(without_base, base, SHA, datetime.now(timezone.utc))
+
+        retired = dict(
+            active,
+            state="index_removed",
+            not_before="2026-10-01T00:30:00Z",
+        )
+        current = release("3.0.0-beta.7", 11)
+        retirement = {
+            "phase": "indexes_removed",
+            "version": retired["version"],
+            "not_before": retired["not_before"],
+        }
+        inactive_target = channels(
+            "update_bootstrap",
+            20,
+            10,
+            retired["version"],
+            [retired, current],
+            retirement=retirement,
+        )
+        with self.assertRaisesRegex(MODULE.PlanError, "must be an active release"):
+            MODULE.build_plan(
+                inactive_target,
+                snapshot(10, [retired, current]),
+                SHA,
+                datetime.now(timezone.utc),
+            )
+
+    def test_update_bootstrap_rejects_product_or_retirement_changes(self):
+        active = release("3.0.0-beta.6", 10)
+        base = snapshot(10, [active])
+        changed = dict(active, deb_sha256="c" * 64)
+        changed_release = channels(
+            "update_bootstrap", 20, 10, active["version"], [changed]
+        )
+        with self.assertRaisesRegex(MODULE.PlanError, "must not change releases"):
+            MODULE.build_plan(
+                changed_release, base, SHA, datetime.now(timezone.utc)
+            )
+
+        changed_retirement = channels(
+            "update_bootstrap",
+            20,
+            10,
+            active["version"],
+            [active],
+            retirement={
+                "phase": "indexes_removed",
+                "version": "3.0.0-beta.5",
+                "not_before": "2026-10-01T00:30:00Z",
+            },
+        )
+        with self.assertRaisesRegex(MODULE.PlanError, "must not change retirement"):
+            MODULE.build_plan(
+                changed_retirement, base, SHA, datetime.now(timezone.utc)
+            )
 
     def test_remove_indexes_preserves_payload_identity(self):
         old = release("3.1.0-rc.1", 10)

@@ -30,11 +30,13 @@ class DeriveRPMAllowlistsTest(unittest.TestCase):
         self.repository = self.root / "repository"
         (self.repository / "Packages").mkdir(parents=True)
         self.inventory_path = self.root / "inventory.json"
+        self.bootstrap_inventory_path = self.root / "bootstrap-inventory.json"
         self.outputs = (
             self.root / "new.json",
             self.root / "signed.json",
             self.root / "active.json",
         )
+        self.write_bootstrap_inventory()
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
@@ -80,6 +82,62 @@ class DeriveRPMAllowlistsTest(unittest.TestCase):
     def write_inventory(self, value: object) -> None:
         self.inventory_path.write_bytes(canonical_json(value))
 
+    def write_bootstrap_inventory(
+        self,
+        *,
+        repository: Path | None = None,
+        output: Path | None = None,
+        new: bool = True,
+        contents: bytes | None = None,
+    ) -> dict[str, object]:
+        repository = repository or self.repository
+        output = output or self.bootstrap_inventory_path
+        version = "1.0.0"
+        rpm_contents = contents or b"RPM-BOOTSTRAP-TEST-ONLY\n"
+        rpm_filename = f"wukongim-release-{version}-1.noarch.rpm"
+        rpm_path = repository / "Packages" / rpm_filename
+        rpm_path.parent.mkdir(parents=True, exist_ok=True)
+        if contents is not None or not rpm_path.exists():
+            rpm_path.write_bytes(rpm_contents)
+        published = rpm_path.read_bytes()
+        rpm_source = published if new else b"UNSIGNED:" + published
+        apt_source = b"APT-BOOTSTRAP-TEST-ONLY\n"
+        apt_filename = f"wukongim-archive-keyring_{version}_all.deb"
+        value = {
+            "schema": "wukongim.native_package_bootstrap_inventory/v1",
+            "version": version,
+            "packages": {
+                "apt": {
+                    "name": "wukongim-archive-keyring",
+                    "version": version,
+                    "architecture": "all",
+                    "filename": apt_filename,
+                    "repository_path": f"apt/pool/main/w/wukongim/{apt_filename}",
+                    "download_path": f"bootstrap/{apt_filename}",
+                    "source_sha256": sha256(apt_source),
+                    "source_size": len(apt_source),
+                    "published_sha256": sha256(apt_source),
+                    "published_size": len(apt_source),
+                    "new": new,
+                },
+                "rpm": {
+                    "name": "wukongim-release",
+                    "version": version,
+                    "architecture": "noarch",
+                    "filename": rpm_filename,
+                    "repository_path": f"{PREFIX}Packages/{rpm_filename}",
+                    "download_path": f"bootstrap/{rpm_filename}",
+                    "source_sha256": sha256(rpm_source),
+                    "source_size": len(rpm_source),
+                    "published_sha256": sha256(published),
+                    "published_size": len(published),
+                    "new": new,
+                },
+            },
+        }
+        output.write_bytes(canonical_json(value))
+        return value
+
     def run_deriver(self) -> subprocess.CompletedProcess[str]:
         new, signed, active = self.outputs
         return subprocess.run(
@@ -88,6 +146,8 @@ class DeriveRPMAllowlistsTest(unittest.TestCase):
                 str(SCRIPT),
                 "--inventory",
                 str(self.inventory_path),
+                "--bootstrap-inventory",
+                str(self.bootstrap_inventory_path),
                 "--repository-root",
                 str(self.repository),
                 "--new-output",
@@ -129,9 +189,9 @@ class DeriveRPMAllowlistsTest(unittest.TestCase):
         self.assertEqual(
             receipt,
             {
-                "active_count": 2,
+                "active_count": 3,
                 "audit_release_id": 12345,
-                "new_count": 1,
+                "new_count": 2,
                 "schema": "wukongim/rpm-allowlist-derivation/v1",
                 "signed_count": 2,
             },
@@ -143,16 +203,11 @@ class DeriveRPMAllowlistsTest(unittest.TestCase):
             self.assertEqual(path.read_bytes(), canonical_json(value))
             self.assertEqual(path.stat().st_nlink, 1)
         self.assertEqual(
-            new_output,
-            {
-                "packages": [{
-                    "path": "Packages/new.rpm",
-                    "sha256": new["published_sha256"],
-                    "size": (self.repository / "Packages/new.rpm").stat().st_size,
-                }],
-                "schema": "wukongim/rpm-package-allowlist/v1",
-            },
+            [entry["path"] for entry in new_output["packages"]],
+            ["Packages/new.rpm", "Packages/wukongim-release-1.0.0-1.noarch.rpm"],
         )
+        self.assertEqual(new_output["packages"][0]["sha256"], new["published_sha256"])
+        self.assertEqual(new_output["schema"], "wukongim/rpm-package-allowlist/v1")
         self.assertEqual(
             [entry["path"] for entry in signed_output["packages"]],
             ["Packages/old.rpm", "Packages/retired.rpm"],
@@ -160,10 +215,58 @@ class DeriveRPMAllowlistsTest(unittest.TestCase):
         self.assertEqual(
             active_output,
             {
-                "paths": ["Packages/new.rpm", "Packages/old.rpm"],
+                "paths": [
+                    "Packages/new.rpm",
+                    "Packages/old.rpm",
+                    "Packages/wukongim-release-1.0.0-1.noarch.rpm",
+                ],
                 "schema": "wukongim/rpm-active-allowlist/v1",
             },
         )
+
+    def test_classifies_preserved_bootstrap_rpm_as_signed_and_active(self) -> None:
+        product = self.add_package(
+            "v3.0.0-beta.5", "product.rpm", indexed=True, new=True
+        )
+        self.write_inventory(
+            self.inventory([product], active=[product["version"]], retained=[])
+        )
+        self.write_bootstrap_inventory(new=False, contents=b"SIGNED-BOOTSTRAP-RPM\n")
+
+        result = self.run_deriver()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        new_output, signed_output, active_output = [
+            json.loads(path.read_text()) for path in self.outputs
+        ]
+        bootstrap_path = "Packages/wukongim-release-1.0.0-1.noarch.rpm"
+        self.assertEqual(
+            [item["path"] for item in new_output["packages"]],
+            ["Packages/product.rpm"],
+        )
+        self.assertEqual(
+            [item["path"] for item in signed_output["packages"]],
+            [bootstrap_path],
+        )
+        self.assertEqual(
+            active_output["paths"], ["Packages/product.rpm", bootstrap_path]
+        )
+
+    def test_rejects_bootstrap_inventory_digest_mismatch(self) -> None:
+        product = self.add_package(
+            "v3.0.0-beta.5", "product.rpm", indexed=True, new=True
+        )
+        self.write_inventory(
+            self.inventory([product], active=[product["version"]], retained=[])
+        )
+        bootstrap = json.loads(self.bootstrap_inventory_path.read_text())
+        bootstrap["packages"]["rpm"]["published_sha256"] = "0" * 64
+        bootstrap["packages"]["rpm"]["source_sha256"] = "0" * 64
+        self.bootstrap_inventory_path.write_bytes(canonical_json(bootstrap))
+
+        result = self.run_deriver()
+
+        self.assert_safe_failure(result, "bootstrap RPM facts do not match inventory")
 
     def test_rejects_wrong_prefix_and_unsafe_paths(self) -> None:
         unsafe_values = (
@@ -194,10 +297,15 @@ class DeriveRPMAllowlistsTest(unittest.TestCase):
                 inventory.write_bytes(
                     canonical_json(self.inventory([entry], active=[entry["version"]], retained=[]))
                 )
+                bootstrap_inventory = case / "bootstrap-inventory.json"
+                self.write_bootstrap_inventory(
+                    repository=repository, output=bootstrap_inventory
+                )
                 result = subprocess.run(
                     [
                         sys.executable, str(SCRIPT),
                         "--inventory", str(inventory),
+                        "--bootstrap-inventory", str(bootstrap_inventory),
                         "--repository-root", str(repository),
                         "--new-output", str(case / "new.json"),
                         "--signed-output", str(case / "signed.json"),
@@ -363,6 +471,7 @@ class DeriveRPMAllowlistsTest(unittest.TestCase):
             [
                 sys.executable, str(SCRIPT),
                 "--inventory", str(self.inventory_path),
+                "--bootstrap-inventory", str(self.bootstrap_inventory_path),
                 "--repository-root", str(self.repository),
                 "--new-output", str(target),
                 "--signed-output", str(target),

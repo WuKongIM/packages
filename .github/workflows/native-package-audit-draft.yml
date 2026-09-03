@@ -13,6 +13,7 @@ on:
         type: choice
         options:
           - add_release
+          - update_bootstrap
           - remove_indexes
           - remove_payloads
       target_version:
@@ -81,9 +82,12 @@ jobs:
           git fetch --no-tags --depth=1 origin main
           test "$(git rev-parse FETCH_HEAD)" = "$GITHUB_SHA"
           test "$(gh api repos/WuKongIM/packages/immutable-releases --jq .enabled)" = true
-          [[ "$OPERATION" =~ ^(add_release|remove_indexes|remove_payloads)$ ]]
+          [[ "$OPERATION" =~ ^(add_release|update_bootstrap|remove_indexes|remove_payloads)$ ]]
           [[ "$TARGET_VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-[0-9A-Za-z.-]+$ ]]
           ./tests/contract.sh
+          if [[ "$OPERATION" == update_bootstrap ]]; then
+            jq -e '.enabled == true' manifests/bootstrap-packages.json >/dev/null
+          fi
           jq -e '.enabled == true' manifests/preview-signing.json >/dev/null || {
             echo 'production signing control is not provisioned' >&2
             exit 78

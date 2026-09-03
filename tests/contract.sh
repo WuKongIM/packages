@@ -17,8 +17,20 @@ TOOLCHAIN_DOCKERFILE="$ROOT_DIR/toolchain/native-package-signing/Dockerfile"
 SOURCE_RESOLVER="$ROOT_DIR/scripts/resolve-source-release.py"
 SNAPSHOT_ARCHIVER="$ROOT_DIR/scripts/archive-package-snapshot.py"
 SITE_COMPOSER="$ROOT_DIR/scripts/compose-package-site.py"
+BOOTSTRAP_MANIFEST="$ROOT_DIR/manifests/bootstrap-packages.json"
+BOOTSTRAP_BUILDER="$ROOT_DIR/scripts/build-repository-bootstrap-packages.py"
+CLIENT_VALIDATOR="$ROOT_DIR/scripts/validate-production-package-clients.py"
 
 "$ROOT_DIR/scripts/validate-control.py"
+
+[[ -x "$BOOTSTRAP_BUILDER" ]]
+jq -e '
+  . == {
+    schema: "wukongim.native_package_bootstrap/v1",
+    enabled: true,
+    version: "1.0.0"
+  }
+' "$BOOTSTRAP_MANIFEST" >/dev/null
 
 jq -e '
   .schema == "wukongim.native_package_channels/v3" and
@@ -643,22 +655,30 @@ for value, accepted in cases:
     if (result.returncode == 0) != accepted:
         raise SystemExit(f"first-bootstrap predicate misclassified {value!r}")
 PY
-if (( $(grep -cF -- '--expected-version "$TARGET_VERSION"' "$PUBLISH_WORKFLOW") != 2 )); then
-  echo 'local and remote add_release clients must download the exact target version' >&2
+if (( $(grep -cF -- '--expected-version "$TARGET_VERSION"' "$PUBLISH_WORKFLOW") != 4 )); then
+  echo 'local and remote add_release/update_bootstrap clients must download the exact target version' >&2
   exit 1
 fi
 grep -Fq '.expected_version == $target and .expected_version_verified == true' "$PUBLISH_WORKFLOW"
+grep -Fq '.schema == "wukongim/production-package-client-validation/v3"' "$PUBLISH_WORKFLOW"
+grep -Fq '.bootstrap_verified == true and .bootstrap != null' "$PUBLISH_WORKFLOW"
+grep -Fq 'all((.apt[], .rpm[]); .bootstrap_installed == true)' "$PUBLISH_WORKFLOW"
+grep -Fq -- '--bootstrap-builder /control/scripts/build-repository-bootstrap-packages.py' "$PUBLISH_WORKFLOW"
+grep -Fq -- '--bootstrap-inventory /metadata/bootstrap-inventory.json' "$PUBLISH_WORKFLOW"
+grep -Fq 'fetch_and_check bootstrap/manifest.json "$BOOTSTRAP_MANIFEST_SHA256"' "$PUBLISH_WORKFLOW"
+grep -Fq 'update_bootstrap' "$AUDIT_DRAFT_WORKFLOW"
+grep -Fq 'update_bootstrap' "$PUBLISH_WORKFLOW"
 grep -Fq 'https://raw.githubusercontent.com/WuKongIM/WuKongIM/${commit}/${relative}' "$PUBLISH_WORKFLOW"
 grep -Fq -- '--connect-timeout 10 --max-time 30 --max-filesize 1048576' "$PUBLISH_WORKFLOW"
-grep -Fq 'install --downloadonly' "$ROOT_DIR/scripts/validate-production-package-clients.py"
+grep -Fq 'install --downloadonly' "$CLIENT_VALIDATOR"
 grep -Fq 'APT_CA_BUNDLE_PATH = "/etc/ssl/certs/ca-certificates.crt"' \
-  "$ROOT_DIR/scripts/validate-production-package-clients.py"
+  "$CLIENT_VALIDATOR"
 grep -Fq 'Acquire::https::CaInfo="$WK_CA_BUNDLE"' \
-  "$ROOT_DIR/scripts/validate-production-package-clients.py"
+  "$CLIENT_VALIDATOR"
 grep -Fq 'command.extend(("--env", f"WK_CA_BUNDLE={APT_CA_BUNDLE_PATH}"))' \
-  "$ROOT_DIR/scripts/validate-production-package-clients.py"
+  "$CLIENT_VALIDATOR"
 grep -Fq 'list(command), check=True, stdout=sys.stderr, stderr=sys.stderr' \
-  "$ROOT_DIR/scripts/validate-production-package-clients.py"
+  "$CLIENT_VALIDATOR"
 grep -Fq 'test "$(gh api repos/WuKongIM/packages/git/ref/heads/main --jq .object.sha)" = "$GITHUB_SHA"' "$PUBLISH_WORKFLOW"
 grep -Fq 'actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e' "$PUBLISH_WORKFLOW"
 if grep -Eq 'gh release delete|--method DELETE|git push|refs/tags/v|source-attestation-summary|--source-attestation-summary|repos/WuKongIM/WuKongIM/contents' "$PUBLISH_WORKFLOW"; then

@@ -137,6 +137,7 @@ jobs:
           jq -e '.channels.preview.enabled == true and .channels.preview.status == "ready"' \
             manifests/channels.json >/dev/null
           jq -e '.enabled == true' manifests/preview-signing.json >/dev/null
+          jq -e '.enabled == true' manifests/bootstrap-packages.json >/dev/null
           jq -e '.enabled == true' manifests/signing-toolchain.json >/dev/null
           jq -e \
             --argjson requested "$REQUESTED_AUDIT_RELEASE_ID" \
@@ -445,7 +446,9 @@ jobs:
           if [[ "$OPERATION" == add_release ]]; then
             cp -a "$RUNNER_TEMP/source-input/source-assets/." "$work/source-assets/"
           fi
-          chmod 0555 "$RUNNER_TEMP/source-tools/scripts/build-native-package-repositories.sh"
+          chmod 0555 \
+            "$RUNNER_TEMP/source-tools/scripts/build-native-package-repositories.sh" \
+            "$RUNNER_TEMP/control/scripts/build-repository-bootstrap-packages.py"
 
           docker run --rm --platform linux/amd64 \
             --network none --read-only --cap-drop ALL \
@@ -474,18 +477,26 @@ jobs:
                 --channels /control/manifests/channels.json \
                 --plan /work/plan.json "${base_args[@]}" \
                 --source-assets /work/source-assets \
+                --bootstrap-manifest /control/manifests/bootstrap-packages.json \
+                --apt-public-cert /control/keys/apt-preview.asc \
+                --rpm-public-cert /control/keys/rpm-preview.asc \
+                --bootstrap-builder /control/scripts/build-repository-bootstrap-packages.py \
                 --builder /source-tools/scripts/build-native-package-repositories.sh \
                 --output /work/prepared-repository \
-                --inventory /work/inventory.json >/work/preparation.json
+                --inventory /work/inventory.json \
+                --bootstrap-inventory /work/bootstrap-inventory.json \
+                >/work/preparation.json
               python3 /control/scripts/derive-rpm-allowlists.py \
                 --inventory /work/inventory.json \
+                --bootstrap-inventory /work/bootstrap-inventory.json \
                 --repository-root /work/prepared-repository/rpm/preview/el/9/x86_64 \
                 --new-output /work/rpm-new.json \
                 --signed-output /work/rpm-preserved.json \
                 --active-output /work/rpm-active.json
               cp -a /work/prepared-repository/apt /work/artifacts/apt/tree
               cp -a /work/prepared-repository/rpm /work/artifacts/rpm/tree
-              cp /work/plan.json /work/inventory.json /work/rpm-new.json \
+              cp /work/plan.json /work/inventory.json /work/bootstrap-inventory.json \
+                /work/rpm-new.json \
                 /work/rpm-preserved.json /work/rpm-active.json \
                 /work/preparation.json /work/artifacts/metadata/
             '
@@ -865,6 +876,7 @@ jobs:
                 --apt-public-cert /control/keys/apt-preview.asc \
                 --rpm-public-cert /control/keys/rpm-preview.asc \
                 --plan /metadata/plan.json --inventory /metadata/inventory.json \
+                --bootstrap-inventory /metadata/bootstrap-inventory.json \
                 --apt-tree /apt/tree --apt-receipt /apt/apt-signing.json \
                 --rpm-tree /rpm/tree --rpm-receipt /rpm/rpm-signing.json \
                 "${source_args[@]}" \
@@ -933,13 +945,21 @@ jobs:
 
       - name: Validate clean APT and RPM download-only install paths
         shell: bash
+        env:
+          OPERATION: ${{ needs.control.outputs.operation }}
+          TARGET_VERSION: ${{ needs.control.outputs.target_version }}
         run: |
           set -euo pipefail
+          client_target_args=()
+          if [[ "$OPERATION" == add_release || "$OPERATION" == update_bootstrap ]]; then
+            client_target_args+=(--expected-version "$TARGET_VERSION")
+          fi
           python3 "$RUNNER_TEMP/control/scripts/validate-production-package-clients.py" \
             --site-root "$RUNNER_TEMP/assemble-work/snapshot-root/site" \
             --snapshot "$RUNNER_TEMP/assemble-work/snapshot-root/audit/snapshot.json" \
             --apt-public-cert "$RUNNER_TEMP/control/keys/apt-preview.asc" \
-            --rpm-public-cert "$RUNNER_TEMP/control/keys/rpm-preview.asc"
+            --rpm-public-cert "$RUNNER_TEMP/control/keys/rpm-preview.asc" \
+            "${client_target_args[@]}"
 
       - name: Upload deterministic audit candidate
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -1057,13 +1077,21 @@ jobs:
 
       - name: Revalidate clean client download-only install paths from recovered site
         shell: bash
+        env:
+          OPERATION: ${{ needs.control.outputs.operation }}
+          TARGET_VERSION: ${{ needs.control.outputs.target_version }}
         run: |
           set -euo pipefail
+          client_target_args=()
+          if [[ "$OPERATION" == add_release || "$OPERATION" == update_bootstrap ]]; then
+            client_target_args+=(--expected-version "$TARGET_VERSION")
+          fi
           python3 "$RUNNER_TEMP/control/scripts/validate-production-package-clients.py" \
             --site-root "$RUNNER_TEMP/recovery-work/snapshot-root/site" \
             --snapshot "$RUNNER_TEMP/recovery-work/snapshot-root/audit/snapshot.json" \
             --apt-public-cert "$RUNNER_TEMP/control/keys/apt-preview.asc" \
-            --rpm-public-cert "$RUNNER_TEMP/control/keys/rpm-preview.asc"
+            --rpm-public-cert "$RUNNER_TEMP/control/keys/rpm-preview.asc" \
+            "${client_target_args[@]}"
 
       - name: Upload recovered deterministic audit candidate
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -1302,6 +1330,13 @@ jobs:
       rpm_repomd_sha256: ${{ steps.live.outputs.rpm_repomd_sha256 }}
       apt_key_sha256: ${{ steps.live.outputs.apt_key_sha256 }}
       rpm_key_sha256: ${{ steps.live.outputs.rpm_key_sha256 }}
+      bootstrap_manifest_sha256: ${{ steps.live.outputs.bootstrap_manifest_sha256 }}
+      apt_bootstrap_path: ${{ steps.live.outputs.apt_bootstrap_path }}
+      apt_bootstrap_repository_path: ${{ steps.live.outputs.apt_bootstrap_repository_path }}
+      apt_bootstrap_sha256: ${{ steps.live.outputs.apt_bootstrap_sha256 }}
+      rpm_bootstrap_path: ${{ steps.live.outputs.rpm_bootstrap_path }}
+      rpm_bootstrap_repository_path: ${{ steps.live.outputs.rpm_bootstrap_repository_path }}
+      rpm_bootstrap_sha256: ${{ steps.live.outputs.rpm_bootstrap_sha256 }}
     steps:
       - name: Check out exact current control
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -1376,7 +1411,7 @@ jobs:
               --apt-public-cert /control/keys/apt-preview.asc \
               --rpm-public-cert /control/keys/rpm-preview.asc
           client_target_args=()
-          if [[ "$OPERATION" == add_release ]]; then
+          if [[ "$OPERATION" == add_release || "$OPERATION" == update_bootstrap ]]; then
             client_target_args+=(--expected-version "$TARGET_VERSION")
           fi
           python3 scripts/validate-production-package-clients.py \
@@ -1447,6 +1482,17 @@ jobs:
 
           operation="$(jq -er '.operation' "$RUNNER_TEMP/pages-root/audit/plan.json")"
           not_before="$(jq -r '.not_before // empty' "$RUNNER_TEMP/pages-root/audit/plan.json")"
+          bootstrap="$site/bootstrap/manifest.json"
+          apt_bootstrap_path="$(jq -er '.packages.apt.download_path' "$bootstrap")"
+          apt_bootstrap_repository_path="$(jq -er '.packages.apt.repository_path' "$bootstrap")"
+          apt_bootstrap_sha256="$(jq -er '.packages.apt.published_sha256' "$bootstrap")"
+          rpm_bootstrap_path="$(jq -er '.packages.rpm.download_path' "$bootstrap")"
+          rpm_bootstrap_repository_path="$(jq -er '.packages.rpm.repository_path' "$bootstrap")"
+          rpm_bootstrap_sha256="$(jq -er '.packages.rpm.published_sha256' "$bootstrap")"
+          test "$(sha256sum "$site/$apt_bootstrap_path" | cut -d' ' -f1)" = "$apt_bootstrap_sha256"
+          test "$(sha256sum "$site/$apt_bootstrap_repository_path" | cut -d' ' -f1)" = "$apt_bootstrap_sha256"
+          test "$(sha256sum "$site/$rpm_bootstrap_path" | cut -d' ' -f1)" = "$rpm_bootstrap_sha256"
+          test "$(sha256sum "$site/$rpm_bootstrap_repository_path" | cut -d' ' -f1)" = "$rpm_bootstrap_sha256"
           {
             echo "deploy_needed=$deploy_needed"
             echo "operation=$operation"
@@ -1456,6 +1502,13 @@ jobs:
             echo "rpm_repomd_sha256=$(sha256sum "$site/rpm/preview/el/9/x86_64/repodata/repomd.xml" | cut -d' ' -f1)"
             echo "apt_key_sha256=$(sha256sum "$site/keys/apt-preview.asc" | cut -d' ' -f1)"
             echo "rpm_key_sha256=$(sha256sum "$site/keys/rpm-preview.asc" | cut -d' ' -f1)"
+            echo "bootstrap_manifest_sha256=$(sha256sum "$bootstrap" | cut -d' ' -f1)"
+            echo "apt_bootstrap_path=$apt_bootstrap_path"
+            echo "apt_bootstrap_repository_path=$apt_bootstrap_repository_path"
+            echo "apt_bootstrap_sha256=$apt_bootstrap_sha256"
+            echo "rpm_bootstrap_path=$rpm_bootstrap_path"
+            echo "rpm_bootstrap_repository_path=$rpm_bootstrap_repository_path"
+            echo "rpm_bootstrap_sha256=$rpm_bootstrap_sha256"
           } >>"$GITHUB_OUTPUT"
 
       - name: Configure Pages
@@ -1573,6 +1626,13 @@ jobs:
           RPM_REPOMD_SHA256: ${{ needs.pages_artifact.outputs.rpm_repomd_sha256 }}
           APT_KEY_SHA256: ${{ needs.pages_artifact.outputs.apt_key_sha256 }}
           RPM_KEY_SHA256: ${{ needs.pages_artifact.outputs.rpm_key_sha256 }}
+          BOOTSTRAP_MANIFEST_SHA256: ${{ needs.pages_artifact.outputs.bootstrap_manifest_sha256 }}
+          APT_BOOTSTRAP_PATH: ${{ needs.pages_artifact.outputs.apt_bootstrap_path }}
+          APT_BOOTSTRAP_REPOSITORY_PATH: ${{ needs.pages_artifact.outputs.apt_bootstrap_repository_path }}
+          APT_BOOTSTRAP_SHA256: ${{ needs.pages_artifact.outputs.apt_bootstrap_sha256 }}
+          RPM_BOOTSTRAP_PATH: ${{ needs.pages_artifact.outputs.rpm_bootstrap_path }}
+          RPM_BOOTSTRAP_REPOSITORY_PATH: ${{ needs.pages_artifact.outputs.rpm_bootstrap_repository_path }}
+          RPM_BOOTSTRAP_SHA256: ${{ needs.pages_artifact.outputs.rpm_bootstrap_sha256 }}
         run: |
           set -euo pipefail
           fetch_and_check() {
@@ -1594,6 +1654,11 @@ jobs:
           fetch_and_check rpm/preview/el/9/x86_64/repodata/repomd.xml "$RPM_REPOMD_SHA256"
           fetch_and_check keys/apt-preview.asc "$APT_KEY_SHA256"
           fetch_and_check keys/rpm-preview.asc "$RPM_KEY_SHA256"
+          fetch_and_check bootstrap/manifest.json "$BOOTSTRAP_MANIFEST_SHA256"
+          fetch_and_check "$APT_BOOTSTRAP_PATH" "$APT_BOOTSTRAP_SHA256"
+          fetch_and_check "$APT_BOOTSTRAP_REPOSITORY_PATH" "$APT_BOOTSTRAP_SHA256"
+          fetch_and_check "$RPM_BOOTSTRAP_PATH" "$RPM_BOOTSTRAP_SHA256"
+          fetch_and_check "$RPM_BOOTSTRAP_REPOSITORY_PATH" "$RPM_BOOTSTRAP_SHA256"
 
       - name: Validate production endpoint with clean download-only clients
         shell: bash
@@ -1606,7 +1671,7 @@ jobs:
           snapshot="$RUNNER_TEMP/public-snapshot/snapshot.json"
           snapshot_sha256="$(sha256sum "$snapshot" | cut -d' ' -f1)"
           client_target_args=()
-          if [[ "$OPERATION" == add_release ]]; then
+          if [[ "$OPERATION" == add_release || "$OPERATION" == update_bootstrap ]]; then
             client_target_args+=(--expected-version "$TARGET_VERSION")
           fi
           python3 scripts/validate-production-package-clients.py \
@@ -1622,11 +1687,14 @@ jobs:
             --arg snapshot "$snapshot_sha256" \
             --arg operation "$OPERATION" \
             --arg target "$TARGET_VERSION" \
-            '.mode == "remote" and .audit_release_id == $id and
+            '.schema == "wukongim/production-package-client-validation/v3" and
+             .mode == "remote" and .audit_release_id == $id and
              .control_sha == $control and .snapshot_sha256 == $snapshot and
              .snapshot_verified == true and .status_revalidated == true and
+             .bootstrap_verified == true and .bootstrap != null and
              (.apt | length) == 2 and (.rpm | length) == 2 and
-             (if $operation == "add_release" then
+             all((.apt[], .rpm[]); .bootstrap_installed == true) and
+             (if ($operation == "add_release" or $operation == "update_bootstrap") then
                 .expected_version == $target and .expected_version_verified == true and
                 all(.apt[].download.snapshot_versions; . == [$target]) and
                 all(.rpm[].download.snapshot_versions; . == [$target])

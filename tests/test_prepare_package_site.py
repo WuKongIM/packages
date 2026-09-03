@@ -91,6 +91,63 @@ class PreparePackageSiteTests(unittest.TestCase):
         self.source.mkdir()
         self.output = self.root / "output"
         self.inventory = self.root / "inventory.json"
+        self.bootstrap_inventory = self.root / "bootstrap-inventory.json"
+        self.bootstrap_manifest = self.root / "bootstrap-packages.json"
+        self.bootstrap_manifest.write_text(json.dumps({
+            "schema": MODULE.BOOTSTRAP_MANIFEST_SCHEMA,
+            "enabled": True,
+            "version": "1.0.0",
+        }), encoding="utf-8")
+        self.apt_public_cert = self.root / "apt-public.asc"
+        self.rpm_public_cert = self.root / "rpm-public.asc"
+        self.apt_public_cert.write_bytes(b"APT PUBLIC CERT\n")
+        self.rpm_public_cert.write_bytes(b"RPM PUBLIC CERT\n")
+        self.bootstrap_builder = self.root / "bootstrap-builder.py"
+        self.bootstrap_builder.write_text(
+            """#!/usr/bin/env python3
+import hashlib, json, pathlib, sys
+args = dict(zip(sys.argv[1::2], sys.argv[2::2]))
+manifest = json.loads(pathlib.Path(args['--manifest']).read_text())
+version = manifest['version']
+output = pathlib.Path(args['--output-dir'])
+output.mkdir()
+values = {
+    'apt': (
+        'wukongim-archive-keyring', 'all',
+        f'wukongim-archive-keyring_{version}_all.deb',
+        b'APT-BOOTSTRAP:' + pathlib.Path(args['--apt-public-cert']).read_bytes(),
+    ),
+    'rpm': (
+        'wukongim-release', 'noarch',
+        f'wukongim-release-{version}-1.noarch.rpm',
+        b'RPM-BOOTSTRAP:' + pathlib.Path(args['--rpm-public-cert']).read_bytes(),
+    ),
+}
+packages = {}
+for family, (name, architecture, filename, raw) in values.items():
+    (output / filename).write_bytes(raw)
+    repository_path = (
+        f'apt/pool/main/w/wukongim/{filename}'
+        if family == 'apt'
+        else f'rpm/preview/el/9/x86_64/Packages/{filename}'
+    )
+    digest = hashlib.sha256(raw).hexdigest()
+    packages[family] = {
+        'name': name, 'version': version, 'architecture': architecture,
+        'filename': filename, 'repository_path': repository_path,
+        'download_path': f'bootstrap/{filename}',
+        'source_sha256': digest, 'source_size': len(raw),
+        'published_sha256': digest, 'published_size': len(raw), 'new': True,
+    }
+inventory = {
+    'schema': 'wukongim.native_package_bootstrap_inventory/v1',
+    'version': version, 'packages': packages,
+}
+print(json.dumps(inventory, sort_keys=True, separators=(',', ':')))
+""",
+            encoding="utf-8",
+        )
+        self.bootstrap_builder.chmod(0o755)
         self.builder = self.root / "builder.py"
         self.builder.write_text(
             """#!/usr/bin/env python3
@@ -143,9 +200,14 @@ if race_inventory:
             plan=self.plan,
             base_root=base,
             source_assets=self.source,
+            bootstrap_manifest=self.bootstrap_manifest,
+            apt_public_cert=self.apt_public_cert,
+            rpm_public_cert=self.rpm_public_cert,
+            bootstrap_builder=self.bootstrap_builder,
             builder=self.builder,
             output=self.output,
             inventory=self.inventory,
+            bootstrap_inventory=self.bootstrap_inventory,
         )
 
     def arrange_first_release(self):
@@ -181,6 +243,13 @@ if race_inventory:
         inventory = MODULE.prepare(self.args())
         self.assertTrue((self.output / "apt/pool/main/w/wukongim/wukongim_3.1.0-rc.1_linux_amd64.deb").is_file())
         self.assertTrue(all(item["new"] for values in inventory["payloads"].values() for item in values))
+        bootstrap = json.loads(self.bootstrap_inventory.read_text(encoding="utf-8"))
+        self.assertEqual(MODULE.canonical_json(bootstrap), self.bootstrap_inventory.read_bytes())
+        for family in ("apt", "rpm"):
+            item = bootstrap["packages"][family]
+            self.assertTrue(item["new"])
+            self.assertTrue((self.output / item["repository_path"]).is_file())
+            self.assertFalse((self.output / item["download_path"]).exists())
 
     def test_rejects_source_digest_mismatch(self):
         assets = self.source / "110"
@@ -226,6 +295,7 @@ if race_inventory:
         self.assertFalse(self.output.exists())
         self.assertFalse(victim.exists())
         self.assertTrue(self.inventory.is_symlink())
+        self.assertFalse(self.bootstrap_inventory.exists())
 
     def test_inventory_race_cannot_redirect_write_and_rolls_back_repository(self):
         self.arrange_first_release()
@@ -241,6 +311,7 @@ if race_inventory:
         self.assertFalse(self.output.exists())
         self.assertFalse(victim.exists())
         self.assertTrue(self.inventory.is_symlink())
+        self.assertFalse(self.bootstrap_inventory.exists())
 
     def test_output_race_rolls_back_the_created_inventory(self):
         self.arrange_first_release()
@@ -254,6 +325,7 @@ if race_inventory:
         self.assertTrue(self.output.is_dir())
         self.assertEqual([], list(self.output.iterdir()))
         self.assertFalse(os.path.lexists(self.inventory))
+        self.assertFalse(os.path.lexists(self.bootstrap_inventory))
 
     def test_inventory_write_failure_rolls_back_both_outputs(self):
         self.arrange_first_release()
@@ -264,6 +336,7 @@ if race_inventory:
 
         self.assertFalse(os.path.lexists(self.output))
         self.assertFalse(os.path.lexists(self.inventory))
+        self.assertFalse(os.path.lexists(self.bootstrap_inventory))
 
     def test_rejects_inventory_nested_inside_repository_without_creating_output(self):
         self.arrange_first_release()
@@ -308,6 +381,54 @@ if race_inventory:
         (base / "site" / Path(rpm_path).parent).mkdir(parents=True)
         (base / "site" / apt_path).write_bytes(old_deb)
         (base / "site" / rpm_path).write_bytes(old_rpm)
+        bootstrap_apt = b"APT-BOOTSTRAP:" + self.apt_public_cert.read_bytes()
+        bootstrap_rpm_source = b"RPM-BOOTSTRAP:" + self.rpm_public_cert.read_bytes()
+        bootstrap_rpm_published = b"RPM-SIGNED:" + bootstrap_rpm_source
+        bootstrap_version = "1.0.0"
+        bootstrap_filenames = {
+            "apt": f"wukongim-archive-keyring_{bootstrap_version}_all.deb",
+            "rpm": f"wukongim-release-{bootstrap_version}-1.noarch.rpm",
+        }
+        bootstrap_repository_paths = {
+            "apt": (
+                "apt/pool/main/w/wukongim/" + bootstrap_filenames["apt"]
+            ),
+            "rpm": (
+                "rpm/preview/el/9/x86_64/Packages/" + bootstrap_filenames["rpm"]
+            ),
+        }
+        bootstrap_packages = {}
+        for family, source_bytes, published_bytes, name, architecture in (
+            ("apt", bootstrap_apt, bootstrap_apt,
+             "wukongim-archive-keyring", "all"),
+            ("rpm", bootstrap_rpm_source, bootstrap_rpm_published,
+             "wukongim-release", "noarch"),
+        ):
+            filename = bootstrap_filenames[family]
+            repository_path = bootstrap_repository_paths[family]
+            download_path = f"bootstrap/{filename}"
+            for relative in (repository_path, download_path):
+                path = base / "site" / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(published_bytes)
+            bootstrap_packages[family] = {
+                "name": name,
+                "version": bootstrap_version,
+                "architecture": architecture,
+                "filename": filename,
+                "repository_path": repository_path,
+                "download_path": download_path,
+                "source_sha256": sha(source_bytes),
+                "source_size": len(source_bytes),
+                "published_sha256": sha(published_bytes),
+                "published_size": len(published_bytes),
+                "new": True,
+            }
+        (base / "site/bootstrap/manifest.json").write_bytes(MODULE.canonical_json({
+            "schema": MODULE.BOOTSTRAP_INVENTORY_SCHEMA,
+            "version": bootstrap_version,
+            "packages": bootstrap_packages,
+        }))
         identity = write_v3_base_identity(base)
         (base / "audit/snapshot.json").write_text(json.dumps({
             "schema": "wukongim.native_package_snapshot/v3",
@@ -337,6 +458,16 @@ if race_inventory:
             [item["version"] for item in inventory["payloads"]["apt"]],
         )
         self.assertTrue((self.output / apt_path).is_file())
+        bootstrap = json.loads(self.bootstrap_inventory.read_text(encoding="utf-8"))
+        self.assertFalse(bootstrap["packages"]["apt"]["new"])
+        self.assertFalse(bootstrap["packages"]["rpm"]["new"])
+        self.assertEqual(
+            bootstrap_rpm_published,
+            (self.output / bootstrap_repository_paths["rpm"]).read_bytes(),
+        )
+        self.assertFalse(
+            (self.output / bootstrap["packages"]["rpm"]["download_path"]).exists()
+        )
 
     def test_rejects_v3_base_when_archived_toolchain_manifest_differs(self):
         base = self.root / "base"

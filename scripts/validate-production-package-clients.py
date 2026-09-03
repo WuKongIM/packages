@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """Validate the preview repositories with clean, download-only clients.
 
-The four client images are immutable linux/amd64 manifests.  APT refreshes the
-one reviewed source and performs an authenticated package download.  DNF runs
-its genuine ``install --downloadonly`` transaction against the one reviewed
-repository.  Both clients prove that ``wukongim`` is absent before and after
-the transaction; no maintainer script is executed.  The downloaded RPM is
-also checked against the reviewed public certificate in an isolated RPM
-database.  RPM clients clone the pinned image's package database into tmpfs so
-DNF can verify installed dependency providers and import the reviewed key while
-the image itself remains read-only.
+The four client images are immutable linux/amd64 manifests.  Current snapshots
+first install the reviewed, data-only repository bootstrap package, then use
+its installed source/repository file and key to perform an authenticated,
+download-only product transaction.  APT downloads ``wukongim`` without
+installing it.  DNF runs its genuine ``install --downloadonly`` transaction.
+Both clients prove that ``wukongim`` is absent before and after the transaction;
+the product package is never executed.  Bootstrap packages are installed only
+after their direct-download and indexed copies have been matched to the
+canonical public bootstrap manifest.  The downloaded RPM is also checked
+against the reviewed public certificate in an isolated RPM database.
 
 Local validation mounts an already verified Pages site read-only and also
 checks each downloaded payload against the snapshot inventory.  Remote
@@ -37,11 +38,13 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Sequence
 
 
-RECEIPT_SCHEMA = "wukongim/production-package-client-validation/v2"
+RECEIPT_SCHEMA = "wukongim/production-package-client-validation/v3"
 SNAPSHOT_SCHEMA = "wukongim.native_package_snapshot/v3"
 STATUS_SCHEMA = "wukongim.native_package_repository_status/v2"
+BOOTSTRAP_SCHEMA = "wukongim.native_package_bootstrap_inventory/v1"
 MAX_CONTROL_BYTES = 8 * 1024 * 1024
 MAX_CERTIFICATE_BYTES = 1024 * 1024
+MAX_BOOTSTRAP_BYTES = 16 * 1024 * 1024
 MAX_DOWNLOAD_BYTES = 800 * 1024 * 1024
 APT_CA_BUNDLE_PATH = "/etc/ssl/certs/ca-certificates.crt"
 SHA1_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -56,7 +59,15 @@ VERSION_RE = re.compile(
     r"(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)"
     r"(?:\.(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*$"
 )
+RELEASE_VERSION_RE = re.compile(
+    r"^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$"
+)
 SAFE_COMPONENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+~-]{0,254}$")
+
+LEGACY_BOOTSTRAPLESS_IDENTITY = (
+    381152722,
+    "637bc91bc8753a55dba0ebb346384a0a7e7387b6",
+)
 
 SNAPSHOT_FIELDS = {
     "schema", "audit_release_id", "control_sha", "releases", "retirement",
@@ -76,6 +87,12 @@ SOURCE_ATTESTATION_FIELDS = {"summary_sha256", "files"}
 ARTIFACT_FIELDS = {"path", "sha256", "size"}
 TOOLCHAIN_FIELDS = {
     "image", "digest", "workflow_sha", "manifest_sha256", "manifest_size",
+}
+BOOTSTRAP_FIELDS = {"schema", "version", "packages"}
+BOOTSTRAP_PACKAGE_FIELDS = {
+    "name", "version", "architecture", "filename", "repository_path",
+    "download_path", "source_sha256", "source_size", "published_sha256",
+    "published_size", "new",
 }
 
 # These are platform-specific linux/amd64 manifest digests, not mutable tag or
@@ -107,14 +124,67 @@ RPM_CLIENTS = (
 APT_SCRIPT = r"""
 set -euo pipefail
 export LC_ALL=C
+export DEBIAN_FRONTEND=noninteractive
+mkdir -p /var/lib/apt/lists/partial /var/cache/apt/archives/partial
 if dpkg-query -W -f='${db:Status-Abbrev}\n' wukongim 2>/dev/null | grep -q '^ii '; then
   echo 'wukongim was already installed in the clean APT client' >&2
   exit 1
 fi
-printf 'deb [arch=amd64 signed-by=/keys/apt-preview.asc] %s preview main\n' \
-  "$WK_REPOSITORY_URL" >/tmp/wukongim-preview.list
+apt_source=/tmp/wukongim-preview.list
+if [[ -n "${WK_BOOTSTRAP_PACKAGE:-}" ]]; then
+  test -r "$WK_BOOTSTRAP_PACKAGE"
+  bootstrap_control=/tmp/bootstrap-control
+  mkdir "$bootstrap_control"
+  dpkg-deb --control "$WK_BOOTSTRAP_PACKAGE" "$bootstrap_control"
+  test "$(find "$bootstrap_control" -mindepth 1 -maxdepth 1 -type f \
+    -printf '%f\n' | sort)" = $'conffiles\ncontrol'
+  test -z "$(find "$bootstrap_control" -mindepth 1 -maxdepth 1 ! -type f -print -quit)"
+  test "$(dpkg-deb -f "$WK_BOOTSTRAP_PACKAGE" Package)" = wukongim-archive-keyring
+  test "$(dpkg-deb -f "$WK_BOOTSTRAP_PACKAGE" Architecture)" = all
+
+  # Keep the immutable image read-only.  A private copy of its package database
+  # records the real bootstrap installation while the package's two payload
+  # directories are dedicated tmpfs mounts.
+  cp -a /var/lib/dpkg /tmp/dpkg
+  bootstrap_apt_options=(
+    -o Dir::State::status=/tmp/dpkg/status
+    -o DPkg::Options::=--admindir=/tmp/dpkg
+    -o APT::Sandbox::User=root
+  )
+  apt-get "${bootstrap_apt_options[@]}" install --yes --no-install-recommends \
+    "$WK_BOOTSTRAP_PACKAGE"
+  dpkg-query --admindir=/tmp/dpkg -W -f='${db:Status-Abbrev}\n' \
+    wukongim-archive-keyring | grep -q '^ii '
+
+  installed_source=/etc/apt/sources.list.d/wukongim-preview.sources
+  installed_key=/usr/share/keyrings/wukongim-archive-keyring.pgp
+  test -f "$installed_source" && test ! -L "$installed_source"
+  test -f "$installed_key" && test ! -L "$installed_key"
+  test "$(stat -c '%a:%U:%G' "$installed_source")" = 644:root:root
+  test "$(stat -c '%a:%U:%G' "$installed_key")" = 644:root:root
+  cat >/tmp/expected-wukongim-preview.sources <<'EOF'
+Types: deb
+URIs: https://packages.githubim.com/apt
+Suites: preview
+Components: main
+Architectures: amd64
+Signed-By: /usr/share/keyrings/wukongim-archive-keyring.pgp
+Enabled: yes
+EOF
+  cmp -s /tmp/expected-wukongim-preview.sources "$installed_source"
+
+  apt_source="$installed_source"
+  if ! grep -Fxq "URIs: $WK_REPOSITORY_URL" "$installed_source"; then
+    apt_source=/tmp/wukongim-preview.sources
+    sed "s#^URIs: https://packages.githubim.com/apt\$#URIs: $WK_REPOSITORY_URL#" \
+      "$installed_source" >"$apt_source"
+  fi
+else
+  printf 'deb [arch=amd64 signed-by=/keys/apt-preview.asc] %s preview main\n' \
+    "$WK_REPOSITORY_URL" >"$apt_source"
+fi
 apt_options=(
-  -o Dir::Etc::sourcelist=/tmp/wukongim-preview.list
+  -o Dir::Etc::sourcelist="$apt_source"
   -o Dir::Etc::sourceparts=-
   -o Dir::State::lists=/var/lib/apt/lists
   -o Dir::Cache=/var/cache/apt
@@ -141,6 +211,15 @@ if dpkg-query -W -f='${db:Status-Abbrev}\n' wukongim 2>/dev/null | grep -q '^ii 
   echo 'APT download-only validation installed wukongim' >&2
   exit 1
 fi
+if [[ -n "${WK_BOOTSTRAP_PACKAGE:-}" ]]; then
+  dpkg-query --admindir=/tmp/dpkg -W -f='${db:Status-Abbrev}\n' \
+    wukongim-archive-keyring | grep -q '^ii '
+  if dpkg-query --admindir=/tmp/dpkg -W -f='${db:Status-Abbrev}\n' \
+    wukongim 2>/dev/null | grep -q '^ii '; then
+    echo 'APT download-only validation installed wukongim in the bootstrap database' >&2
+    exit 1
+  fi
+fi
 """.strip()
 
 
@@ -149,7 +228,7 @@ set -euo pipefail
 export LC_ALL=C
 client_root=/tmp/client-root
 mkdir -p \
-  /tmp/repos.d /tmp/dnf-cache /tmp/dnf-state /tmp/rpmdb \
+  /tmp/repos.d /tmp/dnf-cache /tmp/dnf-state /tmp/rpmdb /tmp/bootstrap-rpmdb \
   "$client_root/var/lib/rpm"
 cp -a /var/lib/rpm/. "$client_root/var/lib/rpm/"
 if rpm --root "$client_root" -q wukongim >/dev/null 2>&1; then
@@ -157,7 +236,53 @@ if rpm --root "$client_root" -q wukongim >/dev/null 2>&1; then
   exit 1
 fi
 rpm --root "$client_root" -q systemd >/dev/null
-cat >/tmp/repos.d/wukongim-preview.repo <<EOF
+if [[ -n "${WK_BOOTSTRAP_PACKAGE:-}" ]]; then
+  test -r "$WK_BOOTSTRAP_PACKAGE"
+  test "$(rpm -qp --queryformat '%{NAME}' "$WK_BOOTSTRAP_PACKAGE")" = wukongim-release
+  test "$(rpm -qp --queryformat '%{ARCH}' "$WK_BOOTSTRAP_PACKAGE")" = noarch
+  test -z "$(rpm -qp --scripts "$WK_BOOTSTRAP_PACKAGE")"
+  test "$(rpm -qpl "$WK_BOOTSTRAP_PACKAGE" | sort)" = $'/etc/pki/rpm-gpg/RPM-GPG-KEY-wukongim-preview\n/etc/yum.repos.d/wukongim-preview.repo'
+
+  rpm --dbpath /tmp/bootstrap-rpmdb --initdb
+  rpmkeys --dbpath /tmp/bootstrap-rpmdb --import /keys/rpm-preview.asc
+  rpmkeys --dbpath /tmp/bootstrap-rpmdb --checksig "$WK_BOOTSTRAP_PACKAGE" \
+    | tee /tmp/bootstrap-rpm-checksig.txt
+  grep -Eq 'digests signatures OK$' /tmp/bootstrap-rpm-checksig.txt
+  rpm --dbpath /tmp/bootstrap-rpmdb --install "$WK_BOOTSTRAP_PACKAGE"
+  rpm --dbpath /tmp/bootstrap-rpmdb -q wukongim-release >/dev/null
+
+  installed_repo=/etc/yum.repos.d/wukongim-preview.repo
+  installed_key=/etc/pki/rpm-gpg/RPM-GPG-KEY-wukongim-preview
+  test -f "$installed_repo" && test ! -L "$installed_repo"
+  test -f "$installed_key" && test ! -L "$installed_key"
+  test "$(stat -c '%a:%U:%G' "$installed_repo")" = 644:root:root
+  test "$(stat -c '%a:%U:%G' "$installed_key")" = 644:root:root
+  cat >/tmp/expected-wukongim-preview.repo <<'EOF'
+[wukongim-preview]
+name=WuKongIM preview
+baseurl=https://packages.githubim.com/rpm/preview/el/9/x86_64
+enabled=1
+includepkgs=wukongim,wukongim-release
+gpgcheck=1
+repo_gpgcheck=1
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-wukongim-preview
+sslverify=1
+metadata_expire=0
+skip_if_unavailable=0
+EOF
+  cmp -s /tmp/expected-wukongim-preview.repo "$installed_repo"
+  cp "$installed_repo" /tmp/repos.d/wukongim-preview.repo
+  # DNF resolves file:// repository keys in the container namespace, outside
+  # the installroot.  Point the validation copy at the key installed inside
+  # that isolated root; the packaged repository file above remains unchanged.
+  sed -i "s#^gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-wukongim-preview\$#gpgkey=file://$installed_key#" \
+    /tmp/repos.d/wukongim-preview.repo
+  if ! grep -Fxq "baseurl=$WK_REPOSITORY_URL" /tmp/repos.d/wukongim-preview.repo; then
+    sed -i "s#^baseurl=https://packages.githubim.com/rpm/preview/el/9/x86_64\$#baseurl=$WK_REPOSITORY_URL#" \
+      /tmp/repos.d/wukongim-preview.repo
+  fi
+else
+  cat >/tmp/repos.d/wukongim-preview.repo <<EOF
 [wukongim-preview]
 name=WuKongIM preview
 baseurl=$WK_REPOSITORY_URL
@@ -169,6 +294,7 @@ sslverify=1
 metadata_expire=0
 skip_if_unavailable=0
 EOF
+fi
 dnf_options=(
   --quiet
   --assumeyes
@@ -188,6 +314,9 @@ dnf "${dnf_options[@]}" install --downloadonly \
 if rpm --root "$client_root" -q wukongim >/dev/null 2>&1; then
   echo 'DNF download-only validation installed wukongim' >&2
   exit 1
+fi
+if [[ -n "${WK_BOOTSTRAP_PACKAGE:-}" ]]; then
+  rpm --dbpath /tmp/bootstrap-rpmdb -q wukongim-release >/dev/null
 fi
 shopt -s nullglob
 packages=(/downloads/*.rpm)
@@ -312,6 +441,196 @@ def _safe_site_path(value: Any, family: str, label: str) -> str:
     prefix = "apt/pool/" if family == "apt" else "rpm/preview/el/9/x86_64/Packages/"
     _require(value.startswith(prefix) and value.endswith(suffix), f"{label} is not canonical")
     return value
+
+
+def _expected_bootstrap_package(family: str, version: str) -> dict[str, str]:
+    if family == "apt":
+        filename = f"wukongim-archive-keyring_{version}_all.deb"
+        return {
+            "name": "wukongim-archive-keyring",
+            "architecture": "all",
+            "filename": filename,
+            "repository_path": f"apt/pool/main/w/wukongim/{filename}",
+            "download_path": f"bootstrap/{filename}",
+        }
+    _require(family == "rpm", "bootstrap package family is unsupported")
+    filename = f"wukongim-release-{version}-1.noarch.rpm"
+    return {
+        "name": "wukongim-release",
+        "architecture": "noarch",
+        "filename": filename,
+        "repository_path": f"rpm/preview/el/9/x86_64/Packages/{filename}",
+        "download_path": f"bootstrap/{filename}",
+    }
+
+
+def _safe_bootstrap_path(value: Any, expected: str, label: str) -> str:
+    _require(isinstance(value, str) and value == expected, f"{label} must be {expected}")
+    path = PurePosixPath(value)
+    _require(
+        not path.is_absolute()
+        and "\\" not in value
+        and "\x00" not in value
+        and path.as_posix() == value
+        and all(part not in {"", ".", ".."} for part in path.parts)
+        and all(SAFE_COMPONENT_RE.fullmatch(part) is not None for part in path.parts),
+        f"{label} is unsafe",
+    )
+    return value
+
+
+def _validate_bootstrap_manifest_bytes(
+    data: bytes, label: str
+) -> tuple[dict[str, Any], str]:
+    _require(0 < len(data) <= MAX_CONTROL_BYTES, f"{label} has an invalid size")
+    try:
+        value = json.loads(data, object_pairs_hook=_reject_duplicate_pairs)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ClientValidationError(f"{label} is not valid JSON") from error
+    manifest = _exact_object(value, BOOTSTRAP_FIELDS, label)
+    _require(data == _canonical_json(manifest), f"{label} must use canonical JSON encoding")
+    _require(manifest["schema"] == BOOTSTRAP_SCHEMA,
+             f"{label} schema must be {BOOTSTRAP_SCHEMA}")
+    version = manifest["version"]
+    _require(isinstance(version, str)
+             and RELEASE_VERSION_RE.fullmatch(version) is not None,
+             f"{label} version must be strict release SemVer")
+    packages = _exact_object(manifest["packages"], {"apt", "rpm"},
+                             f"{label} packages")
+    for family in ("apt", "rpm"):
+        item = _exact_object(packages[family], BOOTSTRAP_PACKAGE_FIELDS,
+                             f"{label} {family} package")
+        expected = _expected_bootstrap_package(family, version)
+        _require(item["version"] == version,
+                 f"{label} {family} package version differs from the manifest")
+        for field in ("name", "architecture", "filename"):
+            _require(item[field] == expected[field],
+                     f"{label} {family} package {field} must be {expected[field]}")
+        _safe_bootstrap_path(
+            item["repository_path"], expected["repository_path"],
+            f"{label} {family} repository_path",
+        )
+        _safe_bootstrap_path(
+            item["download_path"], expected["download_path"],
+            f"{label} {family} download_path",
+        )
+        for field in ("source_sha256", "published_sha256"):
+            _require(isinstance(item[field], str)
+                     and SHA256_RE.fullmatch(item[field]) is not None,
+                     f"{label} {family} {field} is invalid")
+        for field in ("source_size", "published_size"):
+            _require(type(item[field]) is int
+                     and 0 < item[field] <= MAX_BOOTSTRAP_BYTES,
+                     f"{label} {family} {field} is invalid")
+        _require(type(item["new"]) is bool,
+                 f"{label} {family} new must be a boolean")
+        if family == "apt":
+            _require(
+                (item["source_sha256"], item["source_size"])
+                == (item["published_sha256"], item["published_size"]),
+                f"{label} APT source and published bytes must match",
+            )
+    return manifest, _sha256(data)
+
+
+def _bootstrapless_legacy(identity: tuple[Any, Any]) -> bool:
+    return identity == LEGACY_BOOTSTRAPLESS_IDENTITY
+
+
+def _validate_bootstrap_payload(
+    data: bytes, item: dict[str, Any], label: str
+) -> None:
+    _require(isinstance(data, bytes)
+             and len(data) == item["published_size"],
+             f"{label} size differs from the bootstrap manifest")
+    _require(_sha256(data) == item["published_sha256"],
+             f"{label} digest differs from the bootstrap manifest")
+
+
+def _validate_local_bootstrap(
+    site: Path, identity: tuple[Any, Any]
+) -> dict[str, Any] | None:
+    manifest_path = site / "bootstrap/manifest.json"
+    try:
+        manifest_data = _read_regular(
+            manifest_path, "published bootstrap manifest", MAX_CONTROL_BYTES
+        )
+    except ClientValidationError as error:
+        if not os.path.lexists(manifest_path) and _bootstrapless_legacy(identity):
+            return None
+        raise error
+    manifest, manifest_sha256 = _validate_bootstrap_manifest_bytes(
+        manifest_data, "published bootstrap manifest"
+    )
+    payloads: dict[str, bytes] = {}
+    for family in ("apt", "rpm"):
+        item = manifest["packages"][family]
+        repository = _read_regular(
+            site.joinpath(*PurePosixPath(item["repository_path"]).parts),
+            f"published {family} bootstrap repository package",
+            MAX_BOOTSTRAP_BYTES,
+        )
+        direct = _read_regular(
+            site.joinpath(*PurePosixPath(item["download_path"]).parts),
+            f"published {family} bootstrap direct package",
+            MAX_BOOTSTRAP_BYTES,
+        )
+        _validate_bootstrap_payload(
+            repository, item, f"published {family} bootstrap repository package"
+        )
+        _validate_bootstrap_payload(
+            direct, item, f"published {family} bootstrap direct package"
+        )
+        _require(direct == repository,
+                 f"published {family} bootstrap direct and repository packages differ")
+        payloads[family] = direct
+    return {
+        "manifest": manifest,
+        "manifest_sha256": manifest_sha256,
+        "payloads": payloads,
+    }
+
+
+def _validate_remote_bootstrap(
+    base_url: str,
+    identity: tuple[Any, Any],
+    fetcher: Callable[[str, int], bytes],
+) -> dict[str, Any] | None:
+    manifest_url = f"{base_url}/bootstrap/manifest.json"
+    try:
+        manifest_data = fetcher(manifest_url, MAX_CONTROL_BYTES)
+    except (ClientValidationError, KeyError, OSError, urllib.error.HTTPError) as error:
+        if _bootstrapless_legacy(identity):
+            return None
+        raise ClientValidationError(
+            f"remote bootstrap manifest is required for audit identity {identity[0]}"
+        ) from error
+    _require(isinstance(manifest_data, bytes),
+             "remote bootstrap manifest response is invalid")
+    manifest, manifest_sha256 = _validate_bootstrap_manifest_bytes(
+        manifest_data, "remote bootstrap manifest"
+    )
+    payloads: dict[str, bytes] = {}
+    for family in ("apt", "rpm"):
+        item = manifest["packages"][family]
+        repository = fetcher(
+            f"{base_url}/{item['repository_path']}", MAX_BOOTSTRAP_BYTES
+        )
+        direct = fetcher(f"{base_url}/{item['download_path']}", MAX_BOOTSTRAP_BYTES)
+        _validate_bootstrap_payload(
+            repository, item, f"remote {family} bootstrap repository package"
+        )
+        _validate_bootstrap_payload(
+            direct, item, f"remote {family} bootstrap direct package"
+        )
+        _require(direct == repository,
+                 f"remote {family} bootstrap direct and repository packages differ")
+        payloads[family] = direct
+    return {
+        "manifest": manifest,
+        "manifest_sha256": manifest_sha256,
+        "payloads": payloads,
+    }
 
 
 def _validate_snapshot_public_keys(
@@ -560,11 +879,18 @@ def _validate_local_inputs(
     site_root: Path,
     snapshot_path: Path,
     certificates: dict[str, tuple[Path, bytes]],
-) -> tuple[Path, dict[str, dict[str, list[str]]], str]:
+) -> tuple[Path, dict[str, dict[str, list[str]]], str, tuple[int, str]]:
     site = _real_directory(site_root, "site root")
     snapshot, snapshot_bytes = _load_json(snapshot_path, "snapshot")
     _require(snapshot.get("schema") == SNAPSHOT_SCHEMA,
              f"snapshot schema must be {SNAPSHOT_SCHEMA}")
+    audit_release_id = snapshot.get("audit_release_id")
+    control_sha = snapshot.get("control_sha")
+    _require(type(audit_release_id) is int and audit_release_id > 0,
+             "snapshot audit_release_id is invalid")
+    _require(isinstance(control_sha, str)
+             and SHA1_RE.fullmatch(control_sha) is not None,
+             "snapshot control_sha is invalid")
     payloads = snapshot.get("payloads")
     public_keys = snapshot.get("public_keys")
     _require(isinstance(payloads, dict), "snapshot payloads must be an object")
@@ -616,7 +942,7 @@ def _validate_local_inputs(
                 digest_versions.setdefault(digest, []).append(version)
         _require(digest_versions, f"snapshot contains no indexed {family} payload")
         expected[family] = digest_versions
-    return site, expected, _sha256(snapshot_bytes)
+    return site, expected, _sha256(snapshot_bytes), (audit_release_id, control_sha)
 
 
 def _validated_base_url(value: str) -> str:
@@ -714,6 +1040,7 @@ def _base_docker_command(
     family: str,
     site: Path | None,
     remote: bool,
+    bootstrap_package: Path | None = None,
 ) -> list[str]:
     command = [
         "docker", "run", "--rm", "--platform", "linux/amd64",
@@ -726,19 +1053,35 @@ def _base_docker_command(
     ]
     if family == "apt":
         command.extend((
-            "--tmpfs", "/var/lib/apt/lists:rw,noexec,nosuid,nodev,size=256m",
+            "--tmpfs", "/var/lib/apt:rw,noexec,nosuid,nodev,size=256m",
             "--tmpfs", "/var/cache/apt:rw,noexec,nosuid,nodev,size=256m",
         ))
+        if bootstrap_package is not None:
+            command.extend((
+                "--tmpfs", "/etc/apt/sources.list.d:rw,noexec,nosuid,nodev,size=8m",
+                "--tmpfs", "/usr/share/keyrings:rw,noexec,nosuid,nodev,size=8m",
+            ))
     else:
         command.extend((
             "--tmpfs", "/var/cache/dnf:rw,noexec,nosuid,nodev,size=256m",
         ))
+        if bootstrap_package is not None:
+            command.extend((
+                "--tmpfs", "/etc/pki/rpm-gpg:rw,noexec,nosuid,nodev,size=8m",
+                "--tmpfs", "/etc/yum.repos.d:rw,noexec,nosuid,nodev,size=8m",
+            ))
     if site is not None:
         command.extend(("--network", "none", "--volume", f"{site}:/site:ro"))
     elif remote and family == "apt":
         ca_bundle = _host_ca_bundle()
         command.extend((
             "--volume", f"{ca_bundle}:{APT_CA_BUNDLE_PATH}:ro",
+        ))
+    if bootstrap_package is not None:
+        resolved_bootstrap = bootstrap_package.resolve(strict=True)
+        command.extend((
+            "--volume", f"{resolved_bootstrap}:/bootstrap/{bootstrap_package.name}:ro",
+            "--env", f"WK_BOOTSTRAP_PACKAGE=/bootstrap/{bootstrap_package.name}",
         ))
     return command
 
@@ -750,10 +1093,11 @@ def _client_command(
     family: str,
     site: Path | None,
     base_url: str | None,
+    bootstrap_package: Path | None = None,
 ) -> list[str]:
     remote = base_url is not None
     command = _base_docker_command(
-        downloads, certificate, family, site, remote
+        downloads, certificate, family, site, remote, bootstrap_package
     )
     if family == "apt":
         repository = f"{base_url}/apt" if remote else "file:/site/apt"
@@ -857,13 +1201,15 @@ def validate_clients(
     expected: dict[str, dict[str, list[str]]] | None = None
     snapshot_sha256: str | None = None
     status: dict[str, Any] | None = None
+    bootstrap: dict[str, Any] | None = None
     initial_status_bytes: bytes | None = None
     resolved_site: Path | None = None
     if local:
         assert site_root is not None and snapshot_path is not None
-        resolved_site, expected, snapshot_sha256 = _validate_local_inputs(
+        resolved_site, expected, snapshot_sha256, identity = _validate_local_inputs(
             site_root, snapshot_path, certificates
         )
+        bootstrap = _validate_local_bootstrap(resolved_site, identity)
         normalized_base_url = None
     else:
         assert base_url is not None
@@ -879,6 +1225,11 @@ def validate_clients(
                 normalized_base_url,
                 fetcher,
             )
+        bootstrap = _validate_remote_bootstrap(
+            normalized_base_url,
+            (status["audit_release_id"], status["control_sha"]),
+            fetcher,
+        )
 
     results: dict[str, list[dict[str, Any]]] = {"apt": [], "rpm": []}
     if expected_version is not None:
@@ -892,6 +1243,16 @@ def validate_clients(
                      f"indexed {family} snapshot does not contain exactly expected version {expected_version}")
     with tempfile.TemporaryDirectory(prefix="wukongim-package-clients-") as temporary:
         root = Path(temporary)
+        bootstrap_paths: dict[str, Path] = {}
+        if bootstrap is not None:
+            bootstrap_root = root / "bootstrap"
+            bootstrap_root.mkdir(mode=0o700)
+            for family in ("apt", "rpm"):
+                filename = bootstrap["manifest"]["packages"][family]["filename"]
+                package = bootstrap_root / filename
+                package.write_bytes(bootstrap["payloads"][family])
+                package.chmod(0o444)
+                bootstrap_paths[family] = package
         for family, clients in (("apt", APT_CLIENTS), ("rpm", RPM_CLIENTS)):
             for distribution, image in clients:
                 downloads = root / distribution
@@ -908,6 +1269,7 @@ def validate_clients(
                     family,
                     resolved_site,
                     normalized_base_url,
+                    bootstrap_paths.get(family),
                 )
                 try:
                     runner(command)
@@ -925,6 +1287,7 @@ def validate_clients(
                 results[family].append({
                     "distribution": distribution,
                     "image": image,
+                    "bootstrap_installed": bootstrap is not None,
                     "download": receipt,
                 })
 
@@ -941,9 +1304,20 @@ def validate_clients(
         "mode": "local" if local else "remote",
         "expected_version": expected_version,
         "expected_version_verified": expected_version is not None,
+        "bootstrap_verified": bootstrap is not None,
         "apt": results["apt"],
         "rpm": results["rpm"],
     }
+    if bootstrap is None:
+        output["bootstrap"] = None
+    else:
+        manifest = bootstrap["manifest"]
+        output["bootstrap"] = {
+            "schema": manifest["schema"],
+            "version": manifest["version"],
+            "manifest_sha256": bootstrap["manifest_sha256"],
+            "packages": manifest["packages"],
+        }
     if local:
         output["snapshot_sha256"] = snapshot_sha256
     else:

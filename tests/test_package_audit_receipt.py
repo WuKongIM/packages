@@ -6,6 +6,7 @@ import importlib.util
 import io
 import json
 import os
+import shutil
 import tarfile
 import unittest
 from pathlib import Path
@@ -446,6 +447,32 @@ class PackageAuditReceiptTest(unittest.TestCase):
             output_path=self.receipt_path, **self.inputs()
         )
 
+    def configure_update_bootstrap(self) -> dict[str, Path | None]:
+        payloads_before = canonical(self.snapshot["payloads"])
+        self.publication.update({
+            "base_audit_release_id": AUDIT_ID - 1,
+            "operation": "update_bootstrap",
+        })
+        self.plan.update({
+            "base_audit_release_id": AUDIT_ID - 1,
+            "operation": "update_bootstrap",
+            "new_versions": [],
+        })
+        self.snapshot["source_attestations"] = None
+        signed = self.rpm_receipt["result"]["newly_signed"][0]
+        self.rpm_receipt["result"].update({
+            "new_unsigned_inputs": [],
+            "newly_signed": [],
+            "preserved_signed": [signed],
+        })
+        self.write_inputs()
+        shutil.rmtree(self.audit / "source-attestations")
+        self.rebuild_archive()
+        self.assertEqual(payloads_before, canonical(self.snapshot["payloads"]))
+        inputs: dict[str, Path | None] = self.inputs()
+        inputs["source_attestations_path"] = None
+        return inputs
+
     def test_create_and_verify_bind_all_reviewed_evidence(self) -> None:
         receipt = self.create()
         self.assertEqual(receipt_module.RECEIPT_SCHEMA, receipt["schema"])
@@ -483,6 +510,54 @@ class PackageAuditReceiptTest(unittest.TestCase):
                 receipt_path=self.receipt_path, **self.inputs()
             ),
         )
+
+    def test_update_bootstrap_receipt_has_no_source_and_preserves_product_snapshot(self) -> None:
+        inputs = self.configure_update_bootstrap()
+
+        receipt = receipt_module.create_audit_receipt(
+            output_path=self.receipt_path, **inputs
+        )
+
+        self.assertEqual("update_bootstrap", receipt["plan"]["operation"])
+        self.assertEqual(AUDIT_ID - 1, receipt["plan"]["base_audit_release_id"])
+        self.assertIsNone(receipt["source"])
+        self.assertEqual(
+            receipt,
+            receipt_module.verify_audit_receipt(
+                receipt_path=self.receipt_path, **inputs
+            ),
+        )
+
+    def test_update_bootstrap_requires_a_base_and_unchanged_release_sets(self) -> None:
+        self.publication.update({
+            "base_audit_release_id": AUDIT_ID - 1,
+            "operation": "update_bootstrap",
+        })
+        self.plan.update({
+            "base_audit_release_id": AUDIT_ID - 1,
+            "operation": "update_bootstrap",
+            "new_versions": [],
+        })
+        facts = receipt_module.validate_channels(self.channels)
+        receipt_module.validate_plan(self.plan, facts)
+        for field, value, pattern in (
+            ("base_audit_release_id", None, "base_audit_release_id"),
+            ("new_versions", [VERSION], "transition facts"),
+            ("not_before", "2026-09-03T00:00:00Z", "transition facts"),
+        ):
+            with self.subTest(field=field):
+                original = self.plan[field]
+                self.plan[field] = value
+                if field == "base_audit_release_id":
+                    original_publication = self.publication[field]
+                    self.publication[field] = value
+                    facts = receipt_module.validate_channels(self.channels)
+                with self.assertRaisesRegex(receipt_module.AuditReceiptError, pattern):
+                    receipt_module.validate_plan(self.plan, facts)
+                self.plan[field] = original
+                if field == "base_audit_release_id":
+                    self.publication[field] = original_publication
+                    facts = receipt_module.validate_channels(self.channels)
 
     def test_rejects_reviewed_fingerprints_with_colliding_key_ids(self) -> None:
         signing = json.loads(json.dumps(self.signing))

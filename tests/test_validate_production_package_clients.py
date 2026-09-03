@@ -28,8 +28,11 @@ DEB_PAYLOAD = b"authenticated deb payload\n"
 RPM_PAYLOAD = b"authenticated rpm payload\n"
 RETAINED_DEB_PAYLOAD = b"retained authenticated deb payload\n"
 RETAINED_RPM_PAYLOAD = b"retained authenticated rpm payload\n"
+APT_BOOTSTRAP = b"reviewed apt repository bootstrap package\n"
+RPM_BOOTSTRAP = b"reviewed signed rpm repository bootstrap package\n"
 VERSION = "3.1.0-rc.1"
 RETAINED_VERSION = "3.0.0-rc.1"
+BOOTSTRAP_VERSION = "1.0.0"
 AUDIT_RELEASE_ID = 4242
 CONTROL_SHA = "1" * 40
 
@@ -121,6 +124,47 @@ class Fixture:
             },
         }
         self.write_snapshot()
+        apt_filename = (
+            f"wukongim-archive-keyring_{BOOTSTRAP_VERSION}_all.deb"
+        )
+        rpm_filename = f"wukongim-release-{BOOTSTRAP_VERSION}-1.noarch.rpm"
+        self.bootstrap_value = {
+            "schema": validator.BOOTSTRAP_SCHEMA,
+            "version": BOOTSTRAP_VERSION,
+            "packages": {
+                "apt": {
+                    "name": "wukongim-archive-keyring",
+                    "version": BOOTSTRAP_VERSION,
+                    "architecture": "all",
+                    "filename": apt_filename,
+                    "repository_path": (
+                        f"apt/pool/main/w/wukongim/{apt_filename}"
+                    ),
+                    "download_path": f"bootstrap/{apt_filename}",
+                    "source_sha256": digest(APT_BOOTSTRAP),
+                    "source_size": len(APT_BOOTSTRAP),
+                    "published_sha256": digest(APT_BOOTSTRAP),
+                    "published_size": len(APT_BOOTSTRAP),
+                    "new": True,
+                },
+                "rpm": {
+                    "name": "wukongim-release",
+                    "version": BOOTSTRAP_VERSION,
+                    "architecture": "noarch",
+                    "filename": rpm_filename,
+                    "repository_path": (
+                        "rpm/preview/el/9/x86_64/Packages/" + rpm_filename
+                    ),
+                    "download_path": f"bootstrap/{rpm_filename}",
+                    "source_sha256": digest(b"unsigned rpm bootstrap package\n"),
+                    "source_size": len(b"unsigned rpm bootstrap package\n"),
+                    "published_sha256": digest(RPM_BOOTSTRAP),
+                    "published_size": len(RPM_BOOTSTRAP),
+                    "new": True,
+                },
+            },
+        }
+        self.write_bootstrap()
         self.commands: list[list[str]] = []
 
     def write_snapshot(self) -> None:
@@ -128,6 +172,28 @@ class Fixture:
             json.dumps(self.snapshot_value, sort_keys=True, separators=(",", ":")) + "\n",
             encoding="utf-8",
         )
+
+    def write_bootstrap(self) -> None:
+        manifest = self.site / "bootstrap/manifest.json"
+        manifest.parent.mkdir(parents=True, exist_ok=True)
+        manifest.write_text(
+            json.dumps(self.bootstrap_value, sort_keys=True, separators=(",", ":"))
+            + "\n",
+            encoding="utf-8",
+        )
+        for family, payload in (("apt", APT_BOOTSTRAP), ("rpm", RPM_BOOTSTRAP)):
+            item = self.bootstrap_value["packages"][family]
+            for field in ("repository_path", "download_path"):
+                path = self.site.joinpath(*Path(item[field]).parts)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(payload)
+
+    def remove_bootstrap(self) -> None:
+        for family in ("apt", "rpm"):
+            item = self.bootstrap_value["packages"][family]
+            for field in ("repository_path", "download_path"):
+                self.site.joinpath(*Path(item[field]).parts).unlink()
+        (self.site / "bootstrap/manifest.json").unlink()
 
     def add_retained_payloads(self) -> None:
         not_before = "2026-09-02T00:00:00Z"
@@ -190,7 +256,14 @@ class Fixture:
             ).encode(),
             "https://packages.example/keys/apt-preview.asc": APT_CERTIFICATE,
             "https://packages.example/keys/rpm-preview.asc": RPM_CERTIFICATE,
+            "https://packages.example/bootstrap/manifest.json": (
+                self.site / "bootstrap/manifest.json"
+            ).read_bytes(),
         }
+        for family, payload in (("apt", APT_BOOTSTRAP), ("rpm", RPM_BOOTSTRAP)):
+            item = self.bootstrap_value["packages"][family]
+            for field in ("repository_path", "download_path"):
+                values[f"https://packages.example/{item[field]}"] = payload
         for family in ("apt", "rpm"):
             for item in self.snapshot_value["payloads"][family]:
                 payload = {
@@ -254,10 +327,14 @@ class ValidateProductionPackageClientsTest(unittest.TestCase):
         self.assertEqual(4, len(fixture.commands))
         self.assertIsNone(receipt["expected_version"])
         self.assertFalse(receipt["expected_version_verified"])
+        self.assertTrue(receipt["bootstrap_verified"])
+        self.assertEqual(BOOTSTRAP_VERSION, receipt["bootstrap"]["version"])
+        self.assertRegex(receipt["bootstrap"]["manifest_sha256"], r"^[0-9a-f]{64}$")
         self.assertNotIn("base_url", receipt)
         self.assertRegex(receipt["snapshot_sha256"], r"^[0-9a-f]{64}$")
         for family, payload in (("apt", DEB_PAYLOAD), ("rpm", RPM_PAYLOAD)):
             for result in receipt[family]:
+                self.assertTrue(result["bootstrap_installed"])
                 self.assertEqual(digest(payload), result["download"]["sha256"])
                 self.assertEqual([VERSION], result["download"]["snapshot_versions"])
                 self.assertIn("--network", fixture.commands.pop(0))
@@ -349,13 +426,24 @@ class ValidateProductionPackageClientsTest(unittest.TestCase):
                     self.assertIn("no-new-privileges", command)
                     self.assertIn("--network", command)
                     self.assertIn("none", command)
-                    self.assertNotRegex(rendered, r"apt-get\s+install(?:\s|$)")
+                    self.assertNotRegex(rendered, r"apt-get[^\n]*install[^\n]*wukongim(?:\s|$)")
                     if family == "apt":
                         self.assertIn("dpkg-query -W", rendered)
                         self.assertEqual(2, rendered.count("dpkg-query -W"))
                         self.assertIn("apt-get \"${apt_options[@]}\" update", rendered)
                         self.assertIn("apt-get \"${apt_options[@]}\" download", rendered)
                         self.assertIn("signed-by=/keys/apt-preview.asc", rendered)
+                        self.assertIn(
+                            'apt-get "${bootstrap_apt_options[@]}" install',
+                            rendered,
+                        )
+                        self.assertIn('"$WK_BOOTSTRAP_PACKAGE"', rendered)
+                        self.assertIn("wukongim-archive-keyring", rendered)
+                        self.assertIn("wukongim-preview.sources", rendered)
+                        self.assertIn(
+                            "Signed-By: /usr/share/keyrings/wukongim-archive-keyring.pgp",
+                            rendered,
+                        )
                         self.assertNotIn("WK_CA_BUNDLE=", rendered)
                         self.assertNotIn(validator.APT_CA_BUNDLE_PATH, rendered)
                     else:
@@ -367,7 +455,8 @@ class ValidateProductionPackageClientsTest(unittest.TestCase):
                         self.assertEqual(
                             2,
                             rendered.count(
-                                'rpm --root "$client_root" -q wukongim'
+                                'if rpm --root "$client_root" -q wukongim '
+                                '>/dev/null 2>&1; then'
                             ),
                         )
                         self.assertIn(
@@ -378,6 +467,15 @@ class ValidateProductionPackageClientsTest(unittest.TestCase):
                         self.assertIn("dnf \"${dnf_options[@]}\" makecache", rendered)
                         self.assertIn("install --downloadonly", rendered)
                         self.assertIn("--downloaddir=/downloads wukongim", rendered)
+                        self.assertIn(
+                            'rpm --dbpath /tmp/bootstrap-rpmdb --install "$WK_BOOTSTRAP_PACKAGE"',
+                            rendered,
+                        )
+                        self.assertIn("wukongim-release", rendered)
+                        self.assertIn(
+                            "gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-wukongim-preview",
+                            rendered,
+                        )
                         self.assertIn("rpmkeys --dbpath /tmp/rpmdb --checksig", rendered)
                         self.assertNotIn("repoquery", rendered)
                         self.assertNotIn("curl ", rendered)
@@ -483,13 +581,10 @@ class ValidateProductionPackageClientsTest(unittest.TestCase):
             }
             fetched: list[str] = []
 
+            values = fixture.remote_files(status)
+
             def fetcher(url: str, maximum: int) -> bytes:
                 fetched.append(url)
-                values = {
-                    "https://packages.example/status.json": json.dumps(status).encode(),
-                    "https://packages.example/keys/apt-preview.asc": APT_CERTIFICATE,
-                    "https://packages.example/keys/rpm-preview.asc": RPM_CERTIFICATE,
-                }
                 self.assertLessEqual(len(values[url]), maximum)
                 return values[url]
 
@@ -510,7 +605,8 @@ class ValidateProductionPackageClientsTest(unittest.TestCase):
         self.assertEqual("1" * 40, receipt["control_sha"])
         self.assertFalse(receipt["snapshot_verified"])
         self.assertTrue(receipt["status_revalidated"])
-        self.assertEqual(4, len(fetched))
+        self.assertTrue(receipt["bootstrap_verified"])
+        self.assertEqual(9, len(fetched))
         self.assertEqual(2, fetched.count("https://packages.example/status.json"))
         for command in fixture.commands:
             self.assertNotIn("--network", command)
@@ -577,8 +673,12 @@ class ValidateProductionPackageClientsTest(unittest.TestCase):
             if item["indexed"] is False
         }
         self.assertTrue(retained_urls.issubset(fetched))
-        payload_urls = [url for url in fetched if "/apt/pool/" in url or "/Packages/" in url]
-        self.assertEqual(4, len(payload_urls))
+        payload_urls = {
+            f"https://packages.example/{item['path']}"
+            for family in ("apt", "rpm")
+            for item in fixture.snapshot_value["payloads"][family]
+        }
+        self.assertTrue(payload_urls.issubset(fetched))
         for family in ("apt", "rpm"):
             for result in receipt[family]:
                 self.assertEqual([VERSION], result["download"]["snapshot_versions"])
@@ -794,6 +894,194 @@ class ValidateProductionPackageClientsTest(unittest.TestCase):
                     runner=retained_runner,
                     fetcher=lambda url, maximum: files[url],
                 )
+
+    def test_bootstrap_manifest_and_both_package_paths_are_verified_before_clients(self) -> None:
+        with TemporaryDirectory() as temporary:
+            fixture = Fixture(Path(temporary))
+            runner = mock.Mock()
+            manifest = fixture.site / "bootstrap/manifest.json"
+            manifest.write_text(
+                json.dumps(fixture.bootstrap_value, indent=2), encoding="utf-8"
+            )
+            with self.assertRaisesRegex(
+                validator.ClientValidationError, "canonical JSON encoding"
+            ):
+                fixture.local_validate(runner)
+            runner.assert_not_called()
+
+        for family, field in (("apt", "download_path"), ("rpm", "repository_path")):
+            with self.subTest(family=family, field=field), TemporaryDirectory() as temporary:
+                fixture = Fixture(Path(temporary))
+                item = fixture.bootstrap_value["packages"][family]
+                fixture.site.joinpath(*Path(item[field]).parts).write_bytes(b"tampered")
+                runner = mock.Mock()
+                with self.assertRaisesRegex(
+                    validator.ClientValidationError,
+                    f"published {family} bootstrap .* differs from the bootstrap manifest",
+                ):
+                    fixture.local_validate(runner)
+                runner.assert_not_called()
+
+    def test_remote_bootstrap_paths_are_fetched_and_digest_checked(self) -> None:
+        with TemporaryDirectory() as temporary:
+            fixture = Fixture(Path(temporary))
+            files = fixture.remote_files()
+            fetched: list[str] = []
+
+            def fetcher(url: str, maximum: int) -> bytes:
+                fetched.append(url)
+                return files[url]
+
+            ca_bundle = Path(temporary) / "ca-certificates.crt"
+            ca_bundle.write_bytes(b"host ca\n")
+            with mock.patch.object(validator, "_host_ca_bundle", return_value=ca_bundle):
+                receipt = validator.validate_clients(
+                    site_root=None,
+                    snapshot_path=fixture.snapshot,
+                    base_url="https://packages.example",
+                    apt_public_cert=fixture.apt_certificate,
+                    rpm_public_cert=fixture.rpm_certificate,
+                    runner=fixture.runner,
+                    fetcher=fetcher,
+                )
+
+            expected_bootstrap_urls = {
+                f"https://packages.example/{item[field]}"
+                for item in fixture.bootstrap_value["packages"].values()
+                for field in ("repository_path", "download_path")
+            }
+            self.assertTrue(expected_bootstrap_urls.issubset(fetched))
+            self.assertTrue(receipt["bootstrap_verified"])
+
+            apt_direct = fixture.bootstrap_value["packages"]["apt"]["download_path"]
+            files[f"https://packages.example/{apt_direct}"] = b"tampered"
+            with self.assertRaisesRegex(
+                validator.ClientValidationError,
+                "remote apt bootstrap direct package .* differs from the bootstrap manifest",
+            ):
+                validator.validate_clients(
+                    site_root=None,
+                    snapshot_path=fixture.snapshot,
+                    base_url="https://packages.example",
+                    apt_public_cert=fixture.apt_certificate,
+                    rpm_public_cert=fixture.rpm_certificate,
+                    runner=mock.Mock(),
+                    fetcher=lambda url, maximum: files[url],
+                )
+
+    def test_only_the_reviewed_legacy_identity_may_omit_bootstrap(self) -> None:
+        with TemporaryDirectory() as temporary:
+            fixture = Fixture(Path(temporary))
+            fixture.snapshot_value["audit_release_id"] = (
+                validator.LEGACY_BOOTSTRAPLESS_IDENTITY[0]
+            )
+            fixture.snapshot_value["control_sha"] = (
+                validator.LEGACY_BOOTSTRAPLESS_IDENTITY[1]
+            )
+            fixture.write_snapshot()
+            fixture.remove_bootstrap()
+            receipt = fixture.local_validate()
+
+            self.assertFalse(receipt["bootstrap_verified"])
+            self.assertIsNone(receipt["bootstrap"])
+            self.assertTrue(all(
+                not item["bootstrap_installed"]
+                for family in ("apt", "rpm")
+                for item in receipt[family]
+            ))
+            self.assertTrue(all(
+                "WK_BOOTSTRAP_PACKAGE=" not in command
+                for command in fixture.commands
+            ))
+
+            legacy_status = fixture.status(
+                audit_release_id=validator.LEGACY_BOOTSTRAPLESS_IDENTITY[0],
+                control_sha=validator.LEGACY_BOOTSTRAPLESS_IDENTITY[1],
+                snapshot_sha256="2" * 64,
+            )
+            remote_files = {
+                "https://packages.example/status.json": json.dumps(legacy_status).encode(),
+                "https://packages.example/keys/apt-preview.asc": APT_CERTIFICATE,
+                "https://packages.example/keys/rpm-preview.asc": RPM_CERTIFICATE,
+            }
+
+            def legacy_fetcher(url: str, maximum: int) -> bytes:
+                if url.endswith("/bootstrap/manifest.json"):
+                    raise validator.ClientValidationError("public endpoint read failed: 404")
+                return remote_files[url]
+
+            ca_bundle = Path(temporary) / "ca-certificates.crt"
+            ca_bundle.write_bytes(b"host ca\n")
+            fixture.commands.clear()
+            with mock.patch.object(validator, "_host_ca_bundle", return_value=ca_bundle):
+                remote_receipt = validator.validate_clients(
+                    site_root=None,
+                    snapshot_path=None,
+                    base_url="https://packages.example",
+                    apt_public_cert=fixture.apt_certificate,
+                    rpm_public_cert=fixture.rpm_certificate,
+                    runner=fixture.runner,
+                    fetcher=legacy_fetcher,
+                )
+            self.assertFalse(remote_receipt["bootstrap_verified"])
+            self.assertIsNone(remote_receipt["bootstrap"])
+
+        with TemporaryDirectory() as temporary:
+            fixture = Fixture(Path(temporary))
+            fixture.remove_bootstrap()
+            runner = mock.Mock()
+            with self.assertRaisesRegex(
+                validator.ClientValidationError, "cannot open published bootstrap manifest"
+            ):
+                fixture.local_validate(runner)
+            runner.assert_not_called()
+
+    def test_bootstrap_client_commands_mount_and_install_only_the_bootstrap_package(self) -> None:
+        with TemporaryDirectory() as temporary:
+            fixture = Fixture(Path(temporary))
+            downloads = Path(temporary) / "downloads"
+            downloads.mkdir()
+            for family, clients, certificate in (
+                ("apt", validator.APT_CLIENTS, fixture.apt_certificate),
+                ("rpm", validator.RPM_CLIENTS, fixture.rpm_certificate),
+            ):
+                item = fixture.bootstrap_value["packages"][family]
+                package = fixture.site.joinpath(*Path(item["download_path"]).parts)
+                command = validator._client_command(
+                    clients[0][1], downloads, certificate, family,
+                    fixture.site, None, package,
+                )
+                image_index = command.index(clients[0][1])
+                self.assertIn(
+                    f"{package.resolve()}:/bootstrap/{package.name}:ro",
+                    command[:image_index],
+                )
+                self.assertIn(
+                    f"WK_BOOTSTRAP_PACKAGE=/bootstrap/{package.name}",
+                    command[:image_index],
+                )
+                rendered = "\n".join(command[image_index + 1:])
+                if family == "apt":
+                    self.assertIn(
+                        "/var/lib/apt:rw,noexec,nosuid,nodev,size=256m",
+                        command[:image_index],
+                    )
+                    self.assertIn('apt-get "${apt_options[@]}" download wukongim', rendered)
+                    self.assertIn("--no-install-recommends", rendered)
+                    self.assertIn("dpkg-deb --control", rendered)
+                else:
+                    self.assertIn(
+                        "/etc/pki/rpm-gpg:rw,noexec,nosuid,nodev,size=8m",
+                        command[:image_index],
+                    )
+                    self.assertIn(
+                        "/etc/yum.repos.d:rw,noexec,nosuid,nodev,size=8m",
+                        command[:image_index],
+                    )
+                    self.assertIn("install --downloadonly", rendered)
+                    self.assertIn('rpm -qp --scripts "$WK_BOOTSTRAP_PACKAGE"', rendered)
+                    self.assertIn("repo_gpgcheck=1", rendered)
+                    self.assertIn("gpgkey=file://$installed_key", rendered)
 
     def test_local_mode_rejects_download_absent_from_indexed_snapshot(self) -> None:
         with TemporaryDirectory() as temporary:

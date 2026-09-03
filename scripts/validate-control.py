@@ -18,6 +18,7 @@ from typing import Any
 
 
 CHANNELS_SCHEMA = "wukongim.native_package_channels/v3"
+BOOTSTRAP_SCHEMA = "wukongim.native_package_bootstrap/v1"
 SIGNING_SCHEMA = "wukongim.native_package_signing/v3"
 SIGNING_TOOLCHAIN_SCHEMA = "wukongim.native_package_signing_toolchain/v1"
 TOOLCHAIN_SCHEMA = "wukongim.native_package_toolchain/v1"
@@ -36,6 +37,11 @@ SEMVER_PRERELEASE = re.compile(
     r"(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)"
     r"(?:\.(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*$"
 )
+SEMVER_RELEASE = re.compile(
+    r"^(?:0|[1-9][0-9]*)\."
+    r"(?:0|[1-9][0-9]*)\."
+    r"(?:0|[1-9][0-9]*)$"
+)
 LOWER_SHA = re.compile(r"^[0-9a-f]{40}$")
 LOWER_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 UPPER_FINGERPRINT = re.compile(r"^[0-9A-F]{40}$")
@@ -52,6 +58,7 @@ CHANNEL_FIELDS = {
     "architectures",
     "channels",
 }
+BOOTSTRAP_FIELDS = {"schema", "enabled", "version"}
 PREVIEW_FIELDS = {"enabled", "status", "releases", "retirement", "publication"}
 STABLE_FIELDS = {"enabled", "status", "releases"}
 RETIREMENT_FIELDS = {"phase", "version", "not_before"}
@@ -147,6 +154,29 @@ def load_json(path: Path) -> Any:
         raise ContractError(f"cannot read {path}: {error}") from error
 
 
+def validate_bootstrap_packages(root: Path) -> dict[str, Any]:
+    bootstrap = exact_fields(
+        load_json(root / "manifests/bootstrap-packages.json"),
+        BOOTSTRAP_FIELDS,
+        "bootstrap-packages manifest",
+    )
+    require(
+        bootstrap["schema"] == BOOTSTRAP_SCHEMA,
+        f"bootstrap-packages schema must be {BOOTSTRAP_SCHEMA}",
+    )
+    require(
+        type(bootstrap["enabled"]) is bool,
+        "bootstrap-packages enabled must be boolean",
+    )
+    require(
+        isinstance(bootstrap["version"], str)
+        and SEMVER_RELEASE.fullmatch(bootstrap["version"]),
+        "bootstrap-packages version must be strict release SemVer without a v prefix, "
+        "prerelease, or build metadata",
+    )
+    return bootstrap
+
+
 def positive_integer(value: Any, context: str) -> None:
     require(type(value) is int and value > 0, f"{context} must be a positive integer")
 
@@ -185,13 +215,20 @@ def validate_publication(
     value: Any,
     releases: list[dict[str, Any]],
     retirement: dict[str, Any],
+    bootstrap_enabled: bool,
 ) -> dict[str, Any]:
     publication = exact_fields(value, PUBLICATION_FIELDS, "preview publication")
     operation = publication["operation"]
     require(
-        operation in {"none", "add_release", "remove_indexes", "remove_payloads"},
+        operation in {
+            "none",
+            "add_release",
+            "remove_indexes",
+            "remove_payloads",
+            "update_bootstrap",
+        },
         "preview publication.operation must be none, add_release, remove_indexes, "
-        "or remove_payloads",
+        "remove_payloads, or update_bootstrap",
     )
 
     audit_release_id = publication["audit_release_id"]
@@ -242,17 +279,32 @@ def validate_publication(
             and retirement["version"] == target_version,
             "remove_indexes target must match the indexes_removed retirement",
         )
-    else:
+    elif operation == "remove_payloads":
         positive_integer(base_audit_release_id, "preview publication.base_audit_release_id")
         require(base_audit_release_id != audit_release_id,
                 "publication audit and base audit Release IDs must differ")
         require(not matching, "remove_payloads target must be absent from preview releases")
         require(retirement["phase"] == "none",
                 "remove_payloads requires retirement.phase none")
+    else:
+        positive_integer(
+            base_audit_release_id,
+            "update_bootstrap requires a base_audit_release_id",
+        )
+        require(base_audit_release_id != audit_release_id,
+                "publication audit and base audit Release IDs must differ")
+        require(
+            bootstrap_enabled,
+            "update_bootstrap requires enabled bootstrap-packages control",
+        )
+        require(
+            len(matching) == 1 and matching[0]["state"] == "active",
+            "update_bootstrap target must be exactly one active preview release",
+        )
     return publication
 
 
-def validate_channels(root: Path) -> dict[str, Any]:
+def validate_channels(root: Path, bootstrap_enabled: bool) -> dict[str, Any]:
     channels = exact_fields(load_json(root / "manifests/channels.json"), CHANNEL_FIELDS, "channels manifest")
     require(channels["schema"] == CHANNELS_SCHEMA, f"channels schema must be {CHANNELS_SCHEMA}")
     require(channels["source_repository"] == SOURCE_REPOSITORY,
@@ -298,7 +350,9 @@ def validate_channels(root: Path) -> dict[str, Any]:
     else:
         raise ContractError("preview retirement.phase must be none or indexes_removed")
 
-    validate_publication(preview["publication"], releases, retirement)
+    validate_publication(
+        preview["publication"], releases, retirement, bootstrap_enabled
+    )
 
     require(type(stable["enabled"]) is bool and stable["enabled"] is False,
             "stable publishing must remain disabled on GitHub Pages")
@@ -851,7 +905,8 @@ def main() -> int:
     root = args.root.resolve()
     try:
         validate_tracked_inputs(root)
-        channels = validate_channels(root)
+        bootstrap = validate_bootstrap_packages(root)
+        channels = validate_channels(root, bootstrap["enabled"])
         signing = validate_signing(root)
         validate_signing_toolchain(root)
         validate_toolchain(root)

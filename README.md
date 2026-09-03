@@ -3,10 +3,39 @@
 This repository owns the public APT and RPM repository metadata for WuKongIM.
 The intended public endpoint is `https://packages.githubim.com`.
 
-The distribution channel is being bootstrapped. Until the signing manifests
-contain reviewed public-key fingerprints and the publishing workflow has
-completed, do not configure this endpoint as a package source. Unsigned or
-test-signed packages are never public releases.
+The signed preview channel publishes amd64/x86_64 packages. Preview releases
+are prereleases and should be validated outside production before rollout.
+
+## Install with the package manager
+
+On Debian or Ubuntu, install the small repository bootstrap package once, then
+install and upgrade WuKongIM normally with APT:
+
+```bash
+curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
+  --output wukongim-archive-keyring_1.0.0_all.deb \
+  https://packages.githubim.com/bootstrap/wukongim-archive-keyring_1.0.0_all.deb
+sudo apt install ./wukongim-archive-keyring_1.0.0_all.deb
+sudo apt update
+sudo apt install wukongim
+```
+
+On Rocky Linux, AlmaLinux, or RHEL 9, install the repository release package
+once, then use DNF (or the compatible `yum` command):
+
+```bash
+curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
+  --output wukongim-release-1.0.0-1.noarch.rpm \
+  https://packages.githubim.com/bootstrap/wukongim-release-1.0.0-1.noarch.rpm
+sudo dnf install ./wukongim-release-1.0.0-1.noarch.rpm
+sudo dnf --enablerepo=wukongim-preview install wukongim
+```
+
+The first bootstrap download necessarily trusts the HTTPS origin. The package
+then installs only the reviewed repository key and dedicated source file; it
+does not run network commands, start services, or weaken signature checks.
+After that first step, APT/DNF authenticates repository metadata and packages,
+and upgrades the bootstrap package through the same signed repository.
 
 The checked-in `site/` directory is deliberately only the disabled bootstrap
 page. Once preview publishing is enabled, the publisher builds and verifies a
@@ -29,9 +58,10 @@ never committed to Git.
 - Stable signing keys remain outside GitHub-hosted CI.
 - GitHub Pages will receive only complete, verified preview snapshots. Stable
   publication requires migration to object storage and a CDN.
-- `manifests/channels.json` and `manifests/preview-signing.json` are the
-  reviewed, fail-closed publication controls. GitHub variables and dispatch
-  payloads are not trust anchors.
+- `manifests/channels.json`, `manifests/preview-signing.json`, and
+  `manifests/bootstrap-packages.json` are the reviewed, fail-closed
+  publication controls. GitHub variables and dispatch payloads are not trust
+  anchors.
 - `manifests/source-read.json` keeps cross-repository verification disabled
   until a source-only GitHub App and protected Environment are provisioned.
 - `manifests/audit-access.json` keeps both package audit Apps fail-closed until
@@ -67,7 +97,8 @@ retention, signing, and recovery contracts.
 
 Reviewed public certificates are published at the stable URLs
 `https://packages.githubim.com/keys/apt-preview.asc` and
-`https://packages.githubim.com/keys/rpm-preview.asc`. This repository does not
-yet publish an APT or RPM keyring package. Existing clients therefore do not
-receive certificate updates automatically and must refresh the applicable
-certificate before a newly added successor subkey is promoted.
+`https://packages.githubim.com/keys/rpm-preview.asc`. The APT
+`wukongim-archive-keyring` and RPM `wukongim-release` packages distribute those
+certificates and dedicated repository definitions. Their indexed bytes and
+friendly `/bootstrap/` downloads are identical and are closed over by each
+immutable package audit snapshot.
