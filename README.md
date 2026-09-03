@@ -8,27 +8,39 @@ are prereleases and should be validated outside production before rollout.
 
 ## Install with the package manager
 
-On Debian or Ubuntu, install the small repository bootstrap package once, then
-install and upgrade WuKongIM normally with APT:
+On Debian or Ubuntu, use three steps: add the repository once, refresh the
+package index, then install WuKongIM by package name. Future installs and
+upgrades no longer require downloading a WuKongIM deb file manually:
 
 ```bash
+# 1. Add the WuKongIM preview repository
 curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
-  --output wukongim-archive-keyring_1.0.0_all.deb \
-  https://packages.githubim.com/bootstrap/wukongim-archive-keyring_1.0.0_all.deb
-sudo apt install ./wukongim-archive-keyring_1.0.0_all.deb
+  --output /tmp/wukongim-archive-keyring_1.0.0_all.deb \
+  https://packages.githubim.com/bootstrap/wukongim-archive-keyring_1.0.0_all.deb && \
+  sudo apt install -y /tmp/wukongim-archive-keyring_1.0.0_all.deb
+
+# 2. Refresh the package index
 sudo apt update
-sudo apt install wukongim
+
+# 3. Install WuKongIM
+sudo apt install -y wukongim
 ```
 
-On Rocky Linux, AlmaLinux, or RHEL 9, install the repository release package
-once, then use DNF (or the compatible `yum` command):
+On Rocky Linux, AlmaLinux, or RHEL 9, use the same three steps with DNF (or the
+compatible `yum` command):
 
 ```bash
+# 1. Add the WuKongIM preview repository
 curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
-  --output wukongim-release-1.0.0-1.noarch.rpm \
-  https://packages.githubim.com/bootstrap/wukongim-release-1.0.0-1.noarch.rpm
-sudo dnf install ./wukongim-release-1.0.0-1.noarch.rpm
-sudo dnf --enablerepo=wukongim-preview install wukongim
+  --output /tmp/wukongim-release-1.0.0-1.noarch.rpm \
+  https://packages.githubim.com/bootstrap/wukongim-release-1.0.0-1.noarch.rpm && \
+  sudo dnf install -y /tmp/wukongim-release-1.0.0-1.noarch.rpm
+
+# 2. Refresh the package index
+sudo dnf -y --disablerepo='*' --enablerepo=wukongim-preview makecache --refresh
+
+# 3. Install WuKongIM
+sudo dnf install -y wukongim
 ```
 
 The first bootstrap download necessarily trusts the HTTPS origin. The package
