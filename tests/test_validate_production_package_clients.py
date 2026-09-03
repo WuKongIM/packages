@@ -477,6 +477,8 @@ class ValidateProductionPackageClientsTest(unittest.TestCase):
                             rendered,
                         )
                         self.assertIn("rpmkeys --dbpath /tmp/rpmdb --checksig", rendered)
+                        self.assertIn("sha256sum <", rendered)
+                        self.assertNotIn("cmp ", rendered)
                         self.assertNotIn("repoquery", rendered)
                         self.assertNotIn("curl ", rendered)
 

@@ -270,7 +270,8 @@ sslverify=1
 metadata_expire=0
 skip_if_unavailable=0
 EOF
-  cmp -s /tmp/expected-wukongim-preview.repo "$installed_repo"
+  test "$(sha256sum < /tmp/expected-wukongim-preview.repo)" = \
+    "$(sha256sum < "$installed_repo")"
   cp "$installed_repo" /tmp/repos.d/wukongim-preview.repo
   # DNF resolves file:// repository keys in the container namespace, outside
   # the installroot.  Point the validation copy at the key installed inside
