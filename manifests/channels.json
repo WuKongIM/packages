@@ -29,9 +29,9 @@
         "not_before": null
       },
       "publication": {
-        "audit_release_id": 381152722,
-        "base_audit_release_id": null,
-        "operation": "add_release",
+        "audit_release_id": 381707165,
+        "base_audit_release_id": 381152722,
+        "operation": "update_bootstrap",
         "target_version": "3.0.0-beta.6"
       }
     },
