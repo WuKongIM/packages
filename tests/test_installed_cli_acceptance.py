@@ -158,6 +158,16 @@ class InstalledCLIContractTest(unittest.TestCase):
                     acceptance.validate(binary, binary, VERSION, 'a' * 40, FIXTURES, execute)
                 self.assertEqual(1, execute.call_count)
 
+    def test_root_mounted_script_accepts_explicit_fixture_path(self):
+        argv = ['/acceptance.py', '--fixtures', str(FIXTURES), '--version', VERSION,
+                '--commit', 'a' * 40]
+        with mock.patch.object(acceptance, '__file__', '/acceptance.py'), \
+             mock.patch.object(acceptance.sys, 'argv', argv), \
+             mock.patch.object(acceptance, 'validate', return_value=self.receipt()) as validate, \
+             mock.patch('sys.stdout', new=io.StringIO()):
+            self.assertEqual(0, acceptance.main())
+            self.assertEqual(FIXTURES.resolve(), validate.call_args.args[-1])
+
     def test_publication_and_repeat_workflows_keep_the_gate_and_read_only_boundary(self):
         publish = (ROOT / '.github/workflows/native-package-publish.yml').read_text()
         public = publish.split('      - name: Validate public downloads and installed CLI acceptance', 1)[1]

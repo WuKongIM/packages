@@ -151,7 +151,7 @@ def main():
     parser.add_argument('--server', type=Path, default=Path('/usr/bin/wukongim'))
     parser.add_argument('--version', required=True)
     parser.add_argument('--commit', required=True)
-    parser.add_argument('--fixtures', type=Path, default=Path(__file__).resolve().parents[1] / 'tests/fixtures/wkcli-acceptance')
+    parser.add_argument('--fixtures', type=Path, default=Path(__file__).resolve().parent.parent / 'tests/fixtures/wkcli-acceptance')
     args = parser.parse_args()
     try:
         receipt = validate(args.wkcli.resolve(), args.server.resolve(), args.version, args.commit, args.fixtures.resolve())
