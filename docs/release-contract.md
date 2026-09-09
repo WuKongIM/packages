@@ -416,3 +416,22 @@ RPM whose issuer is revoked must fail verification and cannot remain published
 under the normal historical-key exception. The
 updated certificate, manifest, snapshot, and audit receipt must agree before
 publication resumes. Audit artifacts remain retained.
+
+## Beta.12 immutable public recovery
+
+Audit `385374689`, bound to control
+`785af29d5bb32d3996e3060b496a68dacecee78a`, was sealed and deployed before
+the public verifier incorrectly rejected the reviewed release order. Recovery
+uses the read-only immutable-public-reverify workflow against this exact audit.
+The reviewed channel manifest is restored byte-for-byte to that artifact's
+control. Audit `385393510` remains immutable but was never deployed; it is not
+the active public identity. No Release, tag, signed payload, or Pages artifact
+is modified by recovery.
+
+The recovery boundary pins the numeric audit and artifact control, requires
+all identity manifests and certificates to remain byte-identical, and permits
+only the enumerated verifier, workflow, tests, and documentation differences.
+It verifies archived signatures and provenance, compares public critical bytes
+including `/repo` and the bootstrap manifest, and runs all four public clients
+for exact version `3.0.0-beta.12`. Any other artifact or control-plane change
+requires a separately reviewed recovery boundary.

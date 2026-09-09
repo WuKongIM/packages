@@ -229,7 +229,7 @@ required = (
     'snapshot_control_sha="$(jq -er \'.object.sha\' "$root/evidence/tag-initial.json")"',
     'test "$(jq -er \'.target_commitish\' "$release")" = "$snapshot_control_sha"',
     'git diff --name-status --no-renames "$snapshot_control_sha" "$GITHUB_SHA"',
-    "$'A\\t.github/workflows/native-package-immutable-public-reverify.yml'",
+    "$'M\\t.github/workflows/native-package-immutable-public-reverify.yml'",
     "$'M\\tscripts/validate-production-package-clients.py'",
     "$'M\\ttests/contract.sh'",
     "$'M\\ttests/test_validate_production_package_clients.py'",
@@ -245,6 +245,11 @@ required = (
     "gh attestation verify",
     "--network none --read-only --cap-drop ALL",
     "python3 /current/scripts/verify-production-package-site.py",
+    'test "$AUDIT_RELEASE_ID" = 385374689',
+    'test "$snapshot_control_sha" = 785af29d5bb32d3996e3060b496a68dacecee78a',
+    "$'M\\tdocs/release-contract.md'",
+    "fetch_and_compare repo",
+    "fetch_and_compare bootstrap/manifest.json",
     "fetch_and_compare status.json",
     "fetch_and_compare apt/dists/preview/Release",
     "fetch_and_compare rpm/preview/el/9/x86_64/repodata/repomd.xml",
@@ -301,6 +306,7 @@ expected_historical_paths = [
     "keys/apt-preview.asc",
     "keys/rpm-preview.asc",
     "manifests/audit-access.json",
+    "manifests/bootstrap-packages.json",
     "manifests/channels.json",
     "manifests/preview-signing.json",
     "manifests/signing-toolchain.json",
@@ -321,6 +327,7 @@ if identity_match is None:
     raise SystemExit("immutable public reverify lacks its byte-identity allowlist")
 identity_paths = [line.strip() for line in identity_match.group("body").splitlines()]
 expected_identity_paths = [
+    "manifests/bootstrap-packages.json",
     "manifests/channels.json",
     "manifests/preview-signing.json",
     "manifests/signing-toolchain.json",
