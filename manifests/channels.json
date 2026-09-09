@@ -20,7 +20,7 @@
           "deb_sha256": "c2a911e8b407d9038584caa14c0edb22a7f1d93fe0ae7f6c52d2ee6021c5822d",
           "rpm_sha256": "6862496d76a3e0131944111be3b87570d9d0d60d2486457f862fc25287762903",
           "state": "index_removed",
-          "not_before": "2026-09-09T15:38:58Z"
+          "not_before": "2026-09-09T16:08:38Z"
         },
         {
           "version": "3.0.0-beta.7",
@@ -56,10 +56,10 @@
       "retirement": {
         "phase": "indexes_removed",
         "version": "3.0.0-beta.6",
-        "not_before": "2026-09-09T15:38:58Z"
+        "not_before": "2026-09-09T16:08:38Z"
       },
       "publication": {
-        "audit_release_id": 385608888,
+        "audit_release_id": 385625182,
         "base_audit_release_id": 385374689,
         "operation": "remove_indexes",
         "target_version": "3.0.0-beta.6"
