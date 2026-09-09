@@ -428,6 +428,8 @@ class ValidateControlTest(unittest.TestCase):
             preview["enabled"] = True
             preview["status"] = "ready"
             preview["releases"] = [preview_release()]
+            # This signing fixture models an addition, independent of live retirement.
+            preview["retirement"] = {"phase": "none", "version": None, "not_before": None}
             preview["publication"] = publication(
                 "add_release",
                 audit_release_id=2001,
