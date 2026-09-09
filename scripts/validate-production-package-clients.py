@@ -7,7 +7,9 @@ its installed source/repository file and key to perform an authenticated,
 download-only product transaction.  APT downloads ``wukongim`` without
 installing it.  DNF runs its genuine ``install --downloadonly`` transaction.
 Both clients prove that ``wukongim`` is absent before and after the transaction;
-the product package is never executed.  Bootstrap packages are installed only
+the product package is never executed in the download-only clients. An explicit
+remote-only installed-CLI phase can then install the authenticated bytes in
+fresh credential-free containers and run the reviewed offline acceptance fixtures.  Bootstrap packages are installed only
 after their direct-download and indexed copies have been matched to the
 canonical public bootstrap manifest.  The downloaded RPM is also checked
 against the reviewed public certificate in an isolated RPM database.
@@ -1366,6 +1368,62 @@ def _download_receipt(
     }
 
 
+
+def _installed_cli_command(image, package, output, certificate, family, identity, digest):
+    # This is a distinct installation sandbox. Download/signing sandboxes keep
+    # their existing read-only, never-execute-product contract.
+    suffix = "deb" if family == "apt" else "rpm"
+    command = ["docker", "run", "--rm", "--platform", "linux/amd64",
+               "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+               "--pids-limit", "128", "--memory", "768m", "--cpus", "2",
+               "--ulimit", "fsize=134217728:134217728",
+               "--tmpfs", "/tmp:rw,noexec,nosuid,nodev,size=256m"]
+    for capability in ("CHOWN", "DAC_OVERRIDE", "FOWNER", "FSETID", "SETGID", "SETUID", "SETFCAP"):
+        command.extend(("--cap-add", capability))
+    command.extend((
+        "--volume", f"{package.resolve(strict=True)}:/candidate.{suffix}:ro",
+        "--volume", f"{output.resolve(strict=True)}:/evidence:rw",
+        "--volume", f"{certificate.resolve(strict=True)}:/reviewed-key.asc:ro",
+        "--volume", f"{SCRIPT_DIR / 'validate-installed-wkcli.py'}:/acceptance.py:ro",
+        "--volume", f"{SCRIPT_DIR.parent / 'tests/fixtures/wkcli-acceptance'}:/fixtures:ro",
+        "--env", f"WK_EXPECTED_VERSION={identity['version']}",
+        "--env", f"WK_EXPECTED_COMMIT={identity['commit']}",
+        "--env", f"WK_PACKAGE_SHA256={digest}",
+    ))
+    if family == "apt":
+        install = """
+printf '%s  %s\n' "$WK_PACKAGE_SHA256" /candidate.deb | sha256sum --check --strict
+printf '#!/bin/sh\nexit 101\n' >/usr/sbin/policy-rc.d
+chmod 0755 /usr/sbin/policy-rc.d
+apt-get -o Acquire::Retries=3 update
+DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 install -y python3 /candidate.deb
+"""
+    else:
+        install = """
+printf '%s  %s\n' "$WK_PACKAGE_SHA256" /candidate.rpm | sha256sum --check --strict
+rpm --import /reviewed-key.asc
+rpm --checksig /candidate.rpm
+dnf --setopt=localpkg_gpgcheck=1 --setopt=timeout=60 install -y python3 /candidate.rpm
+"""
+    command.extend((image, "timeout", "--kill-after=10s", "600s", "bash", "-euc", install + """
+python3 /acceptance.py --fixtures /fixtures --version "$WK_EXPECTED_VERSION" \
+  --commit "$WK_EXPECTED_COMMIT" >/evidence/installed-cli.json
+"""))
+    return command
+
+
+def _installed_cli_receipt(path, identity):
+    value, _ = _load_json(path, "installed CLI receipt")
+    _require(value.get("schema") == "wukongim/installed-cli-acceptance/v1"
+             and value.get("identity") == identity and value.get("verified") is True
+             and value.get("checks") == ["version", "help", "bench_validate", "db_query",
+                                        "migrate_diagnose", "invalid_inputs", "read_only_data"],
+             "installed CLI acceptance receipt is incomplete or has a wrong release identity")
+    fixture_manifest, _ = _load_json(
+        SCRIPT_DIR.parent / "tests/fixtures/wkcli-acceptance/sha256.json", "CLI fixture inventory")
+    _require(value.get("fixtures") == fixture_manifest, "installed CLI fixture identity mismatch")
+    return value
+
 def validate_clients(
     *,
     site_root: Path | None,
@@ -1374,6 +1432,7 @@ def validate_clients(
     apt_public_cert: Path,
     rpm_public_cert: Path,
     expected_version: str | None = None,
+    verify_installed_cli: bool = False,
     runner: Callable[[Sequence[str]], None] = _run,
     fetcher: Callable[[str, int], bytes] = _fetch_public_file,
 ) -> dict[str, Any]:
@@ -1389,6 +1448,8 @@ def validate_clients(
         _require(snapshot_path is not None,
                  "expected version validation requires a reviewed snapshot")
 
+    _require(not verify_installed_cli or (not local and snapshot_path is not None and expected_version is not None),
+             "installed CLI acceptance requires remote mode, reviewed snapshot and exact version")
     certificates = {
         "apt": (
             apt_public_cert,
@@ -1437,6 +1498,13 @@ def validate_clients(
             fetcher,
         )
 
+    installed_identity = None
+    if verify_installed_cli:
+        reviewed, _ = _load_canonical_snapshot(snapshot_path)
+        matches = [release for release in reviewed["releases"] if release["version"] == expected_version]
+        _require(len(matches) == 1, "installed CLI target identity is ambiguous")
+        installed_identity = {"version": expected_version, "commit": matches[0]["source_sha"],
+                              "build_source": "release"}
     results: dict[str, list[dict[str, Any]]] = {"apt": [], "rpm": []}
     entrypoint_execution: dict[str, dict[str, Any]] = {}
     if expected_version is not None:
@@ -1532,11 +1600,26 @@ def validate_clients(
                         receipt["snapshot_versions"] == [expected_version],
                         f"{distribution} downloaded a version other than expected {expected_version}",
                     )
+                installed = None
+                if installed_identity is not None:
+                    evidence = root / f"installed-{distribution}"
+                    evidence.mkdir(mode=0o777)
+                    evidence.chmod(0o777)
+                    command = _installed_cli_command(
+                        image, downloads / receipt["filename"], evidence,
+                        certificates[family][0], family, installed_identity, receipt["sha256"],
+                    )
+                    try:
+                        runner(command)
+                    except (OSError, subprocess.CalledProcessError) as error:
+                        raise ClientValidationError(f"{distribution} installed CLI acceptance failed: {error}") from error
+                    installed = _installed_cli_receipt(evidence / "installed-cli.json", installed_identity)
                 results[family].append({
                     "distribution": distribution,
                     "image": image,
                     "bootstrap_installed": bootstrap is not None,
                     "download": receipt,
+                    "installed_cli": installed,
                 })
 
     if not local:
@@ -1550,6 +1633,7 @@ def validate_clients(
     output: dict[str, Any] = {
         "schema": RECEIPT_SCHEMA,
         "mode": "local" if local else "remote",
+        "installed_cli_verified": verify_installed_cli,
         "expected_version": expected_version,
         "expected_version_verified": expected_version is not None,
         "bootstrap_verified": bootstrap is not None,
@@ -1589,6 +1673,7 @@ def build_parser() -> argparse.ArgumentParser:
     location.add_argument("--base-url")
     parser.add_argument("--snapshot", type=Path)
     parser.add_argument("--expected-version")
+    parser.add_argument("--verify-installed-cli", action="store_true")
     parser.add_argument("--apt-public-cert", required=True, type=Path)
     parser.add_argument("--rpm-public-cert", required=True, type=Path)
     return parser
@@ -1604,6 +1689,7 @@ def main(argv: list[str] | None = None) -> int:
             apt_public_cert=args.apt_public_cert,
             rpm_public_cert=args.rpm_public_cert,
             expected_version=args.expected_version,
+            verify_installed_cli=args.verify_installed_cli,
         )
     except ClientValidationError as error:
         print(f"production package client validation failed: {error}", file=sys.stderr)

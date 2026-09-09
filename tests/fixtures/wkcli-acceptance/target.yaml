@@ -1,0 +1,13 @@
+# An isolated single-node cluster reachable from the coordinator and worker.
+name: docs-single-node-cluster
+api:
+  addrs: [http://127.0.0.1:5001]
+gateway:
+  tcp:
+    addrs: [127.0.0.1:5100]
+bench_api:
+  enabled: true
+  token: ${WK_BENCH_API_TOKEN}
+metrics:
+  enabled: true
+  addrs: [http://127.0.0.1:5001/metrics]

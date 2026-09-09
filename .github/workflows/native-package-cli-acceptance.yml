@@ -1,0 +1,108 @@
+name: Safety Automation - Verify Installed Public CLI
+
+on:
+  workflow_dispatch:
+    inputs:
+      expected_control_sha:
+        description: Exact protected packages/main commit containing the reviewed acceptance checks
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: packages-pages
+  cancel-in-progress: false
+
+jobs:
+  acceptance:
+    name: Verify installed CLI from the reviewed public snapshot
+    if: github.repository == 'WuKongIM/packages' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - name: Check out exact protected acceptance control
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Fence current control and resolve the reviewed immutable audit
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_CONTROL_SHA: ${{ inputs.expected_control_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$EXPECTED_CONTROL_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$EXPECTED_CONTROL_SHA" = "$GITHUB_SHA"
+          test "$(gh api repos/WuKongIM/packages/git/ref/heads/main --jq .object.sha)" = "$GITHUB_SHA"
+          ./scripts/validate-control.py
+          ./tests/contract.sh
+          root="$RUNNER_TEMP/public-cli-acceptance"
+          mkdir -p "$root/evidence"
+          id="$(jq -er '.channels.preview.publication.audit_release_id' manifests/channels.json)"
+          [[ "$id" =~ ^[1-9][0-9]*$ ]]
+          tag="native-package-preview-r${id}"
+          gh api "repos/WuKongIM/packages/git/ref/tags/$tag" >"$root/evidence/tag.json"
+          artifact_control="$(jq -er '.object | select(.type == "commit") | .sha' "$root/evidence/tag.json")"
+          [[ "$artifact_control" =~ ^[0-9a-f]{40}$ ]]
+          git merge-base --is-ancestor "$artifact_control" "$GITHUB_SHA"
+          for path in manifests/channels.json manifests/preview-signing.json manifests/signing-toolchain.json manifests/bootstrap-packages.json keys/apt-preview.asc keys/rpm-preview.asc; do
+            git show "$artifact_control:$path" | cmp - "$path"
+          done
+          ./scripts/resolve-audit-release.py --release-id "$id" \
+            --expected-control-sha "$artifact_control" --expected-tag-state exact \
+            --output-dir "$root/assets" --token-env GH_TOKEN >"$root/evidence/resolution.json"
+          jq -e '.classification == "immutable_complete" and .immutable == true' "$root/evidence/resolution.json" >/dev/null
+          ./scripts/archive-package-snapshot.py extract \
+            --archive "$root/assets/wukongim-preview-r${id}-site.tar" \
+            --output-dir "$root/snapshot" >"$root/evidence/extraction.json"
+          ./scripts/package-audit-receipt.py verify \
+            --channels manifests/channels.json --signing manifests/preview-signing.json \
+            --signing-toolchain manifests/signing-toolchain.json \
+            --apt-public-cert keys/apt-preview.asc --rpm-public-cert keys/rpm-preview.asc \
+            --source-attestations "$root/snapshot/audit/source-attestations" \
+            --plan "$root/snapshot/audit/plan.json" \
+            --apt-receipt "$root/snapshot/audit/apt-signing.json" \
+            --rpm-receipt "$root/snapshot/audit/rpm-signing.json" \
+            --archive "$root/assets/wukongim-preview-r${id}-site.tar" \
+            --receipt "$root/assets/wukongim-preview-r${id}-receipt.json" \
+            >"$root/evidence/receipt.json"
+
+      - name: Verify public downloads and installed functionality on four distributions
+        shell: bash
+        run: |
+          set -euo pipefail
+          target="$(jq -er '.channels.preview.publication.target_version' manifests/channels.json)"
+          python3 scripts/validate-production-package-clients.py \
+            --base-url https://packages.githubim.com \
+            --snapshot "$RUNNER_TEMP/public-cli-acceptance/snapshot/audit/snapshot.json" \
+            --apt-public-cert keys/apt-preview.asc --rpm-public-cert keys/rpm-preview.asc \
+            --expected-version "$target" --verify-installed-cli \
+            >"$RUNNER_TEMP/public-cli-acceptance/evidence/clients.json"
+          jq -e '.installed_cli_verified == true and .status_revalidated == true and
+            (.apt | length) == 2 and (.rpm | length) == 2 and
+            all((.apt[], .rpm[]); .installed_cli.verified == true)' \
+            "$RUNNER_TEMP/public-cli-acceptance/evidence/clients.json" >/dev/null
+
+      - name: Re-fence protected main after acceptance
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$(gh api repos/WuKongIM/packages/git/ref/heads/main --jq .object.sha)" = "$GITHUB_SHA"
+          git diff --exit-code HEAD --
+          test -z "$(git status --short --untracked-files=all)"
+
+      - name: Retain public acceptance evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: public-cli-acceptance-${{ github.sha }}
+          path: ${{ runner.temp }}/public-cli-acceptance/evidence/
+          if-no-files-found: warn
+          retention-days: 90

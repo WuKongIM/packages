@@ -435,3 +435,40 @@ It verifies archived signatures and provenance, compares public critical bytes
 including `/repo` and the bootstrap manifest, and runs all four public clients
 for exact version `3.0.0-beta.12`. Any other artifact or control-plane change
 requires a separately reviewed recovery boundary.
+
+## Installed CLI publication gate
+
+Every new `add_release` publication must pass `--verify-installed-cli` in its
+final public-client job. The existing download-only sandboxes still never
+execute product payloads. Only after each public download matches the reviewed
+snapshot does a separate, fresh container install those exact bytes. It receives
+no credentials, Docker socket, host data directory, or writable control checkout.
+The installation container has bounded memory, CPU, processes, file sizes and a
+600-second deadline. Package-manager dependency downloads use the distribution's
+normal repositories; RPM local-package signature checking stays enabled.
+
+The reviewed acceptance script and checksum-bound synthetic fixtures are mounted
+read-only. Commands run in private scratch space with caller WK_* and user
+configuration removed, each with a 30-second deadline. Server and CLI identities
+must both equal the snapshot's exact version, source SHA and `release` build
+source. Functional checks cover `bench validate`, a bounded offline query for
+one known user, and a complete `migrate diagnose` source scan. Invalid benchmark,
+query and migration inputs must fail with their documented family exit codes.
+Queries and diagnosis must preserve source bytes; diagnosis must not create the
+target. No cluster, benchmark worker or message traffic is started.
+
+A missing binary, wrong identity, incomplete result, changed fixture or source
+bytes, timeout, or failure on any of the four distributions fails publication.
+Deployment by itself remains incomplete. The receipt includes each installed
+CLI result and the top-level `installed_cli_verified` gate. Bootstrap/retirement
+operations keep their existing compatibility policy and do not require a CLI
+from older retained releases.
+
+`native-package-cli-acceptance.yml` is the read-only repeat check for the currently
+reviewed published snapshot. Its only input is the exact current protected
+control SHA. It derives the numeric audit and target from channels.json, resolves
+the immutable archive/receipt, requires artifact identity manifests and keys to
+match current control byte-for-byte, verifies public downloads and all installed
+clients, and rechecks main. It shares the non-cancelling `packages-pages` group;
+no control merge, publication, binding or snapshot replacement may race this run.
+It neither signs nor deploys, creates Releases, or changes immutable audit tags.

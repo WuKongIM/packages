@@ -1,0 +1,6 @@
+# The token must match the worker process environment.
+workers:
+  - id: docs-worker
+    addr: http://127.0.0.1:19090
+    weight: 1
+    control_token: ${WK_BENCH_WORKER_TOKEN}
