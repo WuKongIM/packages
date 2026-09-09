@@ -1,0 +1,79 @@
+# A small smoke workload, not a capacity claim. Use a fresh run ID each time.
+version: wkbench/v1
+run:
+  id: ${WK_BENCH_RUN_ID}
+  duration: 60s
+  warmup: 10s
+  cooldown: 10s
+  random_seed: 42
+  fail_fast: true
+  report_dir: ./reports/${WK_BENCH_RUN_ID}
+limits:
+  fail_on_soft: true
+  hard:
+    max_worker_failed: 0
+    max_connect_error_rate: 0
+    max_sendack_error_rate: 0
+    max_recv_verify_error_rate: 0
+  soft:
+    max_sendack_p99: 200ms
+    max_recv_p99: 500ms
+prepare:
+  concurrency: 2
+  rate_limit: 10/s
+  retry:
+    max_attempts: 3
+    backoff: 100ms
+identity:
+  total_users: 20
+  uid_prefix: docs-u
+  device_prefix: docs-d
+  client_msg_prefix: docs-m
+  token:
+    mode: bench_api
+online:
+  total_users: 20
+  connect_rate: 5/s
+  gateway_balance: round_robin
+  reconnect:
+    enabled: false
+  heartbeat:
+    enabled: true
+    interval: 30s
+    timeout: 5s
+channels:
+  profiles:
+    - name: small-group
+      channel_type: group
+      count: 2
+      members:
+        count: 10
+        pick: random
+        overlap: disallowed
+      online:
+        sender_ratio: 1
+        recipient_ratio: 1
+        member_ratio: 1
+      shard:
+        mode: hash
+      prepare:
+        subscribers_batch_size: 10
+cleanup:
+  enabled: false
+  strategy: keep_data
+messages:
+  payload:
+    size_bytes: 128
+    mode: fixed
+  traffic:
+    - name: group-send
+      channel_ref: small-group
+      rate_per_channel: 5/s
+      ack_timeout: 5s
+      recv_timeout: 5s
+      sender_pick: random_online
+      recv_ack: true
+      verify:
+        recv:
+          mode: sample
+          sample_size_per_message: 2

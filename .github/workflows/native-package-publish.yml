@@ -1667,7 +1667,7 @@ jobs:
           fetch_and_check "$RPM_BOOTSTRAP_PATH" "$RPM_BOOTSTRAP_SHA256"
           fetch_and_check "$RPM_BOOTSTRAP_REPOSITORY_PATH" "$RPM_BOOTSTRAP_SHA256"
 
-      - name: Validate production endpoint with clean download-only clients
+      - name: Validate public downloads and installed CLI acceptance
         shell: bash
         env:
           AUDIT_RELEASE_ID: ${{ needs.control.outputs.audit_release_id }}
@@ -1682,6 +1682,9 @@ jobs:
           client_target_args=()
           if [[ "$OPERATION" == add_release || "$OPERATION" == update_bootstrap ]]; then
             client_target_args+=(--expected-version "$TARGET_VERSION")
+          fi
+          if [[ "$OPERATION" == add_release ]]; then
+            client_target_args+=(--verify-installed-cli)
           fi
           python3 scripts/validate-production-package-clients.py \
             --base-url https://packages.githubim.com \
@@ -1702,6 +1705,12 @@ jobs:
              .mode == "remote" and .audit_release_id == $id and
              .control_sha == $control and .snapshot_sha256 == $snapshot and
              .snapshot_verified == true and .status_revalidated == true and
+             (if $operation == "add_release" then
+                .installed_cli_verified == true and
+                all((.apt[], .rpm[]); .installed_cli.verified == true and
+                  .installed_cli.identity.version == $target and
+                  .installed_cli.identity.build_source == "release")
+              else .installed_cli_verified == false end) and
              .bootstrap_verified == true and .bootstrap != null and
              .repository_entrypoint_executed == true and
              (.entrypoint_execution | keys) == ["apt", "rpm"] and
@@ -1723,11 +1732,12 @@ jobs:
             "$RUNNER_TEMP/public-client-validation.json" >/dev/null
 
       - name: Upload public endpoint verification evidence
+        if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: native-package-public-verification-${{ needs.control.outputs.audit_release_id }}
           path: ${{ runner.temp }}/public-client-validation.json
-          if-no-files-found: error
+          if-no-files-found: warn
           retention-days: 90
 
       - name: Re-fence main after public verification
