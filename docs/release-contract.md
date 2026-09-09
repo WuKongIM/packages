@@ -133,7 +133,10 @@ limit.
 
 An `add_release` target must rank strictly above every active base version under
 strict SemVer precedence and under the exact DEB and RPM version mappings used
-by the fixed signing toolchain. The planner calls both `dpkg --compare-versions`
+by the fixed signing toolchain. Snapshot release facts preserve the reviewed
+manifest order; canonical payload inventories sort their version keys lexically.
+The public verifier checks unique release identities and exact payload coverage
+without imposing lexical order on release facts. The planner calls both `dpkg --compare-versions`
 and RPM's native `rpm.vercmp`; disagreement or a non-increase fails closed. A
 `remove_indexes` transition may remove only the oldest active version. For an
 addition, all four clean-client checks must download bytes mapped exclusively

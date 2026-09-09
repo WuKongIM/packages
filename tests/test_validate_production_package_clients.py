@@ -718,6 +718,47 @@ class ValidateProductionPackageClientsTest(unittest.TestCase):
             for result in receipt[family]:
                 self.assertEqual([VERSION], result["download"]["snapshot_versions"])
 
+    def test_remote_snapshot_accepts_reviewed_beta_order_but_rejects_duplicates(self) -> None:
+        for duplicate in (False, True):
+            with self.subTest(duplicate=duplicate), TemporaryDirectory() as temporary, mock.patch.dict(
+                globals(), {"VERSION": "3.0.0-beta.12", "RETAINED_VERSION": "3.0.0-beta.9"}
+            ):
+                fixture = Fixture(Path(temporary))
+                fixture.add_retained_payloads()
+                # The composer preserves reviewed release order but emits payloads
+                # in canonical lexical order, which differs for beta.9/beta.12.
+                for family in ("apt", "rpm"):
+                    fixture.snapshot_value["payloads"][family].sort(key=lambda item: item["version"])
+                if duplicate:
+                    fixture.snapshot_value["releases"].append(dict(fixture.snapshot_value["releases"][0]))
+                fixture.write_snapshot()
+                files = fixture.remote_files()
+                ca_bundle = Path(temporary) / "ca-certificates.crt"
+                ca_bundle.write_bytes(b"host ca\n")
+                with mock.patch.object(validator, "_host_ca_bundle", return_value=ca_bundle):
+                    def validate():
+                        return validator.validate_clients(
+                            site_root=None,
+                            snapshot_path=fixture.snapshot,
+                            base_url="https://packages.example/",
+                            apt_public_cert=fixture.apt_certificate,
+                            rpm_public_cert=fixture.rpm_certificate,
+                            expected_version=VERSION,
+                            runner=fixture.runner,
+                            fetcher=lambda url, maximum: files[url],
+                        )
+                    if duplicate:
+                        with self.assertRaisesRegex(validator.ClientValidationError, "versions must be unique"):
+                            validate()
+                        self.assertEqual([], fixture.commands)
+                    else:
+                        receipt = validate()
+                        self.assertTrue(receipt["snapshot_verified"])
+                        self.assertTrue(receipt["expected_version_verified"])
+                        for family in ("apt", "rpm"):
+                            for result in receipt[family]:
+                                self.assertEqual([VERSION], result["download"]["snapshot_versions"])
+
     def test_remote_status_bytes_must_remain_exact_through_client_downloads(self) -> None:
         with TemporaryDirectory() as temporary:
             fixture = Fixture(Path(temporary))
