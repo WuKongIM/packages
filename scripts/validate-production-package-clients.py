@@ -946,15 +946,14 @@ def _validate_reviewed_remote_snapshot(
     releases_value = snapshot["releases"]
     _require(isinstance(releases_value, list), "snapshot releases must be an array")
     releases: dict[str, dict[str, Any]] = {}
-    prior_version = ""
     for index, raw in enumerate(releases_value):
         release = _exact_object(raw, RELEASE_FIELDS, f"snapshot release {index}")
         version = release["version"]
         _require(isinstance(version, str) and VERSION_RE.fullmatch(version) is not None,
                  f"snapshot release {index} version is invalid")
-        _require(version > prior_version and version not in releases,
-                 "snapshot release versions must be unique and sorted")
-        prior_version = version
+        # The composer preserves reviewed manifest order for release facts.
+        # Only payload inventories use lexical order; beta.12 may follow beta.9.
+        _require(version not in releases, "snapshot release versions must be unique")
         _require(isinstance(release["source_sha"], str)
                  and SHA1_RE.fullmatch(release["source_sha"]) is not None,
                  f"snapshot release {version} source_sha is invalid")
