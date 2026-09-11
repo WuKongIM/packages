@@ -13,16 +13,6 @@
       "status": "ready",
       "releases": [
         {
-          "version": "3.0.0-beta.7",
-          "source_sha": "3d0d1696a49a2617a44cb5c84e2d5cfa95913a09",
-          "source_release_id": 381831756,
-          "package_release_id": 381833800,
-          "deb_sha256": "a920b74e6276e32b1b44b39b418a82ce2a1392b91a536650af17988b88b934e3",
-          "rpm_sha256": "c26c2672c4e50aa83d0f9b73927f67f58bd90e3c93162f84ce7d37797ffed0f3",
-          "state": "index_removed",
-          "not_before": "2026-09-11T18:15:00Z"
-        },
-        {
           "version": "3.0.0-beta.9",
           "source_sha": "734166e0ec30fc0f6f10fef6f6d1889d079ab636",
           "source_release_id": 383828341,
@@ -54,14 +44,14 @@
         }
       ],
       "retirement": {
-        "phase": "indexes_removed",
-        "version": "3.0.0-beta.7",
-        "not_before": "2026-09-11T18:15:00Z"
+        "phase": "none",
+        "version": null,
+        "not_before": null
       },
       "publication": {
-        "audit_release_id": 387220361,
-        "base_audit_release_id": 385672103,
-        "operation": "remove_indexes",
+        "audit_release_id": 387230285,
+        "base_audit_release_id": 387220361,
+        "operation": "remove_payloads",
         "target_version": "3.0.0-beta.7"
       }
     },
