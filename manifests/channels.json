@@ -41,6 +41,16 @@
           "rpm_sha256": "709728ac0ae36740c4baa75e0efe4568eba6fa6e6c23bf44f4c16b82612dcc5c",
           "state": "active",
           "not_before": null
+        },
+        {
+          "version": "3.0.0-beta.21",
+          "source_sha": "eff9b4d1ef0d072016796e9fa5d20849e93a0bdd",
+          "source_release_id": 392080063,
+          "package_release_id": 392081326,
+          "deb_sha256": "2543bc3c15cd90a9e1ac6f53260e0ad0622716ca46d61de30d46aada0f17961e",
+          "rpm_sha256": "8d02d3f08593ece1ff8c11b4d7c1b6e84e4479e5beda9b7c3e4652ca3b75f312",
+          "state": "active",
+          "not_before": null
         }
       ],
       "retirement": {
@@ -49,10 +59,10 @@
         "not_before": null
       },
       "publication": {
-        "audit_release_id": 388894170,
-        "base_audit_release_id": 388884077,
-        "operation": "remove_payloads",
-        "target_version": "3.0.0-beta.12"
+        "audit_release_id": 392081326,
+        "base_audit_release_id": 388894170,
+        "operation": "add_release",
+        "target_version": "3.0.0-beta.21"
       }
     },
     "stable": {
