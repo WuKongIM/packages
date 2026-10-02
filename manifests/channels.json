@@ -59,7 +59,7 @@
         "not_before": "2026-10-02T14:00:00Z"
       },
       "publication": {
-        "audit_release_id": 401825146,
+        "audit_release_id": 401835685,
         "base_audit_release_id": 401701963,
         "operation": "remove_indexes",
         "target_version": "3.0.0-beta.14"

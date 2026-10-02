@@ -129,7 +129,7 @@ RPM_CLIENTS = (
         "rocky-linux-9",
         # The init variant contains systemd, which satisfies the package's
         # runtime dependency while the reviewed repository remains offline.
-        "quay.io/rockylinux/rockylinux@sha256:0a384e1e9c7562251c9e2fdc4843b3ea21118e606dabfbe87d41f842f6f006ec",
+        "quay.io/rockylinux/rockylinux@sha256:45e07bfa0996c2f62f8aa49492b37f0db1fd2eab1c182f9cf2b04b9fdcd3ade4",
     ),
     (
         "alma-linux-9",
