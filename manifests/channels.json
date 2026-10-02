@@ -19,8 +19,8 @@
           "package_release_id": 387250694,
           "deb_sha256": "8017cd191c089b71dbcc1435a10198c32b4d5070cc0877eaf2e16354cdb037b1",
           "rpm_sha256": "435b67258705e515430f79457589435d603787940773eab6fad79122323d3ff0",
-          "state": "active",
-          "not_before": null
+          "state": "index_removed",
+          "not_before": "2026-10-02T14:00:00Z"
         },
         {
           "version": "3.0.0-beta.16",
@@ -54,15 +54,15 @@
         }
       ],
       "retirement": {
-        "phase": "none",
-        "version": null,
-        "not_before": null
+        "phase": "indexes_removed",
+        "version": "3.0.0-beta.14",
+        "not_before": "2026-10-02T14:00:00Z"
       },
       "publication": {
-        "audit_release_id": 401701963,
-        "base_audit_release_id": 401668801,
-        "operation": "add_release",
-        "target_version": "3.0.0-beta.22"
+        "audit_release_id": 401825146,
+        "base_audit_release_id": 401701963,
+        "operation": "remove_indexes",
+        "target_version": "3.0.0-beta.14"
       }
     },
     "stable": {
