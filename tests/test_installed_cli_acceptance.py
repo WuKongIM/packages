@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import io
 import json
 from pathlib import Path
@@ -21,6 +22,23 @@ CHECKS = ['version', 'help', 'bench_validate', 'db_query', 'migrate_diagnose', '
 
 
 class InstalledCLIContractTest(unittest.TestCase):
+    def test_native_fixture_is_a_registered_format_2_generation(self):
+        with tarfile.open(FIXTURES / 'native-v3.tar.gz') as archive:
+            self.assertIn('DATA-FORMAT.json', archive.getnames())
+            metadata = json.load(archive.extractfile('DATA-FORMAT.json'))
+        self.assertEqual('wukongim-v3', metadata['format'])
+        self.assertEqual(2, metadata['format_version'])
+        self.assertEqual(dict(program='wkcli', version='3.0.0-beta.22',
+                              commit='e12d13cdc797c53315f703445d5f4a950e064d6b',
+                              build_source='release'), metadata['created_by'])
+
+    def test_unregistered_native_fixture_preserves_original_database_bytes(self):
+        path = FIXTURES / 'native-v3-unregistered.tar.gz'
+        self.assertEqual('6bfc89f1dbe171b2f3a09998709fe9bfb0c406b962ee0f031ca66425b22377eb',
+                         hashlib.sha256(path.read_bytes()).hexdigest())
+        with tarfile.open(path) as archive:
+            self.assertNotIn('DATA-FORMAT.json', archive.getnames())
+
     def receipt(self):
         return dict(schema='wukongim/installed-cli-acceptance/v1', identity=IDENTITY,
                     fixtures=json.loads((FIXTURES / 'sha256.json').read_text()), checks=CHECKS, verified=True)

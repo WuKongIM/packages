@@ -81,6 +81,7 @@ def validate(wkcli, server, version, commit, fixtures, execute=run):
     for binary in (wkcli, server):
         require(binary.is_file() and os.access(binary, os.X_OK), f'missing executable: {binary}')
     names = {'target.yaml', 'workers.yaml', 'scenario.yaml', 'native-v3.tar.gz',
+             'native-v3-unregistered.tar.gz',
              'original-v2-empty.tar.gz'}
     digests = json.loads((fixtures / 'sha256.json').read_text())
     require(set(digests) == names, 'fixture inventory mismatch')
@@ -116,6 +117,26 @@ def validate(wkcli, server, version, commit, fixtures, execute=run):
                 'offline query did not return the exact fixture user')
         execute(query[:-1] + ['select * from acceptance_unknown_table limit 1'], root, env, expected=2)
         require(inventory(root / 'native') == before, 'read-only query changed native data')
+        # The format-2 release must reject historical unregistered data without
+        # adopting it. Preserve the original fixture as a separate negative case.
+        unpack(fixtures / 'native-v3-unregistered.tar.gz', root / 'unregistered')
+        before = inventory(root / 'unregistered')
+        rejected_query = query.copy()
+        rejected_query[3] = str(root / 'unregistered')
+        execute(rejected_query, root, env, expected=1)
+        require(inventory(root / 'unregistered') == before,
+                'rejected query changed unregistered data')
+        # A registered but incompatible format also fails before opening stores.
+        unpack(fixtures / 'native-v3.tar.gz', root / 'unsupported')
+        marker = root / 'unsupported' / 'DATA-FORMAT.json'
+        metadata = json.loads(marker.read_text())
+        metadata['format_version'] = 1
+        marker.write_text(json.dumps(metadata))
+        before = inventory(root / 'unsupported')
+        rejected_query[3] = str(root / 'unsupported')
+        execute(rejected_query, root, env, expected=1)
+        require(inventory(root / 'unsupported') == before,
+                'rejected query changed incompatible data')
         unpack(fixtures / 'original-v2-empty.tar.gz', root / 'source')
         before = inventory(root / 'source')
         plan = {'version': 1, 'source_commit': 'a888f89533d0e7d1b2030e06504ca97f1ad891d4',
