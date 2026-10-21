@@ -20,6 +20,7 @@ from typing import Any
 CHANNELS_SCHEMA = "wukongim.native_package_channels/v3"
 BOOTSTRAP_SCHEMA = "wukongim.native_package_bootstrap/v1"
 SIGNING_SCHEMA = "wukongim.native_package_signing/v3"
+STABLE_PUBLIC_KEYS_SCHEMA = "wukongim.stable_public_keys/v1"
 SIGNING_TOOLCHAIN_SCHEMA = "wukongim.native_package_signing_toolchain/v1"
 TOOLCHAIN_SCHEMA = "wukongim.native_package_toolchain/v1"
 SOURCE_READ_SCHEMA = "wukongim.native_package_source_read/v1"
@@ -518,6 +519,53 @@ def validate_public_certificate(
                 f"{path.name} historical signing subkey expires after the current subkey")
 
 
+def load_stable_public_certificates(root: Path) -> list[tuple[str, Path, str, dict[str, Any]]]:
+    """Read optional public-only stable roles without enabling a publisher."""
+    path = root / "manifests/stable-public-keys.json"
+    if not os.path.lexists(path):
+        return []
+    metadata = path.lstat()
+    require(stat.S_ISREG(metadata.st_mode) and metadata.st_nlink == 1,
+            "stable public-key declaration must be a single-link regular file")
+    declaration = exact_fields(load_json(path), {"schema", "apt", "rpm"},
+                               "stable public-key declaration")
+    require(declaration["schema"] == STABLE_PUBLIC_KEYS_SCHEMA,
+            f"stable public-key schema must be {STABLE_PUBLIC_KEYS_SCHEMA}")
+    certificates = []
+    for family in ("apt", "rpm"):
+        label = f"stable.{family}"
+        key = exact_fields(declaration[family],
+                           {"public_key", "primary_fingerprint", "signing_subkeys"}, label)
+        expected_path = f"keys/{family}-stable.asc"
+        require(key["public_key"] == expected_path,
+                f"{label}.public_key must be {expected_path}")
+        primary = key["primary_fingerprint"]
+        require(isinstance(primary, str) and UPPER_FINGERPRINT.fullmatch(primary),
+                f"{label}.primary_fingerprint must be an uppercase 40-hex fingerprint")
+        subkeys = exact_fields(key["signing_subkeys"], SIGNING_SUBKEY_FIELDS,
+                               f"{label}.signing_subkeys")
+        for role in ("current", "next"):
+            value = subkeys[role]
+            require(isinstance(value, str) and UPPER_FINGERPRINT.fullmatch(value),
+                    f"{label}.{role} must be an uppercase 40-hex fingerprint")
+        historical = subkeys["historical"]
+        require(isinstance(historical, list), f"{label}.historical must be an array")
+        require(all(isinstance(value, str) and UPPER_FINGERPRINT.fullmatch(value)
+                    for value in historical),
+                f"{label}.historical must contain uppercase 40-hex fingerprints")
+        require(historical == sorted(set(historical)),
+                f"{label}.historical must be unique and sorted")
+        certificate = root / expected_path
+        try:
+            metadata = certificate.lstat()
+        except OSError as error:
+            raise ContractError(f"cannot read stable public key {expected_path}") from error
+        require(stat.S_ISREG(metadata.st_mode) and metadata.st_nlink == 1,
+                f"{expected_path} must be a single-link regular file")
+        certificates.append((family, certificate, primary, subkeys))
+    return certificates
+
+
 def validate_signing(root: Path) -> dict[str, Any]:
     signing = exact_fields(load_json(root / "manifests/preview-signing.json"), SIGNING_FIELDS,
                            "preview signing manifest")
@@ -597,16 +645,21 @@ def validate_signing(root: Path) -> dict[str, Any]:
                     and subkeys == {"current": None, "next": None, "historical": []},
                     f"signing.{family} fingerprints must be empty while signing is disabled")
 
-    if signing["enabled"]:
+    stable_certificates = load_stable_public_certificates(root)
+    for _, _, primary, subkeys in stable_certificates:
+        fingerprints.extend([primary, subkeys["current"], subkeys["next"], *subkeys["historical"]])
+    certificates.extend(stable_certificates)
+    if fingerprints:
         require(len(set(fingerprints)) == len(fingerprints),
                 "APT and RPM signing fingerprints must all be distinct")
         require(len({value[-16:] for value in fingerprints}) == len(fingerprints),
                 "APT and RPM signing fingerprints must have globally distinct 16-hex key IDs")
         require(len({value[-8:] for value in fingerprints}) == len(fingerprints),
                 "APT and RPM signing fingerprints must have globally distinct 8-hex key IDs")
-        expected_key_files = {"README.md", "apt-preview.asc", "rpm-preview.asc"}
-    else:
-        expected_key_files = {"README.md"}
+    expected_key_files = {"README.md"}
+    if signing["enabled"]:
+        expected_key_files.update({"apt-preview.asc", "rpm-preview.asc"})
+    expected_key_files.update(path.name for _, path, _, _ in stable_certificates)
     actual_key_entries = {path.name: path for path in (root / "keys").iterdir()}
     require(set(actual_key_entries) == expected_key_files,
             f"keys directory entries must be exactly {sorted(expected_key_files)}")

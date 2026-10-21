@@ -457,7 +457,7 @@ class ValidateControlTest(unittest.TestCase):
                 "signing.apt fingerprints must all be distinct",
             )
 
-    def test_rejects_extra_binary_key_file_while_signing_is_disabled(self) -> None:
+    def test_rejects_extra_binary_key_file_while_preview_signing_is_disabled(self) -> None:
         with copied_control_root() as root:
             signing = load_manifest(root, "preview-signing.json")
             signing["enabled"] = False
@@ -477,7 +477,7 @@ class ValidateControlTest(unittest.TestCase):
 
             self.assert_rejected(
                 root,
-                "keys directory entries must be exactly ['README.md']",
+                "keys directory entries must be exactly ['README.md', 'apt-stable.asc', 'rpm-stable.asc']",
             )
 
     def test_rejects_readme_directory_hiding_binary_key_material(self) -> None:

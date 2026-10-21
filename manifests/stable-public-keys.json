@@ -1,0 +1,21 @@
+{
+  "schema": "wukongim.stable_public_keys/v1",
+  "apt": {
+    "public_key": "keys/apt-stable.asc",
+    "primary_fingerprint": "F68735072235EDC3BEBA83A55F19C486C2108B64",
+    "signing_subkeys": {
+      "current": "870709103947DCA5C19D76A817A8FB409BB05E51",
+      "next": "46F98702B783D39F2009B75B3528CA2EEEFC54DF",
+      "historical": []
+    }
+  },
+  "rpm": {
+    "public_key": "keys/rpm-stable.asc",
+    "primary_fingerprint": "4C76B7B37EBDAF05EB44976F96EC1B2D5976F45D",
+    "signing_subkeys": {
+      "current": "7C090D6807F29854C25824B0C620CF61C8256051",
+      "next": "333EB560B893835062CE28332022BAA4F4BE83D1",
+      "historical": []
+    }
+  }
+}
