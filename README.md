@@ -144,6 +144,11 @@ existing preview audit snapshots and explicitly retained dependency generations
 without credentials or network access. Its output is a plan only; it does not
 sign, upload, activate CDN routing or enable the stable channel.
 
+The [offline delivery preparer](docs/object-storage-delivery.md) consumes either
+the original preview plan or an explicit composite plan, materializes exact
+objects and previews routes. Its in-memory test seam exercises upload/activation
+failures without a cloud provider; all completion evidence remains simulated.
+
 ## Unpublished stable bootstrap preparation
 
 The offline builder can prepare separate stable APT/RPM repository-setup
