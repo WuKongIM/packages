@@ -181,3 +181,13 @@ The TEST ONLY native drill uses two ephemeral key families and tiny data-only
 packages; it is not a production signature, a GitHub audit seal, or public
 APT/DNF acceptance. See the [candidate contract](docs/release-contract.md#stable-first-generation-offline-candidate)
 for exact inputs, commands, supported operations and verification boundaries.
+
+## Stable audit sealing and offline composite planning
+
+Explicit stable bind/seal/readback preserves the original candidate pair and null IDs.
+Sealing authenticates historical control/producer Git bytes and fresh source
+provenance before uploading; normal stable endpoints are fixed to GitHub.com.
+TEST ONLY loopback evidence remains separate. The explicit offline composite
+planner retains both channels and all supplied generations without uploading or
+activating. Stable remains disabled and no production workflow is connected.
+See [the operator contract](docs/stable-audit-transport.md) for identities, inputs and verification limits.

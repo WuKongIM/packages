@@ -257,13 +257,14 @@ class GitHubWriter(resolver.GitHubReader):
 
 
 def _snapshot(
-    writer: GitHubWriter, release_id: int, expected_control_sha: str
+    writer: GitHubWriter, release_id: int, expected_control_sha: str,
+    channel: str = "preview", candidate: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     raw = writer.api_json(
         f"repos/{resolver.AUDIT_REPOSITORY}/releases/{release_id}"
     )
     try:
-        value = resolver._release_snapshot(raw, release_id, expected_control_sha)
+        value = resolver._release_snapshot(raw, release_id, expected_control_sha, channel, candidate)
     except resolver.ResolutionError as error:
         raise SealError(str(error)) from error
     return raw, value
@@ -344,6 +345,10 @@ def seal_audit_release(
     policy_token: str | None = None,
     max_polls: int = 20,
     poll_seconds: float = 2.0,
+    channel: str = "preview", test_only: bool = False,
+    candidate_plan: Path | None = None, control_root: Path | None = None,
+    candidate_source_root: Path | None = None, apt_receipt: Path | None = None,
+    rpm_receipt: Path | None = None, source_token: str | None = None,
 ) -> dict[str, Any]:
     """Add missing exact assets, publish once, and verify immutable bytes."""
 
@@ -364,7 +369,13 @@ def seal_audit_release(
     ):
         raise SealError("policy token must be a non-empty string when provided")
 
-    archive_name, receipt_name = resolver.expected_asset_names(release_id)
+    resolver.stable.network_mode(channel,test_only,api_base_url,download_base_url)
+    candidate = None
+    if channel == "stable":
+        candidate=resolver.stable.candidate_identity(candidate_plan,receipt_path,test_only=test_only)
+    elif any(item is not None for item in (candidate_plan,control_root,candidate_source_root,apt_receipt,rpm_receipt,source_token)):
+        raise SealError("candidate inputs require explicit stable mode")
+    archive_name, receipt_name = resolver.expected_asset_names(release_id,channel,candidate)
     local = {
         archive_name: _regular_artifact(
             archive_path, archive_name, resolver.MAX_ARCHIVE_BYTES
@@ -373,11 +384,17 @@ def seal_audit_release(
             receipt_path, receipt_name, resolver.MAX_RECEIPT_BYTES
         ),
     }
-    writer = GitHubWriter(api_base_url, download_base_url, token)
+    writer = GitHubWriter(api_base_url, download_base_url, token, deny_redirects=test_only)
     policy_reader = resolver.GitHubReader(
-        api_base_url, download_base_url, policy_token or token
+        api_base_url, download_base_url, policy_token or token, deny_redirects=test_only
     )
-    raw, current = _snapshot(writer, release_id, expected_control_sha)
+    verified = None
+    if channel == "stable":
+        verified=resolver.stable.verify_seal_inputs(reader=writer,expected_control_sha=expected_control_sha,
+            archive_path=archive_path,receipt_path=receipt_path,plan_path=candidate_plan,
+            control_root=control_root,source_root=candidate_source_root,apt_receipt=apt_receipt,
+            rpm_receipt=rpm_receipt,source_token=source_token,test_only=test_only)
+    raw, current = _snapshot(writer, release_id, expected_control_sha, channel, candidate)
     _assert_remote_matches(current, local)
     initial_classification = current["classification"]
     _require_current_control_and_reserved_tag(
@@ -399,12 +416,15 @@ def seal_audit_release(
                 writer, current["tag_name"], expected_control_sha
             )
             _require_immutable_releases_enabled(policy_reader)
-            raw, current = _snapshot(writer, release_id, expected_control_sha)
+            raw, current = _snapshot(writer, release_id, expected_control_sha, channel, candidate)
             _assert_remote_matches(current, local)
         if current["classification"] != resolver.COMPLETE_DRAFT:
             raise SealError("audit draft did not reach the exact complete asset state")
         for name in (archive_name, receipt_name):
             _download_and_compare(writer, current["assets"][name], local[name])
+
+        if channel == "stable" and not test_only:
+            resolver.stable.revalidate_source(verified['source'],source_token)
 
         # Asset downloads may be large.  Re-read the numeric Release after
         # both downloads so a concurrent contents writer cannot smuggle an
@@ -415,7 +435,7 @@ def seal_audit_release(
         _require_current_control_and_reserved_tag(
             writer, current["tag_name"], expected_control_sha
         )
-        _, pre_publish = _snapshot(writer, release_id, expected_control_sha)
+        _, pre_publish = _snapshot(writer, release_id, expected_control_sha, channel, candidate)
         if pre_publish["classification"] != resolver.COMPLETE_DRAFT:
             raise SealError(
                 "audit Release changed before immutable publication"
@@ -431,7 +451,7 @@ def seal_audit_release(
         )
         try:
             patched = resolver._release_snapshot(
-                patch_response, release_id, expected_control_sha
+                patch_response, release_id, expected_control_sha, channel, candidate
             )
         except resolver.ResolutionError as error:
             raise SealError(
@@ -463,7 +483,7 @@ def seal_audit_release(
         raise SealError("published audit Release did not become immutable")
     try:
         final = resolver._release_snapshot(
-            final_raw, release_id, expected_control_sha
+            final_raw, release_id, expected_control_sha, channel, candidate
         )
         resolver._tag_snapshot(writer, final["tag_name"], expected_control_sha)
     except resolver.ResolutionError as error:
@@ -473,7 +493,7 @@ def seal_audit_release(
     _assert_remote_matches(final, local)
     for name in (archive_name, receipt_name):
         _download_and_compare(writer, final["assets"][name], local[name])
-    _, revalidated = _snapshot(writer, release_id, expected_control_sha)
+    _, revalidated = _snapshot(writer, release_id, expected_control_sha, channel, candidate)
     if revalidated != final:
         raise SealError(
             "audit Release identity, state, or asset set changed during final download"
@@ -486,7 +506,7 @@ def seal_audit_release(
     except resolver.ResolutionError as error:
         raise SealError(str(error)) from error
 
-    return {
+    result = {
         "schema": SEAL_SCHEMA,
         "repository": resolver.AUDIT_REPOSITORY,
         "release_id": release_id,
@@ -508,12 +528,24 @@ def seal_audit_release(
         "immutable_releases_revalidated": True,
         "remote_control_revalidated": True,
     }
+    if channel == "stable":
+        result.update(schema="wukongim/package-audit-release-seal/v2",channel=channel,
+                      test_only=test_only,candidate=candidate,source_verified=not test_only)
+    return result
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Fill and seal one exact numeric native-package audit Release."
     )
+    parser.add_argument("--channel",choices=("preview","stable"),default="preview")
+    parser.add_argument("--test-only",action="store_true")
+    parser.add_argument("--candidate-plan",type=Path)
+    parser.add_argument("--control-root",type=Path)
+    parser.add_argument("--candidate-source-root",type=Path)
+    parser.add_argument("--apt-receipt",type=Path)
+    parser.add_argument("--rpm-receipt",type=Path)
+    parser.add_argument("--source-token-env",default=None)
     parser.add_argument("--release-id", required=True, type=int)
     parser.add_argument("--expected-control-sha", required=True)
     parser.add_argument("--archive", required=True, type=Path)
@@ -547,9 +579,14 @@ def main(argv: list[str] | None = None) -> int:
             api_base_url=args.api_base_url,
             download_base_url=args.download_base_url or args.api_base_url,
             token=token,
-            policy_token=policy_token,
+            policy_token=policy_token,channel=args.channel,test_only=args.test_only,
+            candidate_plan=args.candidate_plan,control_root=args.control_root,
+            candidate_source_root=args.candidate_source_root,apt_receipt=args.apt_receipt,
+            rpm_receipt=args.rpm_receipt,
+            source_token=os.environ.get(args.source_token_env) if args.source_token_env else None,
         )
-    except (SealError, resolver.ResolutionError) as error:
+    except (SealError, resolver.ResolutionError,resolver.stable.StableInputError,
+            resolver.stable.C.CompositionError,OSError,ValueError,TypeError,KeyError) as error:
         print(f"audit Release sealing failed: {error}", file=sys.stderr)
         return 1
     json.dump(result, sys.stdout, sort_keys=True, separators=(",", ":"))

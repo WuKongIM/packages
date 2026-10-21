@@ -719,3 +719,13 @@ Filling null IDs inside an existing snapshot would create different bytes and
 must not be described as sealing the same artifact. This slice does not
 implement that seal, upload/activation, production signing or public exact-version
 APT/DNF acceptance. Those remain release completion requirements.
+
+## Stable external audit seal and composite transport
+
+Explicit stable bind/seal/readback preserves the original candidate pair and null IDs.
+Sealing authenticates historical control/producer Git bytes and fresh source
+provenance before uploading; normal stable endpoints are fixed to GitHub.com.
+TEST ONLY loopback evidence remains separate. The explicit offline composite
+planner retains both channels and all supplied generations without uploading or
+activating. Stable remains disabled and no production workflow is connected.
+See [the operator contract](stable-audit-transport.md) for identities, inputs and verification limits.

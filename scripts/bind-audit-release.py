@@ -12,6 +12,8 @@ an ancestor of the new protected ``main`` commit before invoking this program.
 from __future__ import annotations
 
 import argparse
+import importlib.util
+from pathlib import Path
 import ipaddress
 import json
 import os
@@ -22,6 +24,12 @@ import urllib.parse
 import urllib.request
 from typing import Any
 
+
+STABLE_SPEC = importlib.util.spec_from_file_location(
+    "bind_stable_inputs", Path(__file__).resolve().with_name("verify-stable-seal-inputs.py"))
+assert STABLE_SPEC is not None and STABLE_SPEC.loader is not None
+stable = importlib.util.module_from_spec(STABLE_SPEC)
+STABLE_SPEC.loader.exec_module(stable)
 
 AUDIT_REPOSITORY = "WuKongIM/packages"
 RESULT_SCHEMA = "wukongim/package-audit-release-binding/v1"
@@ -34,10 +42,10 @@ class BindingError(RuntimeError):
     """The requested audit draft binding was not safe to perform."""
 
 
-def expected_release_identity(release_id: int) -> tuple[str, str]:
+def expected_release_identity(release_id: int, channel: str = "preview") -> tuple[str, str]:
     return (
-        f"native-package-preview-r{release_id}",
-        f"WuKongIM preview package snapshot r{release_id}",
+        f"native-package-{channel}-r{release_id}",
+        f"WuKongIM {channel} package snapshot r{release_id}",
     )
 
 
@@ -89,12 +97,15 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 class GitHubWriter:
     """Minimal authenticated JSON client with redirects disabled."""
 
-    def __init__(self, api_base_url: str, token: str) -> None:
+    def __init__(self, api_base_url: str, token: str, *, test_only: bool = False) -> None:
         if not token:
             raise BindingError("a GitHub token is required")
         self.api_base_url = _validated_api_base(api_base_url)
         self.token = token
-        self._opener = urllib.request.build_opener(_NoRedirect())
+        handlers = [_NoRedirect()]
+        if test_only:
+            handlers.append(urllib.request.ProxyHandler({}))
+        self._opener = urllib.request.build_opener(*handlers)
 
     def request_json(
         self,
@@ -109,6 +120,8 @@ class GitHubWriter:
             raise BindingError(f"unsupported GitHub API method: {method}")
         if allow_not_found and method != "GET":
             raise BindingError("only a GitHub API GET may allow a missing response")
+        if method != "GET" and hasattr(self, "control_guard"):
+            self.control_guard()
         body = None
         if payload is not None:
             body = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
@@ -144,9 +157,15 @@ class GitHubWriter:
         if len(data) > MAX_JSON_BYTES:
             raise BindingError(f"GitHub API response is too large for {path}")
         try:
-            return _require_object(json.loads(data), f"GitHub API response for {path}")
+            value = _require_object(json.loads(data), f"GitHub API response for {path}")
+            if method != "GET" and hasattr(self, "control_guard"):
+                self.control_guard()
+            return value
         except (UnicodeDecodeError, json.JSONDecodeError) as error:
             raise BindingError(f"GitHub API returned invalid JSON for {path}") from error
+
+    def api_json(self, path: str) -> dict[str, Any]:
+        return _require_object(self.request_json("GET",path), "GitHub API response")
 
     @staticmethod
     def _validate_lightweight_tag(
@@ -210,10 +229,11 @@ def _empty_draft_snapshot(
     expected_control_shas: set[str],
     *,
     allow_github_detached_tag: bool = False,
+    channel: str = "preview",
 ) -> dict[str, Any]:
     if release.get("id") != release_id:
         raise BindingError("audit Release id does not match the requested numeric id")
-    expected_tag, expected_name = expected_release_identity(release_id)
+    expected_tag, expected_name = expected_release_identity(release_id, channel)
     tag_name = release.get("tag_name")
     if tag_name != expected_tag and not (
         allow_github_detached_tag
@@ -260,6 +280,8 @@ def bind_audit_release(
     expected_control_sha: str,
     api_base_url: str,
     token: str,
+    channel: str = "preview", test_only: bool = False,
+    candidate_plan: Path | None = None, control_root: Path | None = None,
 ) -> dict[str, Any]:
     """Bind an exact empty draft and return revalidated non-secret evidence."""
 
@@ -272,14 +294,24 @@ def bind_audit_release(
         if not isinstance(value, str) or not CONTROL_SHA_RE.fullmatch(value):
             raise BindingError(f"{label} must be a lowercase 40-hex commit")
 
-    writer = GitHubWriter(api_base_url, token)
+    stable.network_mode(channel,test_only,api_base_url,api_base_url)
+    if channel == "preview" and (candidate_plan is not None or control_root is not None):
+        raise BindingError("candidate inputs require explicit stable mode")
+    writer = GitHubWriter(api_base_url, token, test_only=test_only)
+    if channel == "stable":
+        stable.require(candidate_plan is not None and control_root is not None,"stable candidate control inputs required")
+        stable.verify_control(reader=writer,plan_path=candidate_plan,control_root=control_root,
+                              expected_control_sha=expected_control_sha,test_only=test_only)
+        if not test_only:
+            stable.require_ancestor(writer,expected_previous_control_sha,expected_control_sha)
+        writer.control_guard = lambda: stable.current_control(writer,expected_control_sha)
     path = f"repos/{AUDIT_REPOSITORY}/releases/{release_id}"
-    expected_tag, _ = expected_release_identity(release_id)
+    expected_tag, _ = expected_release_identity(release_id, channel)
     initial = _empty_draft_snapshot(
         _require_object(writer.request_json("GET", path), "initial audit Release"),
         release_id,
         {expected_previous_control_sha, expected_control_sha},
-        allow_github_detached_tag=True,
+        allow_github_detached_tag=True, channel=channel,
     )
     # Reserve the create-only canonical ref before changing the Release.  A
     # conflicting ref therefore cannot leave the draft rebound but unusable.
@@ -303,7 +335,7 @@ def bind_audit_release(
         ),
         release_id,
         {expected_previous_control_sha, expected_control_sha},
-        allow_github_detached_tag=True,
+        allow_github_detached_tag=True, channel=channel,
     )
     normalized_initial = {**initial, "tag_name": expected_tag}
     normalized_current = {**current, "tag_name": expected_tag}
@@ -327,7 +359,7 @@ def bind_audit_release(
             patched,
             release_id,
             {expected_control_sha},
-            allow_github_detached_tag=True,
+            allow_github_detached_tag=True, channel=channel,
         )
         if current["tag_name"] != expected_tag:
             writer.require_lightweight_tag_absent(current["tag_name"])
@@ -345,13 +377,13 @@ def bind_audit_release(
                 "repaired audit Release",
             ),
             release_id,
-            {expected_control_sha},
+            {expected_control_sha}, channel=channel,
         )
 
     final = _empty_draft_snapshot(
         _require_object(writer.request_json("GET", path), "final audit Release"),
         release_id,
-        {expected_control_sha},
+        {expected_control_sha}, channel=channel,
     )
     expected_final = {
         **initial,
@@ -361,7 +393,7 @@ def bind_audit_release(
     if expected_final != final:
         raise BindingError("audit Release identity or state changed during control binding")
     writer.require_lightweight_tag(expected_tag, expected_control_sha)
-    return {
+    result = {
         "schema": RESULT_SCHEMA,
         "repository": AUDIT_REPOSITORY,
         "release_id": release_id,
@@ -374,12 +406,21 @@ def bind_audit_release(
         "audit_tag_reserved": True,
         "empty_draft_revalidated": True,
     }
+    if channel == "stable":
+        stable.current_control(writer,expected_control_sha)
+        result.update(schema="wukongim/package-audit-release-binding/v2",
+                      channel=channel,test_only=test_only,source_verified=False)
+    return result
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Bind one empty numeric package audit draft to reviewed control."
     )
+    parser.add_argument("--channel",choices=("preview","stable"),default="preview")
+    parser.add_argument("--test-only",action="store_true")
+    parser.add_argument("--candidate-plan",type=Path)
+    parser.add_argument("--control-root",type=Path)
     parser.add_argument("--release-id", required=True, type=int)
     parser.add_argument("--expected-previous-control-sha", required=True)
     parser.add_argument("--expected-control-sha", required=True)
@@ -401,9 +442,10 @@ def main(argv: list[str] | None = None) -> int:
             expected_previous_control_sha=args.expected_previous_control_sha,
             expected_control_sha=args.expected_control_sha,
             api_base_url=args.api_base_url,
-            token=token or "",
+            token=token or "",channel=args.channel,test_only=args.test_only,
+            candidate_plan=args.candidate_plan,control_root=args.control_root,
         )
-    except BindingError as error:
+    except (BindingError,stable.StableInputError,stable.C.CompositionError,OSError) as error:
         print(f"audit Release binding failed: {error}", file=sys.stderr)
         return 1
     json.dump(result, sys.stdout, sort_keys=True, separators=(",", ":"))
