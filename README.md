@@ -70,7 +70,10 @@ never committed to Git.
 - Preview primary and next private keys currently use an explicitly accepted
   single-operator online-workstation custody model. CI still receives only the
   encrypted current sign-only subkey for the applicable package family.
-- Stable signing keys remain outside GitHub-hosted CI.
+- Stable signing uses operator-managed local Mac keys, with encrypted backups
+  on the Mac or NAS. This accepted online-workstation custody model keeps
+  stable private keys outside GitHub-hosted CI; stable publication remains
+  disabled. This custody choice does not claim an offline ceremony.
 - GitHub Pages will receive only complete, verified preview snapshots. Stable
   publication requires migration to object storage and a CDN.
 - `manifests/channels.json`, `manifests/preview-signing.json`, and

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import shutil
@@ -35,6 +37,144 @@ def canonical_json(value: object) -> bytes:
 def identity(path: Path, relative: str) -> dict[str, object]:
     contents = path.read_bytes()
     return {"path": relative, "sha256": hashlib.sha256(contents).hexdigest(), "size": len(contents)}
+
+
+class PackageFamilyLocalInputTest(unittest.TestCase):
+    """Exercise local CLI inputs without generating keys or launching GPG."""
+
+    def setUp(self) -> None:
+        self.temporary = TemporaryDirectory(prefix="wk-family-local-input-TEST-ONLY-")
+        self.root = Path(self.temporary.name)
+        self.source = self.root / "input"
+        self.source.mkdir()
+        self.output = self.root / "output"
+        self.public = self.root / "public.asc"
+        self.public.write_bytes(b"TEST ONLY non-key public input\n")
+        self.secret = self.root / "selected-subkey.b64"
+        self.secret.write_bytes(b"VEVTVCBPTkxZIG5vbi1rZXkgbWF0ZXJpYWw=")
+        self.secret.chmod(0o600)
+        self.passphrase = self.root / "passphrase"
+        self.passphrase.write_bytes(b"TEST ONLY local input sentinel")
+        self.passphrase.chmod(0o600)
+        self.native_log = self.root / "native-called"
+        self.bin = self.root / "bin"
+        self.bin.mkdir()
+        for tool in ("gpg", "gpgconf"):
+            script = self.bin / tool
+            script.write_text(
+                f"#!{sys.executable}\nfrom pathlib import Path\n"
+                f"Path({str(self.native_log)!r}).write_text('unexpected native call')\n"
+                "raise SystemExit(99)\n"
+            )
+            script.chmod(0o700)
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def arguments(self, family: str = "apt") -> list[str]:
+        return ["--family", family, "--input-root", str(self.source),
+                "--output-root", str(self.output), "--public-cert", str(self.public),
+                "--primary-fingerprint", "A" * 40,
+                "--signing-subkey-fingerprint", "B" * 40,
+                "--apt-release", "dists/stable/Release"]
+
+    def file_arguments(self) -> list[str]:
+        return ["--secret-subkey-base64-file", str(self.secret),
+                "--passphrase-file", str(self.passphrase)]
+
+    def run_cli(self, options: list[str], *, stdin: bytes = b"") -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [sys.executable, "-B", str(SCRIPT), *self.arguments(), *options],
+            input=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            env={"PATH": str(self.bin), "HOME": str(self.root), "LC_ALL": "C"},
+            timeout=10,
+        )
+
+    def assert_rejected_before_native(self, result: subprocess.CompletedProcess,
+                                      message: str) -> None:
+        self.assertEqual(result.returncode, 1, result.stderr.decode())
+        self.assertIn(message.encode(), result.stderr)
+        self.assertEqual(result.stdout, b"")
+        self.assertNotIn(b"TEST ONLY local input sentinel", result.stderr)
+        self.assertNotIn(b"VEVTVCBPTkxZ", result.stderr)
+        self.assertFalse(self.native_log.exists())
+        self.assertFalse(os.path.lexists(self.output))
+        self.assertFalse(list(self.root.glob(".output.*.tmp.*")))
+
+    def test_file_and_stdin_options_reach_existing_validator_arguments(self) -> None:
+        for family in ("apt", "rpm"):
+            with self.subTest(family=family):
+                args = signer.build_parser().parse_args([*self.arguments(family), *self.file_arguments()])
+                self.assertEqual(args.secret_subkey_base64_file, self.secret)
+                self.assertEqual(args.passphrase_file, self.passphrase)
+                self.assertIsNone(args.secret_subkey_base64_env)
+                self.assertIsNone(args.passphrase_env)
+                self.assertFalse(args.secret_subkey_base64_stdin)
+                stdin_args = signer.build_parser().parse_args([
+                    *self.arguments(family), "--secret-subkey-base64-stdin",
+                    "--passphrase-file", str(self.passphrase),
+                ])
+                self.assertTrue(stdin_args.secret_subkey_base64_stdin)
+                self.assertIsNone(stdin_args.secret_subkey_base64_file)
+                self.assertEqual(stdin_args.passphrase_file, self.passphrase)
+
+    def test_environment_arguments_remain_compatible(self) -> None:
+        args = signer.build_parser().parse_args([
+            *self.arguments(), "--secret-subkey-base64-env", "WK_TEST_SECRET",
+            "--passphrase-env", "WK_TEST_PASSPHRASE",
+        ])
+        self.assertEqual(args.secret_subkey_base64_env, "WK_TEST_SECRET")
+        self.assertEqual(args.passphrase_env, "WK_TEST_PASSPHRASE")
+        self.assertIsNone(args.secret_subkey_base64_file)
+        self.assertIsNone(args.passphrase_file)
+        self.assertFalse(args.secret_subkey_base64_stdin)
+
+    def test_input_choices_are_required_and_mutually_exclusive(self) -> None:
+        invalid_options = [
+            [], ["--passphrase-file", str(self.passphrase)],
+            ["--secret-subkey-base64-file", str(self.secret)],
+            [*self.file_arguments(), "--secret-subkey-base64-env", "WK_TEST_SECRET"],
+            [*self.file_arguments(), "--secret-subkey-base64-stdin"],
+            [*self.file_arguments(), "--passphrase-env", "WK_TEST_PASSPHRASE"],
+        ]
+        for options in invalid_options:
+            with self.subTest(options=options), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as caught:
+                    signer.build_parser().parse_args([*self.arguments(), *options])
+                self.assertEqual(caught.exception.code, 2)
+
+    def test_secret_file_failures_use_existing_checks_before_gpg(self) -> None:
+        self.secret.chmod(0o644)
+        self.assert_rejected_before_native(self.run_cli(self.file_arguments()), "permissions")
+        self.secret.chmod(0o600)
+        self.secret.write_bytes(b"bad base64 TEST ONLY")
+        self.assert_rejected_before_native(self.run_cli(self.file_arguments()), "canonical line")
+        self.secret.write_bytes(b"bad-base64-TEST-ONLY")
+        self.assert_rejected_before_native(self.run_cli(self.file_arguments()), "canonical base64")
+        self.secret.unlink()
+        self.assert_rejected_before_native(self.run_cli(self.file_arguments()), "cannot inspect")
+        self.secret.symlink_to(self.passphrase)
+        self.assert_rejected_before_native(self.run_cli(self.file_arguments()), "not a link")
+        self.secret.unlink()
+        os.link(self.passphrase, self.secret)
+        self.assert_rejected_before_native(self.run_cli(self.file_arguments()), "hard linked")
+
+    def test_passphrase_file_failures_use_existing_checks_before_gpg(self) -> None:
+        self.passphrase.chmod(0o644)
+        self.assert_rejected_before_native(self.run_cli(self.file_arguments()), "permissions")
+        self.passphrase.chmod(0o600)
+        self.passphrase.write_bytes(b"TEST ONLY local input sentinel\nsecond line")
+        self.assert_rejected_before_native(self.run_cli(self.file_arguments()), "single non-empty line")
+        self.passphrase.write_bytes(b"")
+        self.assert_rejected_before_native(self.run_cli(self.file_arguments()), "invalid size")
+
+    def test_stdin_uses_existing_base64_and_passphrase_validation(self) -> None:
+        options = ["--secret-subkey-base64-stdin", "--passphrase-file", str(self.passphrase)]
+        self.assert_rejected_before_native(self.run_cli(options, stdin=b"bad-base64-TEST-ONLY"),
+                                           "canonical base64")
+        self.passphrase.chmod(0o644)
+        self.assert_rejected_before_native(self.run_cli(options, stdin=self.secret.read_bytes()),
+                                           "permissions")
 
 
 class PackageFamilySigningTest(unittest.TestCase):

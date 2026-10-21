@@ -37,6 +37,26 @@ class SourcePreflightWorkflowTest(unittest.TestCase):
         self.assertIn("source-metadata-native/", workflow)
         self.assertIn("if: always()", workflow)
 
+    def test_local_signing_drill_remains_bounded_private_and_read_only(self) -> None:
+        workflow = (ROOT / ".github/workflows/native-package-repository-drill.yml").read_text()
+        step = next((s for s in workflow.split("      - name:")
+                     if "tests/native_local_signing_drill.py" in s), "")
+        self.assertTrue(step, "missing real native local signing drill")
+        for argument in ("manifests/signing-toolchain.json", "--network none", "--read-only",
+                         "--cap-drop ALL", "--security-opt no-new-privileges",
+                         "--user 65532:65532", "--cpus 1", "--memory 512m", "--pids-limit 128",
+                         ":/control:ro", "--output-dir /evidence", "--kill-after=10s 8m",
+                         'docker rm --force "$container"', "trap 'exit 130' INT",
+                         "trap 'exit 143' TERM"):
+            self.assertIn(argument, step)
+        self.assertNotRegex(workflow, r"secrets\.|GH_TOKEN|GITHUB_TOKEN|id-token: write|contents: write|environment:")
+        self.assertIn("contents: read", workflow)
+        self.assertIn("(.cases | length) == 10", step)
+        upload = next((s for s in workflow.split("      - name:")
+                       if "name: native-local-signing-test-only" in s), "")
+        self.assertIn("if: always()", upload)
+        self.assertIn("path: ${{ runner.temp }}/local-signing-native/native-local-signing.json", upload)
+
 
 if __name__ == "__main__":
     unittest.main()

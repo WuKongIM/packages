@@ -359,10 +359,26 @@ multi-custodian trust model requires generating new primary certificates under
 that model and distributing their public certificates; an online-generated
 primary cannot become retroactively offline.
 
-Stable private keys never enter GitHub-hosted CI. Stable publication uses an
-offline or hardware-backed signing ceremony. Promoting an RPM preserves the
-same unsigned payload, NEVRA, and provenance, but its bytes change when it is
-signed with the independent stable key.
+Stable private keys never enter GitHub-hosted CI. Stable signing uses an
+operator-managed local Mac under the explicitly accepted online-workstation
+custody model. Operator-retained encrypted backups may be stored on the Mac or
+NAS. This reuses the encrypted-backup, local permissions, distinct passphrase,
+operating-system credential-store, and restore-check practices described above;
+it does not require or claim an offline or hardware-backed ceremony. Stable
+certificates remain independent of preview and of the other package family.
+Promoting an RPM preserves the same unsigned payload, NEVRA, and provenance,
+but its bytes change when it is signed with the independent stable key. This
+custody choice does not enable the stable channel or authorize publication.
+
+The credential-free TEST ONLY PR drill also exercises the local file and
+existing environment inputs with tiny data-only packages and independent
+ephemeral APT/RPM keys, plus the stdin subkey option. After signing, it removes
+test secret material before verifying both APT signatures, actual RPM package
+signatures, repomd signatures and their package hash closure in fresh public-only
+homes/databases. Wrong passphrases, full-primary signing input and tampered
+outputs must fail. Only the public JSON result is uploaded; keys, packages and
+signed fixture trees remain in temporary scratch. This is native input-adapter
+regression evidence, not production key provisioning or stable publication.
 
 ## Atomic publication and recovery
 

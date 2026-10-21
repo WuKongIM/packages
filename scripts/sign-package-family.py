@@ -875,8 +875,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--input-root", required=True, type=Path)
     parser.add_argument("--output-root", required=True, type=Path)
     parser.add_argument("--public-cert", required=True, type=Path)
-    parser.add_argument("--secret-subkey-base64-env", required=True)
-    parser.add_argument("--passphrase-env", required=True)
+    secret_group = parser.add_mutually_exclusive_group(required=True)
+    secret_group.add_argument("--secret-subkey-base64-file", type=Path)
+    secret_group.add_argument("--secret-subkey-base64-env")
+    secret_group.add_argument("--secret-subkey-base64-stdin", action="store_true")
+    passphrase_group = parser.add_mutually_exclusive_group(required=True)
+    passphrase_group.add_argument("--passphrase-file", type=Path)
+    passphrase_group.add_argument("--passphrase-env")
     parser.add_argument("--primary-fingerprint", required=True)
     parser.add_argument("--signing-subkey-fingerprint", required=True)
     parser.add_argument("--next-signing-subkey-fingerprint")
@@ -892,11 +897,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--new-rpm-allowlist", type=Path)
     parser.add_argument("--signed-rpm-allowlist", type=Path)
     parser.add_argument("--active-rpm-allowlist", type=Path)
-    parser.set_defaults(
-        secret_subkey_base64_file=None,
-        secret_subkey_base64_stdin=False,
-        passphrase_file=None,
-    )
     return parser
 
 
