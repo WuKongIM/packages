@@ -19,6 +19,7 @@ import re
 import selectors
 import shutil
 import signal
+import stat
 import ssl
 import subprocess
 import sys
@@ -35,6 +36,11 @@ INRELEASE = '/apt/dists/stable/InRelease'
 MAX_LOG = 8 * 1024 * 1024
 MAX_REQUESTS = 20000
 CORRUPT_APT_INDEX = b'changed authenticated index\n'
+# Pinned libdnf uses the first eight SHA256 bytes of the canonical mirrorlist
+# URL in this cache directory. Only its observed public-key IPC nodes are exempt.
+DNF_PUBRING = 'dnf-cli-cache/wukongim-stable-5702a8a51b8fa885/pubring'
+DNF_IPC_NAMES = frozenset(('S.gpg-agent', 'S.gpg-agent.browser', 'S.gpg-agent.extra',
+                           'S.gpg-agent.ssh', 'S.scdaemon'))
 
 
 def canonical(value):
@@ -455,14 +461,22 @@ def cache_inventory(root, *, arm=False):
     if not root.exists(): return result
     for path in sorted(root.rglob('*')):
         info = path.lstat()
-        require(not path.is_symlink(), 'cache must not contain links')
+        relative = path.relative_to(root).as_posix()
+        detail = (f'{repr(relative)[:240]} mode={oct(info.st_mode)} '
+                  f'nlink={info.st_nlink} size={info.st_size}')
+        require(not path.is_symlink(), 'cache must not contain links: ' + detail)
         if path.is_dir(): continue
+        if (stat.S_ISSOCK(info.st_mode) and info.st_nlink == 1 and info.st_size == 0
+                and path.parent.relative_to(root).as_posix() == DNF_PUBRING
+                and path.name in DNF_IPC_NAMES):
+            # These are not metadata. Do not read, connect, timestamp, or remove
+            # them; retained ordinary files still need the same read proof.
+            continue
         require(path.is_file() and info.st_nlink == 1 and info.st_size <= 64 * 1024 * 1024,
-                'cache contains an unsupported file')
+                'cache contains an unsupported file: ' + detail)
         total += info.st_size
         require(len(result) < 10000 and total <= 512 * 1024 * 1024, 'cache inventory exceeds bounds')
         if not info.st_size: continue
-        relative = path.relative_to(root).as_posix()
         result[relative] = {**facts(path), 'device': info.st_dev, 'inode': info.st_ino,
                             'mtime_ns': info.st_mtime_ns, 'atime_ns': info.st_atime_ns}
         if arm:

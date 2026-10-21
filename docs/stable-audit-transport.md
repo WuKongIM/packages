@@ -167,9 +167,17 @@ TLS rejection, redirect escape, interrupted responses, and exact-target/source
 identity rejection. RPM cache cases persist the final CLI cache/state paths and
 the earlier installroot paths in separate scratch directories: the pinned DNF
 versions initialize their global state before reapplying command-line paths to
-the repository cache. A state file alone does not count as metadata. Repeated
-cache acceptance still requires unchanged metadata bytes and inode plus an
-observed read after timestamp arming. Installed CLI containers use ordinary
+the repository cache. Inventory excludes only the five observed GPG IPC socket
+names (`S.gpg-agent`, `S.gpg-agent.browser`, `S.gpg-agent.extra`,
+`S.gpg-agent.ssh`, and `S.scdaemon`) directly in
+`dnf-cli-cache/wukongim-stable-5702a8a51b8fa885/pubring`. This directory is fixed by the canonical
+stable mirrorlist and pinned libdnf. Each excluded node must be an actual
+single-link, zero-byte Unix socket; it is never read, connected, or deleted by
+inventory. Other special files or locations still fail closed, with bounded
+relative-path and stat diagnostics. Ordinary-file limits remain unchanged.
+A state file or socket alone does not count as metadata. Repeated cache
+acceptance still requires unchanged metadata bytes and inode plus an observed
+read after timestamp arming. Installed CLI containers use ordinary
 distro dependency networking and only the already authenticated local product package; that
 traffic is not part of the isolated A/B proof.
 

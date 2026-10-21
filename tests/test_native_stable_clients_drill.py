@@ -1,6 +1,8 @@
 """Lightweight boundaries for the opt-in native stable client laboratory."""
 import importlib.util
 import copy
+from contextlib import ExitStack
+import errno
 import email.utils
 import http.client
 import hashlib
@@ -8,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import socket
+import stat
 import ssl
 import subprocess
 import sys
@@ -789,6 +792,200 @@ def fixture_module(filename):
     spec.loader.exec_module(value)
     return value
 
+
+
+class CacheInventorySocketTests(unittest.TestCase):
+    """Real filesystem boundaries for the pinned DNF public-key IPC exception."""
+    PUBRING = 'dnf-cli-cache/wukongim-stable-5702a8a51b8fa885/pubring'
+    NAMES = ('S.gpg-agent', 'S.gpg-agent.browser', 'S.gpg-agent.extra',
+             'S.gpg-agent.ssh', 'S.scdaemon')
+
+    def bind_socket(self, stack, path, *, live=True):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handle = stack.enter_context(socket.socket(socket.AF_UNIX, socket.SOCK_STREAM))
+        handle.bind(str(path))
+        if not live:
+            handle.close()
+        self.assertTrue(stat.S_ISSOCK(path.lstat().st_mode))
+        return handle
+
+    def test_five_live_and_closed_sockets_remain_untouched_beside_metadata(self):
+        drill = load()
+        for live in (True, False):
+            with self.subTest(live=live), tempfile.TemporaryDirectory(dir='/tmp', prefix='cs-') as tmp, ExitStack() as stack:
+                root = Path(tmp); nodes = []
+                for name in self.NAMES:
+                    path = root / self.PUBRING / name
+                    self.bind_socket(stack, path, live=live); nodes.append((path, path.lstat()))
+                metadata = root / 'dnf-cli-cache/repo/repodata/primary.xml.gz'
+                metadata.parent.mkdir(parents=True); metadata.write_bytes(b'authenticated metadata')
+                before = drill.cache_inventory(root, arm=True)
+                self.assertEqual(set(before), {'dnf-cli-cache/repo/repodata/primary.xml.gz'})
+                self.assertEqual(before[next(iter(before))]['sha256'], hashlib.sha256(b'authenticated metadata').hexdigest())
+                self.assertEqual(metadata.read_bytes(), b'authenticated metadata')
+                for path, original in nodes:
+                    current = path.lstat()
+                    for field in ('st_mode', 'st_nlink', 'st_size', 'st_ino', 'st_mtime_ns', 'st_atime_ns'):
+                        self.assertEqual(getattr(current, field), getattr(original, field), (path.name, field))
+
+    def test_known_sockets_alone_cannot_supply_metadata_or_reuse_evidence(self):
+        drill = load()
+        with tempfile.TemporaryDirectory(dir='/tmp', prefix='cs-') as tmp, ExitStack() as stack:
+            root = Path(tmp)
+            for name in self.NAMES:
+                self.bind_socket(stack, root / self.PUBRING / name, live=False)
+            inventory = drill.cache_inventory(root, arm=True)
+            self.assertEqual(inventory, {})
+            for reuse in (False, True):
+                with self.subTest(reuse=reuse), self.assertRaisesRegex(RuntimeError, 'nonempty metadata'):
+                    drill.cache_evidence({}, inventory, require_reuse=reuse)
+
+    def test_known_sockets_do_not_weaken_actual_metadata_read_proof(self):
+        drill = load()
+        with tempfile.TemporaryDirectory(dir='/tmp', prefix='cs-') as tmp, ExitStack() as stack:
+            root = Path(tmp)
+            for name in self.NAMES:
+                self.bind_socket(stack, root / self.PUBRING / name)
+            name = 'dnf-cli-cache/repo/repodata/primary.xml.gz'; path = root / name
+            path.parent.mkdir(parents=True); path.write_bytes(b'existing metadata')
+            before = drill.cache_inventory(root, arm=True)
+            after = drill.cache_inventory(root)
+            with self.assertRaisesRegex(RuntimeError, 'read of existing metadata'):
+                drill.cache_evidence(before, after, require_reuse=True)
+            before = drill.cache_inventory(root, arm=True)
+            path.read_bytes()  # Real OS access after epoch arming, not a forged timestamp.
+            after = drill.cache_inventory(root)
+            self.assertEqual(drill.cache_evidence(before, after, require_reuse=True)['metadata_reads'], [name])
+            for mutation in ('device', 'inode', 'sha256', 'size', 'absent-before', 'removed'):
+                with self.subTest(mutation=mutation):
+                    earlier, later = copy.deepcopy(before), copy.deepcopy(after)
+                    if mutation == 'absent-before': earlier.clear()
+                    elif mutation == 'removed': later.clear()
+                    elif mutation == 'sha256': later[name][mutation] = 'f' * 64
+                    else: later[name][mutation] += 1
+                    with self.assertRaises(RuntimeError):
+                        drill.cache_evidence(earlier, later, require_reuse=True)
+
+    def test_socket_name_and_parent_allowlist_are_exact(self):
+        drill = load()
+        parents = ('', 'apt', 'dnf-cache/wukongim-stable-5702a8a51b8fa885/pubring',
+                   'dnf-cli-state/wukongim-stable-5702a8a51b8fa885/pubring',
+                   'dnf-cli-cache/wukongim-preview-5702a8a51b8fa885/pubring',
+                   'dnf-cli-cache/wukongim-stable-aaa08530d5caaef3/pubring',
+                   self.PUBRING + '/sub', self.PUBRING + '-other')
+        cases = [(parent, name) for parent in parents for name in self.NAMES]
+        cases += [(self.PUBRING, name) for name in ('S.gpg-agent.foo', 'S.scdaemon.extra', 'socket')]
+        for parent, name in cases:
+            with self.subTest(parent=parent, name=name), tempfile.TemporaryDirectory(dir='/tmp', prefix='cs-') as tmp, ExitStack() as stack:
+                root = Path(tmp); path = root / parent / name
+                self.bind_socket(stack, path)
+                with self.assertRaisesRegex(RuntimeError, 'unsupported file'):
+                    drill.cache_inventory(root)
+                self.assertTrue(stat.S_ISSOCK(path.lstat().st_mode))
+
+    def test_known_names_reject_fifo_symlink_and_regular_hardlink_without_reading(self):
+        drill = load()
+        for name in self.NAMES:
+            for kind in ('fifo', 'symlink', 'hardlink'):
+                with self.subTest(name=name, kind=kind), tempfile.TemporaryDirectory(dir='/tmp', prefix='cs-') as tmp:
+                    outer = Path(tmp); root = outer / 'c'; path = root / self.PUBRING / name
+                    path.parent.mkdir(parents=True)
+                    sentinel = outer / 'sentinel'; sentinel.write_bytes(b'keep outside data')
+                    if kind == 'fifo': os.mkfifo(path)
+                    elif kind == 'symlink': path.symlink_to(sentinel)
+                    else: os.link(sentinel, path)
+                    with mock.patch.object(Path, 'read_bytes', side_effect=AssertionError('unsupported file must not be read')):
+                        with self.assertRaisesRegex(RuntimeError, 'cache.*(?:links|unsupported file)'):
+                            drill.cache_inventory(root)
+                    self.assertEqual(sentinel.read_bytes(), b'keep outside data')
+                    self.assertTrue(path.exists())
+
+    def test_real_hardlinked_socket_is_rejected(self):
+        drill = load()
+        with tempfile.TemporaryDirectory(dir='/tmp', prefix='cs-') as tmp, ExitStack() as stack:
+            root = Path(tmp); path = root / self.PUBRING / 'S.gpg-agent'
+            self.bind_socket(stack, path)
+            try:
+                os.link(path, path.with_name('S.gpg-agent.extra'))
+            except OSError as error:
+                if error.errno not in (errno.EPERM, errno.ENOTSUP, errno.EOPNOTSUPP): raise
+                self.skipTest(f'OS cannot hardlink an AF_UNIX socket: errno={error.errno}; Linux must exercise this case')
+            self.assertEqual(path.lstat().st_nlink, 2)
+            with self.assertRaisesRegex(RuntimeError, 'unsupported file'):
+                drill.cache_inventory(root)
+
+    def test_known_socket_size_and_link_count_still_fail_closed(self):
+        drill = load()
+        for field, value in ((3, 2), (6, 1), (0, stat.S_IFCHR | 0o600)):
+            with self.subTest(stat_field=field), tempfile.TemporaryDirectory(dir='/tmp', prefix='cs-') as tmp, ExitStack() as stack:
+                root = Path(tmp); path = root / self.PUBRING / 'S.scdaemon'
+                self.bind_socket(stack, path)
+                original = Path.lstat
+                values = list(original(path)); values[field] = value
+                def altered(candidate, *args, **kwargs):
+                    return os.stat_result(values) if candidate == path else original(candidate, *args, **kwargs)
+                # Socket byte size cannot be changed portably; this is a filesystem
+                # stat boundary probe, separate from the real hardlink case above.
+                with mock.patch.object(Path, 'lstat', altered):
+                    with self.assertRaisesRegex(RuntimeError, 'unsupported file'):
+                        drill.cache_inventory(root)
+
+    def test_known_names_as_regular_files_are_hashed_and_keep_size_bounds(self):
+        drill = load()
+        for name in self.NAMES:
+            with self.subTest(name=name), tempfile.TemporaryDirectory(dir='/tmp', prefix='cs-') as tmp:
+                root = Path(tmp); path = root / self.PUBRING / name
+                path.parent.mkdir(parents=True); path.write_bytes(b'ordinary content')
+                inventory = drill.cache_inventory(root)
+                self.assertEqual(inventory[self.PUBRING + '/' + name]['sha256'], hashlib.sha256(b'ordinary content').hexdigest())
+                with path.open('r+b') as stream: stream.truncate(64 * 1024 * 1024 + 1)
+                with mock.patch.object(Path, 'read_bytes', side_effect=AssertionError('oversize read')):
+                    with self.assertRaisesRegex(RuntimeError, 'unsupported file'):
+                        drill.cache_inventory(root)
+
+    def test_rejected_file_diagnostic_is_relative_bounded_and_stat_specific(self):
+        drill = load()
+        cases = [('odd\nname', kind) for kind in ('fifo', 'symlink', 'hardlink')]
+        cases.append((('x' * 100 + '/') * 3 + 'fifo', 'fifo'))
+        for relative, kind in cases:
+            with self.subTest(relative=relative, kind=kind), tempfile.TemporaryDirectory(dir='/tmp', prefix='cs-') as tmp:
+                root = Path(tmp) / 'c'; path = root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                sentinel = Path(tmp) / 'sentinel'; sentinel.write_bytes(b'keep outside')
+                if kind == 'fifo': os.mkfifo(path)
+                elif kind == 'symlink': path.symlink_to(sentinel)
+                else: os.link(sentinel, path)
+                info = path.lstat()
+                with mock.patch.object(Path, 'read_bytes', side_effect=AssertionError('FIFO read')):
+                    with self.assertRaises(RuntimeError) as caught: drill.cache_inventory(root)
+                message = str(caught.exception)
+                self.assertIn('cache', message)
+                self.assertIn(repr(relative)[:240], message)
+                self.assertIn('mode=' + oct(info.st_mode), message)
+                self.assertIn('nlink=' + str(info.st_nlink), message)
+                self.assertIn('size=' + str(info.st_size), message)
+                self.assertNotIn(str(root), message)
+                self.assertNotIn('\n', message)
+                self.assertLessEqual(len(message), 400)
+
+    def test_known_sockets_do_not_bypass_regular_count_or_total_size_budget(self):
+        drill = load()
+        for count, size in ((10001, 1), (9, 64 * 1024 * 1024)):
+            with self.subTest(count=count, size=size), tempfile.TemporaryDirectory(dir='/tmp', prefix='cs-') as tmp, ExitStack() as stack:
+                root = Path(tmp); sock = root / self.PUBRING / 'S.gpg-agent'
+                self.bind_socket(stack, sock, live=False)
+                paths = [root / f'z-{number:05}' for number in range(count)]
+                file_stat = os.stat_result((stat.S_IFREG | 0o600, 1, 1, 1, 0, 0, size, 1, 1, 1))
+                original = Path.lstat
+                def lstat(path, *args, **kwargs): return original(path, *args, **kwargs) if path == sock else file_stat
+                with mock.patch.object(Path, 'rglob', return_value=iter([sock, *paths])), \
+                     mock.patch.object(Path, 'lstat', lstat), \
+                     mock.patch.object(Path, 'is_symlink', return_value=False), \
+                     mock.patch.object(Path, 'is_dir', return_value=False), \
+                     mock.patch.object(Path, 'is_file', side_effect=lambda: True), \
+                     mock.patch.object(Path, 'read_bytes', return_value=b'x'):
+                    with self.assertRaisesRegex(RuntimeError, 'inventory exceeds bounds'):
+                        drill.cache_inventory(root)
 
 class PublicFixtureBoundaryTests(unittest.TestCase):
     def test_export_rejects_unusable_output_without_native_commands(self):

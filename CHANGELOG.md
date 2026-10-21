@@ -11,6 +11,8 @@
   requests, with exact source/content checks and unchanged signed metadata.
 - Correct TEST ONLY DNF cache persistence to include the actual repository cache
   while retaining separate installroot state and strict metadata-read checks.
+- Recognize the pinned DNF public-key IPC sockets in TEST ONLY cache inspection,
+  retaining strict ordinary-file checks and metadata-read evidence.
 
 - Add explicit stable audit sealing with fresh source/control verification and offline composite transport planning; keep stable disabled and production publication unconnected.
 
