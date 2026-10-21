@@ -354,6 +354,13 @@ def _stable_snapshot(item: dict[str, Any], base: Path, test_only: bool) -> dict[
             'stable bootstrap',canonical=True),prepared=False,channel='stable')
         rpm_receipt=C.load_json(root/'audit/rpm-signing.json','stable RPM receipt',canonical=True)
         repo='rpm/stable/el/9/x86_64/'
+        # The verified first-candidate contract has one product and one bootstrap
+        # RPM. Keep transport expansion bounded to those exact canonical members.
+        rpm_paths={C.expected_payload_path('rpm',candidate['version'],channel='stable'),
+                   bootstrap['packages']['rpm']['repository_path']}
+        require(len(rpm_paths)==2 and {name for name in files if name.startswith(repo+'Packages/')}==rpm_paths,
+                'stable RPM payload catalog must contain exactly the canonical product and bootstrap')
+        rpm_payloads={name:files[name] for name in sorted(rpm_paths)}
         immutable={value['download_path'] for value in bootstrap['packages'].values()} | {
             name for name in files if name.startswith('apt/pool/') or '/by-hash/SHA256/' in name
             or name.startswith(repo+'Packages/')}
@@ -388,7 +395,7 @@ def _stable_snapshot(item: dict[str, Any], base: Path, test_only: bool) -> dict[
     return {'identity':{'channel':'stable','audit_release_id':item['audit_release_id'],
         'seal_control_sha':item['seal_control_sha'],'candidate':candidate,
         'resolution_sha256':item['resolution_sha256']},'prefix':prefix,'objects':objects,
-        'files':files,'immutable':immutable,'derived_aliases':derived_aliases}
+        'files':files,'immutable':immutable,'derived_aliases':derived_aliases,'rpm_payloads':rpm_payloads}
 
 
 def make_composite_plan(input_path: Path, test_only: bool, output_path: Path | None = None) -> dict[str, Any]:
@@ -437,15 +444,44 @@ def make_composite_plan(input_path: Path, test_only: bool, output_path: Path | N
             snapshot=_stable_snapshot(raw,input_path.parent,test_only)
         snapshots.append(snapshot)
     preview,stable=snapshots[:2]
+    # Public snapshot paths already address original archive members. A derived
+    # alias must never shadow a different member, even across output categories.
+    snapshot_routes={}
+    for snapshot in snapshots:
+        for value in snapshot['objects']:
+            uri='/'+value['object_key']
+            require(uri not in snapshot_routes or all(snapshot_routes[uri][key]==value[key]
+                    for key in ('sha256','size','cache_control')),'snapshot URI conflict: '+uri)
+            snapshot_routes[uri]=value
     aliases={}
     def add_alias(value: dict[str, Any]) -> None:
+        uri=value['public_uri']
+        if uri in snapshot_routes:
+            require(all(snapshot_routes[uri][key]==value[key] for key in ('sha256','size','cache_control')),
+                    'immutable alias conflicts with snapshot URI: '+uri)
+            return
         path=value['public_uri'][1:]
         if path in aliases:
             require(all(aliases[path][key]==value[key] for key in ('object_key','sha256','size','cache_control')),
                     'immutable URI conflict across snapshots: /'+path)
         else: aliases[path]=value
-    for snapshot in snapshots:
+    stable_snapshots=sorted((item for item in snapshots if item['identity']['channel']=='stable'),
+                            key=lambda item:item['identity']['audit_release_id'])
+    rpm_catalog={}
+    for snapshot in stable_snapshots:
+        for path,facts in snapshot['rpm_payloads'].items():
+            value={'public_uri':'/'+path,'object_key':'public/'+path,**facts,'cache_control':IMMUTABLE_CACHE,
+                'source':{'audit_release_id':snapshot['identity']['audit_release_id'],
+                          'channel':'stable','member':'site/'+path}}
+            if path in rpm_catalog:
+                require(all(rpm_catalog[path][key]==value[key] for key in ('sha256','size','cache_control')),
+                        'immutable URI conflict across snapshots: /'+path)
+            else: rpm_catalog[path]=value
+    # Current descriptors keep precedence for legacy aliases; retained identity
+    # order makes identical-byte source selection independent of input ordering.
+    for snapshot in [*snapshots[:2],*sorted(snapshots[2:],key=lambda item:item['identity']['audit_release_id'])]:
         for path in sorted(snapshot['immutable']):
+            if snapshot['identity']['channel']=='stable' and path in rpm_catalog: continue
             facts=snapshot['files'][path]
             value={'public_uri':'/'+path,'object_key':'public/'+path,**facts,'cache_control':IMMUTABLE_CACHE,
                 'source':{'audit_release_id':snapshot['identity']['audit_release_id'],
@@ -453,6 +489,14 @@ def make_composite_plan(input_path: Path, test_only: bool, output_path: Path | N
             add_alias(value)
         for value in snapshot.get('derived_aliases',[]):
             add_alias(value)
+    for path,value in sorted(rpm_catalog.items()):
+        add_alias(value)
+        for snapshot in stable_snapshots:
+            # A later DNF invocation may refresh mirrorlist while retaining old
+            # metadata. Serve the authenticated payload at each retained base;
+            # its source stays the real archive member, not the destination ID.
+            uri='/'+snapshot['prefix']+'/site/'+path
+            add_alias({**value,'public_uri':uri,'object_key':'public'+uri})
     entrypoints=[]
     for snapshot in (preview,stable):
         for path,facts in sorted(snapshot['files'].items()):
