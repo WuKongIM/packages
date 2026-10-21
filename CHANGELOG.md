@@ -2,9 +2,9 @@
 
 ## Unreleased
 
-- Make TEST ONLY DNF generation-switch acceptance independent of metadata cache
-  age, with explicit A metadata reuse and verified exact-A delivery through the
-  planned B mirrorlist and payload prefix. Production client policy is unchanged.
+- Keep TEST ONLY DNF generation-switch metadata selected across makecache
+  shutdown and download, with verified exact-A delivery through the planned B
+  mirrorlist and payload prefix. Production client policy is unchanged.
 
 - Prepare exact preview/composite object-storage deliveries locally and exercise
   create-only upload, routing and acceptance failures through explicit simulated
