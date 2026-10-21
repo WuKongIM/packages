@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Compile larger finite native route tables into bounded offline CDN candidates
+  while preserving exact paths and legacy literal rules. Live routing and
+  production activation remain unverified and disabled.
+
 - Preserve bounded installation-phase diagnostics when native client acceptance
   fails or times out, without changing package verification or acceptance limits.
 
