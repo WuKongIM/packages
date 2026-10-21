@@ -30,6 +30,14 @@ RPM_REPOSITORY = "stable/el/9/x86_64"
 PACKAGE = "Packages/wukongim.rpm"
 
 
+class SignerInvocationError(RuntimeError):
+    """Retain a bounded public diagnostic for one failed positive signer case."""
+
+    def __init__(self, diagnostic: dict):
+        self.diagnostic = diagnostic
+        super().__init__(f"TEST ONLY signer case failed: {diagnostic['case']}")
+
+
 def load(name: str, filename: str):
     spec = importlib.util.spec_from_file_location(name, ROOT / "tests" / filename)
     assert spec is not None and spec.loader is not None
@@ -106,7 +114,7 @@ def prepare_inputs(scratch: Path, deb: Path, rpm: Path) -> tuple[Path, Path, lis
         ("active", {"schema": "wukongim/rpm-active-allowlist/v1", "paths": [PACKAGE]}),
     ):
         path = scratch / f"{name}.json"
-        path.write_text(json.dumps(value))
+        path.write_bytes(json.dumps(value, sort_keys=True, separators=(",", ":")).encode() + b"\n")
         allowlists += [f"--{name}-rpm-allowlist", str(path)]
     return apt, rpm_input, allowlists
 
@@ -139,12 +147,25 @@ def invoke(scratch: Path, name: str, family: str, mode: str, key, successor: str
             arguments += ["--secret-subkey-base64-file", str(selected)]
     arguments += (["--apt-release", APT_RELEASE] if family == "apt" else
                   ["--rpm-repository", RPM_REPOSITORY, *allowlists])
-    result = run(arguments, env=env, input_bytes=stdin, success=not reject)
+    result = run(arguments, env=env, input_bytes=stdin, success=False)
     if reject:
         require(result.returncode != 0 and not result.stdout and not output.exists()
                 and not list(scratch.glob(f".{name}.*.tmp.*")),
                 f"negative signer case exposed success or partial output: {name}")
         return output, None
+    if result.returncode != 0:
+        message = "no recognized signer diagnostic"
+        for line in result.stderr.splitlines():
+            if line.startswith(b"package-family signing failed: "):
+                # Only the signer's top-level diagnostic is public. Never copy
+                # arbitrary tool stderr or the TEST ONLY credential fixture.
+                for private in (selected.read_bytes().strip(), phrase.read_bytes().strip()):
+                    if private:
+                        line = line.replace(private, b"[redacted]")
+                message = line[:2048].decode("utf-8", errors="ignore")
+                break
+        raise SignerInvocationError({"case": name, "family": family, "input_mode": mode,
+                                     "exit_code": result.returncode, "message": message})
     receipt = json.loads(result.stdout)
     require(receipt["schema"] == "wukongim/package-family-signing-receipt/v1"
             and receipt["family"] == family and receipt["key"]["validated"] is True
@@ -377,6 +398,9 @@ def main() -> int:
             require(len(evidence["cases"]) == 10, "native signing case set is incomplete")
             evidence.update(passed=True, keys=identities, source_inputs_unchanged=True)
         return 0
+    except SignerInvocationError as error:
+        evidence["failure"] = error.diagnostic
+        raise
     finally:
         with (args.output_dir / "native-local-signing.json").open("x") as stream:
             json.dump(evidence, stream, sort_keys=True, indent=2)
