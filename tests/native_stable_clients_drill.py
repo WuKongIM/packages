@@ -442,7 +442,7 @@ def fixture_user():
 
 
 def download_client_command(validator, image, downloads, certificate, family, bootstrap, *, mode):
-    """Hold selected RPM metadata only during the TEST ONLY switch download phase."""
+    """Hold RPM selection across both TEST ONLY switch phases and DNF teardown."""
     command = validator.stable_client_command(image, downloads, certificate, family, bootstrap)
     if family == 'rpm' and mode == 'rpm-switch':
         first = 'dnf "${dnf_options[@]}" makecache --refresh'
@@ -451,10 +451,12 @@ def download_client_command(validator, image, downloads, certificate, family, bo
         require(script.count(first) == 1 and script.count(second) == 1
                 and script.index(first) < script.index(second), 'ambiguous RPM switch phase boundaries')
         command = list(command)
-        # Separate DNF invocations otherwise permit metadata_expire=0 to select
-        # B after A's response barrier. This explicit phase still downloads via
-        # the floating mirrorlist; all normal and cache cases keep native policy.
-        command[-1] = script.replace(second,
+        # DNF can persist explicit expiry when makecache exits. Hold the same
+        # policy in both phases, while --refresh still authenticates fresh A.
+        # The download still uses the floating mirrorlist; other cases keep
+        # native policy and their persistent-cache checks.
+        command[-1] = script.replace(first,
+            'dnf "${dnf_options[@]}" --setopt=wukongim-stable.metadata_expire=-1 makecache --refresh').replace(second,
             'dnf "${dnf_options[@]}" --setopt=wukongim-stable.metadata_expire=-1 install --downloadonly')
     return command
 

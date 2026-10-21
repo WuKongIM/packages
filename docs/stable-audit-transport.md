@@ -146,11 +146,13 @@ The four digest-pinned Ubuntu, Debian, Rocky Linux and AlmaLinux download
 clients use an internal Docker network and an ephemeral CA for the exact
 `packages.githubim.com` name. A deterministic server switches after serving A's
 InRelease or mirrorlist. APT retains A's authenticated by-hash indexes. The RPM
-switch case first runs the normal signed `makecache --refresh`, then sets only
-that case's second DNF invocation to `wukongim-stable.metadata_expire=-1` so it
-uses the already authenticated A metadata. With the packaged `metadata_expire=0`,
-two separate DNF invocations can instead refresh to B as A's cache ages; a
-request barrier alone does not pin a transaction across those invocations.
+switch case sets `wukongim-stable.metadata_expire=-1` on both DNF invocations.
+The first still runs signed `makecache --refresh` to authenticate fresh A; the
+second reuses that selected metadata. DNF can persist an explicit expired state
+when `makecache` exits under the packaged `metadata_expire=0` policy, causing the
+next command to refresh to B even with its own expiry value set to -1. Holding
+the same test policy across both phases prevents that teardown boundary from
+changing the selected generation. No persisted state or metadata mtime is edited.
 The explicit second phase keeps the floating mirrorlist and must record B's
 exact planned mirrorlist response before an exact-A payload response under B's
 planned prefix, within the same case. An A-only download or another retained
