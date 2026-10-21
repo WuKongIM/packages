@@ -311,7 +311,7 @@ def main() -> int:
                         output, receipt = invoke(scratch, name, family, mode, key, successor, source, allowlists)
                         completed.append((name, family, output, receipt))
                     if family == "apt":
-                        bad_phrase = scratch / "wrong-passphrase"
+                        bad_phrase = scratch / "wrong-passphrase.secret"
                         bad_phrase.write_bytes(b"WRONG TEST ONLY")
                         bad_phrase.chmod(0o600)
                         invoke(scratch, "wrong-passphrase", family, "files", key, successor,
