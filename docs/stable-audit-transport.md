@@ -164,8 +164,13 @@ cover both supported by-hash algorithms without forcing a client hash choice.
 Request logs expose the actual URLs, response digests and cache conditionals.
 Separate cases cover persistent caches and missing/corrupt retained objects,
 TLS rejection, redirect escape, interrupted responses, and exact-target/source
-identity rejection. Installed CLI containers use ordinary distro dependency
-networking and only the already authenticated local product package; that
+identity rejection. RPM cache cases persist the final CLI cache/state paths and
+the earlier installroot paths in separate scratch directories: the pinned DNF
+versions initialize their global state before reapplying command-line paths to
+the repository cache. A state file alone does not count as metadata. Repeated
+cache acceptance still requires unchanged metadata bytes and inode plus an
+observed read after timestamp arming. Installed CLI containers use ordinary
+distro dependency networking and only the already authenticated local product package; that
 traffic is not part of the isolated A/B proof.
 
 The driver records and removes only its own container/network IDs. Controlled

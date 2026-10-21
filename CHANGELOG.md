@@ -9,6 +9,8 @@
 - Retain verified stable RPM payloads across supplied snapshot base URLs so DNF
   can finish a download when its mirrorlist changes between metadata and package
   requests, with exact source/content checks and unchanged signed metadata.
+- Correct TEST ONLY DNF cache persistence to include the actual repository cache
+  while retaining separate installroot state and strict metadata-read checks.
 
 - Add explicit stable audit sealing with fresh source/control verification and offline composite transport planning; keep stable disabled and production publication unconnected.
 
