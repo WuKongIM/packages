@@ -58,5 +58,25 @@ class SourcePreflightWorkflowTest(unittest.TestCase):
         self.assertIn("path: ${{ runner.temp }}/local-signing-native/native-local-signing.json", upload)
 
 
+    def test_bootstrap_preparation_drill_uses_only_isolated_native_package_databases(self) -> None:
+        workflow = (ROOT / ".github/workflows/native-package-repository-drill.yml").read_text()
+        step = next((s for s in workflow.split("      - name:")
+                     if "tests/native_bootstrap_preparation_drill.py" in s), "")
+        self.assertTrue(step, "missing real bootstrap preparation drill")
+        for argument in ("manifests/signing-toolchain.json", "--network none", "--read-only",
+                         "--cap-drop ALL", "--cap-add SYS_CHROOT", "--security-opt no-new-privileges",
+                         "--user 0:0", "--cpus 1", "--memory 512m", "--pids-limit 128",
+                         ":/control:ro", "--output-dir /evidence", "--kill-after=10s 5m",
+                         'docker rm --force "$container"', "trap 'exit 130' INT",
+                         "trap 'exit 143' TERM"):
+            self.assertIn(argument, step)
+        self.assertNotRegex(step, r"secrets\.|GH_TOKEN|GITHUB_TOKEN|environment:|--privileged|--cap-add (?!SYS_CHROOT)")
+        self.assertIn("(.cases | length) == 6", step)
+        upload = next((s for s in workflow.split("      - name:")
+                       if "name: native-bootstrap-preparation-test-only" in s), "")
+        self.assertIn("if: always()", upload)
+        self.assertIn("path: ${{ runner.temp }}/bootstrap-preparation-native/native-bootstrap-preparation.json", upload)
+
+
 if __name__ == "__main__":
     unittest.main()

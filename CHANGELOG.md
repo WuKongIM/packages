@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Prepare separate, unsigned stable repository bootstrap packages from reviewed
+  public controls, with independent package/file ownership and native TEST ONLY
+  coinstallation checks. Stable publication and the existing preview installer
+  remain unchanged.
+
 - Register the independent stable APT/RPM public certificates and reviewed
   signing roles, while retaining the disabled stable channel and preview
   publication inputs.

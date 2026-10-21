@@ -143,3 +143,24 @@ The [offline transport planner](docs/object-storage-planning.md) inventories
 existing preview audit snapshots and explicitly retained dependency generations
 without credentials or network access. Its output is a plan only; it does not
 sign, upload, activate CDN routing or enable the stable channel.
+
+## Unpublished stable bootstrap preparation
+
+The offline builder can prepare separate stable APT/RPM repository-setup
+packages from the reviewed bootstrap version and stable public roles:
+
+```sh
+python3 scripts/build-repository-bootstrap-packages.py \
+  --channel stable --control-root . --output-dir /tmp/wukongim-stable-bootstrap-new \
+  > /tmp/wukongim-stable-bootstrap-preparation.json
+```
+
+The output directory must not exist. The command uses only public inputs and
+builds unsigned packages; it does not sign, upload, install, or enable the
+stable channel. The dedicated package names and owned files can coexist with
+preview. The stable RPM configuration uses the planned mirrorlist endpoint
+without a floating `baseurl` fallback. These are preparation artifacts, not
+publicly installable releases: current preview composition, audit and client
+validation reject their explicit unpublished preparation inventory, and `/repo`
+continues to select preview. See the [bootstrap contract](docs/release-contract.md#unpublished-stable-bootstrap-preparation)
+for the remaining signed-repository and public-client acceptance boundaries.

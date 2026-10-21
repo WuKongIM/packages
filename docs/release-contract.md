@@ -345,6 +345,61 @@ entrypoint twice on one pinned APT client and one pinned EL9 DNF client with a
 network-disabled, exact-input curl shim. Both executions must be idempotent,
 must install the bootstrap package, and must leave `wukongim` absent.
 
+### Unpublished stable bootstrap preparation
+
+`build-repository-bootstrap-packages.py` defaults to preview. Its original
+manifest/certificate flags, package identities, data bytes and canonical
+`wukongim.native_package_bootstrap_inventory/v1` output remain unchanged.
+Stable preparation instead requires `--channel stable --control-root <checkout>`
+and derives all inputs from that reviewed root: the existing
+`bootstrap-packages.json` version, `stable-public-keys.json` roles, and fixed
+`keys/apt-stable.asc` / `keys/rpm-stable.asc` files. It rejects explicit
+manifest/certificate overrides, missing or partial registration, enabled stable
+control, certificate substitution, and certificate changes during validation.
+The existing public validator enforces topology, lifetime and full/16/8-hex
+identifier uniqueness across the four APT/RPM channel certificates. Executable
+validation code comes from the builder checkout, never the input control root.
+
+The stable packages are `wukongim-archive-keyring-stable` (`all`) and
+`wukongim-release-stable` (`noarch`). They retain the data-only/no-script
+contract and own separate files:
+
+- `/usr/share/keyrings/wukongim-archive-keyring-stable.pgp` and
+  `/etc/apt/sources.list.d/wukongim-stable.sources`, using APT suite `stable`
+  and the dedicated `Signed-By` keyring;
+- `/etc/pki/rpm-gpg/RPM-GPG-KEY-wukongim-stable` and
+  `/etc/yum.repos.d/wukongim-stable.repo`, using only
+  `https://packages.githubim.com/rpm/stable/el/9/x86_64/mirrorlist`, with no
+  floating `baseurl` fallback and all signature/TLS checks enabled.
+
+Their normal source configuration is enabled inside the generated packages;
+this does not activate a server-side channel. Preparation must never be
+advertised as an install command for the public service. Both packages remain
+unsigned build outputs, and the inventory schema is
+`wukongim.stable_bootstrap_preparation/v1` with `channel: stable` and
+`published: false`. Existing preview composer, snapshot/audit validators and
+client gates reject it; the current `/repo` installer is unchanged. The generic
+family signer can operate on explicit repository trees but does not consume
+this preparation inventory or authorize stable publication.
+
+The native TEST ONLY drill builds both channels twice in the existing pinned
+Linux toolchain, compares default/explicit preview and repeated stable bytes,
+then uses real `dpkg` and `rpm` scratch databases to install both orders and
+reinstall each package. It checks retained file bytes/ownership, exact package
+identities, no product installation, and preserves a six-case public JSON result.
+For native `--root` installation only, the network-disabled, read-only container
+runs as root with only `SYS_CHROOT`; production signing remains non-root. No
+package is installed on the host and no signature, dependency, or file-conflict
+check is disabled. Only the JSON receipt leaves temporary scratch.
+
+This proves package construction/coinstallation when the native drill passes.
+It does not prove RPM package signatures, live APT/DNF repository behavior,
+mirrorlist correctness, CDN A/B/cache transitions, or authenticated public
+installation. Those require subsequent complete stable composition, signing,
+immutable audit and public-client work. The separate existing local-signing drill
+provides TEST ONLY signature coverage, not signatures on these preparation bytes.
+The stable channel remains disabled throughout this slice.
+
 Preview primary-key generation currently uses an explicitly accepted
 single-operator online-workstation custody model. The named operator is
 `tangtaoit`. The operator retains one encrypted full-secret backup and its
