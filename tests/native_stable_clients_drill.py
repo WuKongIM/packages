@@ -613,12 +613,13 @@ def build_product(args, scratch, evidence):
     return binaries
 
 
-def seal_generations(exports, fixtures, scratch, evidence):
+def seal_generations(exports, fixtures, scratch, evidence, *, preview=None):
     """Exercise existing writers only against the explicit loopback API substitute."""
     sys.path.insert(0, str(ROOT)); sys.path.insert(0, str(ROOT / 'tests'))
     from stable_audit_fixture import AuditState, serve_audit
     from test_plan_object_storage_publication import InputSnapshot
-    preview = InputSnapshot(scratch / 'preview-structural')
+    if preview is None:
+        preview = InputSnapshot(scratch / 'preview-structural')
     descriptors = {}
     for label, release_id in (('A', 4242), ('B', 4243)):
         entry = exports['generations'][label]

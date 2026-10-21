@@ -226,3 +226,44 @@ Official references: [OSS V2](https://pypi.org/project/alibabacloud-oss-v2/1.4.1
 [CDN SDK](https://pypi.org/project/aliyun-python-sdk-cdn/3.8.8/),
 [STS SDK](https://pypi.org/project/aliyun-python-sdk-sts/3.1.3/), and
 [CDN function contract](https://www.alibabacloud.com/help/en/cdn/developer-reference/parameters-for-configuring-features-for-domain-names).
+
+## TEST ONLY native preview fixture seam
+
+`tests/native_object_delivery_fixture_drill.py` constructs tiny data-only native
+preview and stable A/B packages in the existing pinned signing image. It reuses
+the trusted repository builder, family signer, composer, canonical archiver,
+external audit receipt and default native verifier. Private TEST ONLY signing
+material is destroyed before verification or public export. It then supplies the
+real preview archive to the existing loopback stable sealing helper and exercises
+the unchanged v2 planner and offline materializer, including exact object bytes,
+cross-generation aliases, current client request identities and rejection cases.
+No native verifier is substituted.
+
+The separate `export_delivery_generations` helper cannot replace
+`export_client_generations`: the latter still requires explicit fixed-source
+Linux amd64 executable inputs. The fixture drill checks missing binaries,
+malformed ELF inputs and a wrong source SHA are rejected. Format validation does
+not independently prove arbitrary executable provenance. These data-only
+packages contain no product executable, and no package is installed or run.
+
+Preview source attestation JSON and loopback GitHub observations are synthetic
+TEST ONLY byte anchors. Actual native signature verification does not authenticate
+those source claims. Fresh production authentication must reject the composite
+TEST ONLY inputs. The original false GitHub, cloud, activation and publication
+fields remain false. This seam does not test official SDK delivery, live CDN
+rewrite equivalence, production authority or public installed-CLI acceptance.
+
+Run the drill as a non-root user in the image digest from
+`manifests/signing-toolchain.json`, with networking disabled, a read-only checkout
+and a public output directory. Supply `--trusted-root` containing the six exact
+files from `manifests/trusted-toolchain.json`, `--source-sha` for the tested checkout,
+and an initially empty `--output-dir`. Bound the container lifetime and remove it
+after exit. `result.json` records every declared case, command outcomes, native
+verification limits and cleanup; `fixture-export.json` binds the public preview
+descriptor and A/B paths. A nonzero exit, omitted case, timeout or cleanup failure
+is a failed run. The read-only native safety workflow runs these 29 cases in a
+separate 15-minute, network-disabled container step with `--init` to reap orphaned
+GPG agents, and checks both receipts. It
+uploads only public JSON evidence. Existing native candidate 31 and four-client
+49-case commands and deadlines remain separate and unchanged. The production
+producers, validators, channels and keys are unchanged.

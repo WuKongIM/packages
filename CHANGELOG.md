@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Add a TEST ONLY native preview fixture export alongside stable A/B to check
+  signed archive recovery and offline composite delivery without cloud access.
+  Data-only fixtures do not establish product, source or public-client acceptance.
+
 - Add optional offline contracts for explicit-credential OSS/CDN SDK operations
   and fresh delivery-input authentication, with complete configuration observations
   bound before writes and credential logging rejected before SDK entry. Production
