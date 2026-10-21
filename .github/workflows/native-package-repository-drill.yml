@@ -162,6 +162,42 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
 
+      - name: Compose and independently verify TEST ONLY stable offline candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          jq -e '.enabled == true' manifests/signing-toolchain.json >/dev/null
+          image="$(jq -r '.image + "@" + .digest' manifests/signing-toolchain.json)"
+          candidate_output="$RUNNER_TEMP/stable-candidate-native"
+          mkdir "$candidate_output"
+          chmod 0777 "$candidate_output"
+          container="wk-stable-candidate-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          trap 'docker rm --force "$container" >/dev/null 2>&1 || true' EXIT
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
+          timeout --signal=TERM --kill-after=10s 10m docker run --rm --name "$container" \
+            --platform linux/amd64 --network none --read-only --cap-drop ALL \
+            --security-opt no-new-privileges --user 65532:65532 \
+            --cpus 1 --memory 512m --pids-limit 128 \
+            --tmpfs /tmp:rw,nosuid,nodev,size=268435456 \
+            --volume "$GITHUB_WORKSPACE:/control:ro" \
+            --volume "$candidate_output:/evidence" \
+            --workdir /tmp "$image" \
+            python3 -B /control/tests/native_stable_candidate_drill.py \
+            --output-dir /evidence --source-sha "$GITHUB_SHA" \
+            --trusted-root /control/.trusted/wukongim
+          jq -e '.test_only == true and .passed == true and .secret_tree_removed_before_verification == true and .scratch_removed == true and .checked_in_control_unchanged == true and (.cases | length) == 31 and all(.cases[]; .passed == true)' \
+            "$candidate_output/native-stable-candidate.json" >/dev/null
+
+      - name: Preserve TEST ONLY native stable candidate evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-stable-candidate-test-only
+          path: ${{ runner.temp }}/stable-candidate-native/native-stable-candidate.json
+          if-no-files-found: warn
+          retention-days: 30
+
       - name: Set up fixed GoReleaser toolchain
         uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:

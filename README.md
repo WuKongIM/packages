@@ -164,3 +164,20 @@ publicly installable releases: current preview composition, audit and client
 validation reject their explicit unpublished preparation inventory, and `/repo`
 continues to select preview. See the [bootstrap contract](docs/release-contract.md#unpublished-stable-bootstrap-preparation)
 for the remaining signed-repository and public-client acceptance boundaries.
+
+## Stable offline candidate closure
+
+The existing planner, preparer, composer, audit and independent verifier now
+accept an explicit `--channel stable --offline-candidate` mode for one initial
+stable release. It binds the public controls and original source preflight
+bytes, prepares both product and separate bootstrap packages, consumes outputs
+from the existing family signer, and reconstructs a canonical archive after
+independent native signature and repository-closure checks.
+
+These are unsealed local candidates. The stable channel remains disabled;
+production publishers, audit replay and the preview transport planner still
+reject candidate schemas. No production signing keys are read automatically.
+The TEST ONLY native drill uses two ephemeral key families and tiny data-only
+packages; it is not a production signature, a GitHub audit seal, or public
+APT/DNF acceptance. See the [candidate contract](docs/release-contract.md#stable-first-generation-offline-candidate)
+for exact inputs, commands, supported operations and verification boundaries.

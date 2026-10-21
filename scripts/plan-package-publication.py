@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import importlib.util
 import re
 import shutil
 import subprocess
@@ -13,6 +14,10 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+
+_C_SPEC = importlib.util.spec_from_file_location("_plan_composer", Path(__file__).with_name("compose-package-site.py"))
+C = importlib.util.module_from_spec(_C_SPEC)
+_C_SPEC.loader.exec_module(C)
 
 CHANNELS_SCHEMA = "wukongim.native_package_channels/v3"
 SNAPSHOT_SCHEMA = "wukongim.native_package_snapshot/v3"
@@ -503,13 +508,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--channels", type=Path, required=True)
     parser.add_argument("--base-snapshot", type=Path)
-    parser.add_argument("--control-sha", required=True)
+    parser.add_argument("--control-sha")
+    C.candidate_arguments(parser)
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     try:
+        if C.candidate_mode(args):
+            C.require_candidate_paths(args)
+            plan = C.build_candidate_plan(args.control_root, args.candidate_source_root,
+                                          args.control_sha, test_only=args.test_only)
+            sys.stdout.buffer.write(C.canonical_json(plan))
+            return 0
+        require(args.control_sha is not None, "preview requires --control-sha")
         channels = load_json(args.channels)
         preview = channels.get("channels", {}).get("preview", {}) if isinstance(channels, dict) else {}
         publication = preview.get("publication", {}) if isinstance(preview, dict) else {}
@@ -517,7 +530,7 @@ def main(argv: list[str] | None = None) -> int:
         base = load_base(args.base_snapshot, base_id)
         plan = build_plan(channels, base, args.control_sha, datetime.now(timezone.utc))
         validate_native_version_transition(plan, base)
-    except PlanError as error:
+    except (PlanError, C.CompositionError, OSError) as error:
         print(f"publication planning failed: {error}", file=sys.stderr)
         return 1
     json.dump(plan, sys.stdout, sort_keys=True, separators=(",", ":"))

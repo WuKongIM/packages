@@ -28,6 +28,10 @@ snapshot_archive = importlib.util.module_from_spec(ARCHIVE_SPEC)
 ARCHIVE_SPEC.loader.exec_module(snapshot_archive)
 
 
+COMPOSER_SPEC = importlib.util.spec_from_file_location("_audit_composer", ROOT/"scripts/compose-package-site.py")
+C = importlib.util.module_from_spec(COMPOSER_SPEC)
+COMPOSER_SPEC.loader.exec_module(C)
+
 RECEIPT_SCHEMA = "wukongim/package-audit-receipt/v2"
 CHANNELS_SCHEMA = "wukongim.native_package_channels/v3"
 SIGNING_SCHEMA = "wukongim.native_package_signing/v3"
@@ -1072,6 +1076,53 @@ def _require_archived_copy(
     return archived_raw
 
 
+def candidate_archive_names(version: str, snapshot_sha256: str) -> tuple[str, str]:
+    """Name an unsealed archive by content, never by a nonexistent audit Release."""
+    require(isinstance(version, str) and C.RELEASE_VERSION_RE.fullmatch(version),
+            "candidate version must be strict release SemVer")
+    require(isinstance(snapshot_sha256, str) and LOWER_SHA256.fullmatch(snapshot_sha256),
+            "candidate snapshot digest must be SHA-256")
+    stem = f"wukongim-stable-{version}-{snapshot_sha256}-candidate"
+    return stem + "-site.tar", stem + "-receipt.json"
+
+
+def build_candidate_audit_receipt(args: argparse.Namespace, archive_path: Path) -> dict[str, Any]:
+    """Reconstruct an unsealed receipt from external anchors and real verification."""
+    C.require_candidate_paths(args)
+    plan = C.validate_candidate_plan(C.load_json(args.plan, "external candidate plan", canonical=True),
+        args.control_root, args.candidate_source_root, test_only=args.test_only)
+    archive_facts = C.hash_file(archive_path, "candidate archive", maximum_bytes=ARCHIVE_MAX_TOTAL_BYTES)
+    with tempfile.TemporaryDirectory(prefix="wk-candidate-audit-") as temporary:
+        extracted = Path(temporary).resolve()/"snapshot"
+        snapshot_archive.extract_snapshot(archive_path=archive_path, output_dir=extracted,
+            max_members=snapshot_archive.DEFAULT_MAX_MEMBERS, max_total_size=ARCHIVE_MAX_TOTAL_BYTES)
+        snapshot_facts = C.hash_file(extracted/"audit/snapshot.json", "candidate snapshot", maximum_bytes=MAX_JSON_BYTES)
+        archive_name, _ = candidate_archive_names(plan["target_version"], snapshot_facts["sha256"])
+        require(archive_path.name == archive_name, "candidate archive name differs from version/snapshot identity")
+        external_inputs = C.candidate_audit_inputs(args, plan)
+        for relative, (external, facts) in external_inputs.items():
+            archived = C.read_checked(extracted/relative, "archived " + relative, expected=facts, maximum_bytes=MAX_JSON_BYTES)
+            require(archived == C.read_checked(external, "external " + relative, expected=facts, maximum_bytes=MAX_JSON_BYTES),
+                    "archived candidate evidence differs from external input: " + relative)
+        verifier = C.local_module("verify-production-package-site.py")
+        verification_args = argparse.Namespace(**vars(args), site_root=extracted/"site",
+                                               snapshot=extracted/"audit/snapshot.json")
+        try:
+            verification = verifier.verify(verification_args)
+        except (verifier.VerificationError, verifier.C.CompositionError) as error:
+            raise AuditReceiptError(str(error)) from error
+        require(C.hash_file(archive_path, "candidate archive", maximum_bytes=ARCHIVE_MAX_TOTAL_BYTES) == archive_facts,
+                "candidate archive changed during verification")
+    return {
+        "schema":"wukongim/package-audit-receipt/v3", "stage":"offline_candidate",
+        "channel":"stable", "test_only":args.test_only, "audit_release_id":None,
+        "control_sha":plan["control_sha"],
+        "archive":{"name":archive_name, **archive_facts, "snapshot_sha256":snapshot_facts["sha256"]},
+        "inputs":{relative:facts for relative, (_, facts) in sorted(external_inputs.items())},
+        "verification":verification,
+    }
+
+
 def build_audit_receipt(
     *,
     channels_path: Path,
@@ -1084,7 +1135,23 @@ def build_audit_receipt(
     apt_receipt_path: Path,
     rpm_receipt_path: Path,
     archive_path: Path,
+    channel: str = "preview",
+    offline_candidate: bool = False,
+    control_root: Path | None = None,
+    candidate_source_root: Path | None = None,
+    test_only: bool = False,
 ) -> dict[str, Any]:
+    candidate_args = argparse.Namespace(channel=channel, offline_candidate=offline_candidate,
+        control_root=control_root, candidate_source_root=candidate_source_root, test_only=test_only,
+        channels=channels_path, signing=signing_path, signing_toolchain=signing_toolchain_path,
+        apt_public_cert=apt_public_cert_path, rpm_public_cert=rpm_public_cert_path,
+        plan=plan_path, apt_receipt=apt_receipt_path, rpm_receipt=rpm_receipt_path)
+    if C.candidate_mode(candidate_args):
+        require(source_attestations_path is None, "candidate source evidence uses the bound source root")
+        try:
+            return build_candidate_audit_receipt(candidate_args, archive_path)
+        except snapshot_archive.ArchiveError as error:
+            raise AuditReceiptError(f"package archive validation failed: {error}") from error
     channels_value, _ = load_json(Path(channels_path), "channels manifest")
     signing_value, _ = load_json(Path(signing_path), "preview signing manifest")
     toolchain_value, toolchain_raw = load_json(
@@ -1368,7 +1435,12 @@ def _write_exclusive(path: Path, value: dict[str, Any]) -> None:
 
 def create_audit_receipt(*, output_path: Path, **inputs: Any) -> dict[str, Any]:
     receipt = build_audit_receipt(**inputs)
-    expected_name = f"wukongim-preview-r{receipt['audit_release_id']}-receipt.json"
+    if inputs.get("offline_candidate"):
+        C.validate_candidate_output_paths((Path(output_path),),
+            (inputs["control_root"], inputs["candidate_source_root"], inputs["plan_path"],
+             inputs["apt_receipt_path"], inputs["rpm_receipt_path"], inputs["archive_path"]))
+    expected_name = (candidate_archive_names(receipt["verification"]["target_version"], receipt["archive"]["snapshot_sha256"])[1]
+                     if inputs.get("offline_candidate") else f"wukongim-preview-r{receipt['audit_release_id']}-receipt.json")
     require(Path(output_path).name == expected_name,
             f"external receipt name must be {expected_name}")
     _write_exclusive(Path(output_path), receipt)
@@ -1377,12 +1449,13 @@ def create_audit_receipt(*, output_path: Path, **inputs: Any) -> dict[str, Any]:
 
 def verify_audit_receipt(*, receipt_path: Path, **inputs: Any) -> dict[str, Any]:
     expected = build_audit_receipt(**inputs)
-    expected_name = f"wukongim-preview-r{expected['audit_release_id']}-receipt.json"
+    expected_name = (candidate_archive_names(expected["verification"]["target_version"], expected["archive"]["snapshot_sha256"])[1]
+                     if inputs.get("offline_candidate") else f"wukongim-preview-r{expected['audit_release_id']}-receipt.json")
     require(Path(receipt_path).name == expected_name,
             f"external receipt name must be {expected_name}")
     actual_value, _ = load_json(Path(receipt_path), "external audit receipt", canonical=True)
-    actual = validate_external_receipt(actual_value)
-    require(actual == expected,
+    actual = actual_value if inputs.get("offline_candidate") else validate_external_receipt(actual_value)
+    require(canonical_json(actual) == canonical_json(expected),
             "external audit receipt differs from the current reviewed inputs or archive")
     return actual
 
@@ -1398,6 +1471,7 @@ def _common_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--apt-receipt", required=True, type=Path)
     parser.add_argument("--rpm-receipt", required=True, type=Path)
     parser.add_argument("--archive", required=True, type=Path)
+    C.candidate_arguments(parser)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -1425,13 +1499,16 @@ def main(argv: list[str] | None = None) -> int:
         "apt_receipt_path": args.apt_receipt,
         "rpm_receipt_path": args.rpm_receipt,
         "archive_path": args.archive,
+        "channel":args.channel, "offline_candidate":args.offline_candidate,
+        "control_root":args.control_root, "candidate_source_root":args.candidate_source_root,
+        "test_only":args.test_only,
     }
     try:
         if args.command == "create":
             receipt = create_audit_receipt(output_path=args.output, **inputs)
         else:
             receipt = verify_audit_receipt(receipt_path=args.receipt, **inputs)
-    except AuditReceiptError as error:
+    except (AuditReceiptError, C.CompositionError, OSError) as error:
         print(f"package audit receipt operation failed: {error}", file=sys.stderr)
         return 1
     print(canonical_json(receipt).decode("utf-8"), end="")

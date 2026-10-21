@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Build and independently verify first-generation stable offline repository
+  candidates with the existing local signing tools and canonical archive
+  recovery. Candidate artifacts remain unsealed and cannot be published by
+  current production consumers; stable publication remains disabled.
+
 - Prepare separate, unsigned stable repository bootstrap packages from reviewed
   public controls, with independent package/file ownership and native TEST ONLY
   coinstallation checks. Stable publication and the existing preview installer

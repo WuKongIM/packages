@@ -8,6 +8,7 @@ import ctypes
 import errno
 import hashlib
 import json
+import importlib.util
 import os
 import re
 import shutil
@@ -18,6 +19,10 @@ import tempfile
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+
+_C_SPEC = importlib.util.spec_from_file_location("_prepare_composer", Path(__file__).with_name("compose-package-site.py"))
+C = importlib.util.module_from_spec(_C_SPEC)
+_C_SPEC.loader.exec_module(C)
 
 PLAN_SCHEMA = "wukongim.native_package_publication_plan/v1"
 SNAPSHOT_SCHEMA = "wukongim.native_package_snapshot/v3"
@@ -485,6 +490,10 @@ def build_bootstrap_packages(
         "--rpm-public-cert", str(args.rpm_public_cert.resolve()),
         "--output-dir", str(output),
     ]
+    candidate = getattr(args, "offline_candidate", False)
+    if candidate:
+        command = [str(args.bootstrap_builder.resolve()), "--channel", "stable",
+                   "--control-root", str(args.control_root), "--output-dir", str(output)]
     result = subprocess.run(command, check=False, capture_output=True)
     require(result.returncode == 0, "trusted bootstrap package builder failed")
     require(len(result.stdout) <= 4 * 1024 * 1024,
@@ -499,12 +508,19 @@ def build_bootstrap_packages(
         ) from error
     require(result.stdout == canonical_json(value),
             "trusted bootstrap package builder inventory is not canonical JSON")
-    inventory = validate_bootstrap_inventory(
-        value,
-        label="bootstrap builder inventory",
-        expected_version=manifest["version"],
-        require_builder_state=True,
-    )
+    if candidate:
+        C.exact(value, {"schema", "channel", "published", "version", "packages"}, "stable bootstrap preparation")
+        C.require(value["schema"] == "wukongim.stable_bootstrap_preparation/v1"
+                  and value["channel"] == "stable" and value["published"] is False,
+                  "stable bootstrap builder did not return unpublished preparation")
+        inventory = C.validate_bootstrap_inventory(
+            {"schema":C.CANDIDATE_BOOTSTRAP_SCHEMA, "version":value["version"], "packages":value["packages"]},
+            prepared=True, channel="stable")
+        C.require(inventory["version"] == manifest["version"] and all(item["new"] is True for item in inventory["packages"].values()),
+                  "stable bootstrap builder version/new state differs")
+    else:
+        inventory = validate_bootstrap_inventory(value, label="bootstrap builder inventory",
+            expected_version=manifest["version"], require_builder_state=True)
     try:
         output_metadata = output.lstat()
         entries = list(output.iterdir())
@@ -625,23 +641,51 @@ def rename_directory_exclusive(source: Path, destination: Path) -> None:
 
 
 def prepare(args: argparse.Namespace) -> dict[str, Any]:
-    channels = load_json(args.channels)
-    plan = load_json(args.plan)
+    candidate = C.candidate_mode(args)
+    channel = "stable" if candidate else "preview"
+    if candidate:
+        C.require_candidate_paths(args)
+        plan = C.validate_candidate_plan(C.load_json(args.plan, "candidate plan", canonical=True),
+            args.control_root, args.candidate_source_root, test_only=args.test_only)
+        C.validate_candidate_output_paths((args.output, args.inventory, args.bootstrap_inventory),
+                                          (args.control_root, args.candidate_source_root))
+        C.require(args.source_assets.absolute() == (args.candidate_source_root/"assets").absolute(),
+                  "candidate assets must come from the bound source root")
+        trusted = C.load_json(args.control_root/"manifests/trusted-toolchain.json", "trusted toolchain")
+        C.require(C.hash_file(args.builder, "trusted repository builder", maximum_bytes=1024*1024)["sha256"]
+                  == trusted["files"]["scripts/build-native-package-repositories.sh"],
+                  "repository builder SHA differs from pinned control")
+        C.require(args.bootstrap_builder.resolve() == Path(__file__).with_name("build-repository-bootstrap-packages.py").resolve(),
+                  "candidate bootstrap builder must be the frozen local producer")
+        if not args.test_only:
+            metadata_verifier = C.local_module("verify-source-package-metadata.py")
+            try:
+                actual_metadata = metadata_verifier.verify_metadata(
+                    args.candidate_source_root/"resolution.json", args.source_assets, "stable")
+            except metadata_verifier.VerificationError as error:
+                raise PreparationError(str(error)) from error
+            C.require(C.canonical_json(actual_metadata) == C.canonical_json(C.load_json(args.candidate_source_root/"metadata.json", "source metadata")),
+                      "actual source package metadata differs from preflight evidence")
+        audit_id = base_id = base_snapshot = base_site = base_bootstrap = None
+        releases = [plan["release"]]
+    else:
+        channels = load_json(args.channels)
+        plan = load_json(args.plan)
+        require(isinstance(channels, dict) and channels.get("schema") == "wukongim.native_package_channels/v3",
+                "channels manifest must use schema v3")
+        require(isinstance(plan, dict) and plan.get("schema") == PLAN_SCHEMA,
+                f"publication plan schema must be {PLAN_SCHEMA}")
+        audit_id = plan.get("audit_release_id")
+        require(type(audit_id) is int and audit_id > 0, "publication plan has no audit Release")
+        base_id = plan.get("base_audit_release_id")
+        base_snapshot, base_site = load_base(args.base_root, base_id)
+        base_bootstrap = load_base_bootstrap(base_site)
+        preview = channels.get("channels", {}).get("preview", {})
+        releases = preview.get("releases")
     bootstrap_manifest = load_bootstrap_manifest(args.bootstrap_manifest)
-    require(isinstance(channels, dict) and channels.get("schema") == "wukongim.native_package_channels/v3",
-            "channels manifest must use schema v3")
-    require(isinstance(plan, dict) and plan.get("schema") == PLAN_SCHEMA,
-            f"publication plan schema must be {PLAN_SCHEMA}")
-    audit_id = plan.get("audit_release_id")
-    require(type(audit_id) is int and audit_id > 0, "publication plan has no audit Release")
-    base_id = plan.get("base_audit_release_id")
-    base_snapshot, base_site = load_base(args.base_root, base_id)
-    base_bootstrap = load_base_bootstrap(base_site)
-    preview = channels.get("channels", {}).get("preview", {})
-    releases = preview.get("releases")
-    require(isinstance(releases, list), "preview releases must be an array")
+    require(isinstance(releases, list), "selected releases must be an array")
     release_by_version = {item.get("version"): item for item in releases if isinstance(item, dict)}
-    require(len(release_by_version) == len(releases), "preview release versions must be unique")
+    require(len(release_by_version) == len(releases), "release versions must be unique")
     active = plan.get("active_versions")
     retained = plan.get("retained_versions")
     new_versions = plan.get("new_versions")
@@ -665,8 +709,8 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
     bootstrap_inventory_absolute = Path(os.path.abspath(args.bootstrap_inventory))
     require(len({output_absolute, inventory_absolute, bootstrap_inventory_absolute}) == 3,
             "repository and inventory outputs must differ")
-    for candidate in (inventory_absolute, bootstrap_inventory_absolute):
-        require(not candidate.is_relative_to(output_absolute),
+    for inventory_path in (inventory_absolute, bootstrap_inventory_absolute):
+        require(not inventory_path.is_relative_to(output_absolute),
                 "inventory output must not be inside repository output")
     checked_file(args.builder, "trusted repository builder")
     checked_file(args.bootstrap_builder, "trusted bootstrap package builder")
@@ -696,8 +740,8 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
     )
     require(len({output, inventory_output, bootstrap_inventory_output}) == 3,
             "repository and inventory outputs must differ")
-    for candidate in (inventory_output, bootstrap_inventory_output):
-        require(not candidate.is_relative_to(output),
+    for inventory_path in (inventory_output, bootstrap_inventory_output):
+        require(not inventory_path.is_relative_to(output),
                 "inventory output must not be inside repository output")
     require(not os.path.lexists(output), "output must not already exist or be a link")
     require(not os.path.lexists(inventory_output),
@@ -705,6 +749,9 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
     require(not os.path.lexists(bootstrap_inventory_output),
             "bootstrap inventory output must not already exist or be a link")
 
+    if candidate:
+        C.validate_candidate_output_paths((output, inventory_output, bootstrap_inventory_output),
+                                          (args.control_root, args.candidate_source_root))
     output_identity: tuple[int, int] | None = None
     inventory_identity: tuple[int, int] | None = None
     bootstrap_inventory_identity: tuple[int, int] | None = None
@@ -727,7 +774,8 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
                     require(isinstance(expected_source, str) and SHA256_RE.fullmatch(expected_source),
                             f"reviewed {family} source digest is invalid for {version}")
                     if is_new:
-                        source = find_new_asset(source_root, release, suffix)
+                        source = (source_root / f"wukongim_{version}_linux_amd64{suffix}" if candidate
+                                  else find_new_asset(source_root, release, suffix))
                         published = expected_source
                         filename = source.name
                     else:
@@ -749,7 +797,7 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
                     repository_path = (
                         f"apt/pool/main/w/wukongim/{filename}"
                         if family == "apt"
-                        else f"rpm/preview/el/9/x86_64/Packages/{filename}"
+                        else f"rpm/{channel}/el/9/x86_64/Packages/{filename}"
                     )
                     prepared[family].append({
                         "version": version,
@@ -784,7 +832,7 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
                 )
             )
             bootstrap_prepared = {
-                "schema": BOOTSTRAP_INVENTORY_SCHEMA,
+                "schema": C.CANDIDATE_BOOTSTRAP_SCHEMA if candidate else BOOTSTRAP_INVENTORY_SCHEMA,
                 "version": built_bootstrap["version"],
                 "packages": {},
             }
@@ -828,9 +876,9 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
                 str(args.builder.resolve()),
                 "--packages-dir", str(active_packages),
                 "--output", str(repository),
-                "--apt-suite", "preview",
+                "--apt-suite", channel,
                 "--apt-architecture", "amd64",
-                "--rpm-channel", "preview",
+                "--rpm-channel", channel,
                 "--rpm-basearch", "x86_64",
             ]
             result = subprocess.run(command, check=False, capture_output=True, text=True)
@@ -862,7 +910,7 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
                 )
 
             inventory = {
-                "schema": INVENTORY_SCHEMA,
+                "schema": C.CANDIDATE_INVENTORY_SCHEMA if candidate else INVENTORY_SCHEMA,
                 "audit_release_id": audit_id,
                 "active_versions": active,
                 "retained_versions": retained,
@@ -871,6 +919,11 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
                     for family in ("apt", "rpm")
                 },
             }
+            if candidate:
+                C.require(C.hash_file(args.builder, "trusted repository builder", maximum_bytes=1024*1024)["sha256"]
+                          == trusted["files"]["scripts/build-native-package-repositories.sh"],
+                          "repository builder changed during preparation")
+                C.validate_candidate_plan(plan, args.control_root, args.candidate_source_root, test_only=args.test_only)
             inventory_raw = canonical_json(inventory)
             bootstrap_inventory_raw = canonical_json(bootstrap_prepared)
             inventory_identity = write_inventory_exclusive(inventory_output, inventory_raw)
@@ -910,6 +963,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--inventory", required=True, type=Path)
     parser.add_argument("--bootstrap-inventory", required=True, type=Path)
+    C.candidate_arguments(parser)
     return parser
 
 
@@ -917,7 +971,7 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         inventory = prepare(args)
-    except PreparationError as error:
+    except (PreparationError, C.CompositionError, OSError) as error:
         print(f"package-site preparation failed: {error}", file=sys.stderr)
         return 1
     json.dump(inventory, sys.stdout, sort_keys=True, separators=(",", ":"))
