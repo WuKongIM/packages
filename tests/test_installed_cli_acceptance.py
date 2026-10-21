@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import importlib.util
+from contextlib import contextmanager
 import hashlib
 import io
 import json
+import os
 from pathlib import Path
+import shlex
 import subprocess
+import sys
 import tarfile
 from tempfile import TemporaryDirectory
 import unittest
@@ -19,6 +23,102 @@ SPEC.loader.exec_module(acceptance)
 FIXTURES = ROOT / 'tests/fixtures/wkcli-acceptance'
 IDENTITY = dict(version=VERSION, commit='a' * 40, build_source='release')
 CHECKS = ['version', 'help', 'bench_validate', 'db_query', 'migrate_diagnose', 'invalid_inputs', 'read_only_data']
+STAGE_PREFIX = 'WK_INSTALLED_STAGE_V1:'
+RPM_STAGE_EVENTS = ['checksum:begin', 'checksum:complete', 'signature:begin', 'signature:complete',
+                    'dependencies:begin', 'dependencies:complete', 'cli:begin', 'cli:complete']
+APT_STAGE_EVENTS = ['checksum:begin', 'checksum:complete', 'dependencies:begin',
+                    'dependencies:complete', 'cli:begin', 'cli:complete']
+
+
+def observed_stage_lines(output):
+    return [line.decode()[len(STAGE_PREFIX):] for line in output.split(b'\n')[:-1]
+            if line.startswith(STAGE_PREFIX.encode())]
+
+
+@contextmanager
+def generated_installation_shell(family, *, fault='', noise=0, extra=''):
+    """Run the real generated shell with only external tools and mount paths replaced."""
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        tools = root / 'tools'; tools.mkdir()
+        evidence = root / 'evidence'; evidence.mkdir()
+        package = root / ('candidate.' + ('deb' if family == 'apt' else 'rpm'))
+        package.write_bytes(b'TEST ONLY package command boundary')
+        certificate = root / 'public.asc'; certificate.write_text('TEST ONLY public command boundary')
+        command = validator._installed_cli_command('fixture-image', package, evidence, certificate,
+                                                   family, IDENTITY, hashlib.sha256(package.read_bytes()).hexdigest())
+        shell = command[-1]
+        for old, new in (('/candidate.' + ('deb' if family == 'apt' else 'rpm'), package),
+                         ('/reviewed-key.asc', certificate), ('/evidence/installed-cli.json', evidence / 'installed-cli.json'),
+                         ('/usr/sbin/policy-rc.d', root / 'policy-rc.d'),
+                         ('/acceptance.py', root / 'acceptance.py'), ('/fixtures', root / 'fixtures')):
+            shell = shell.replace(old, shlex.quote(str(new)))
+        stub = '#!' + sys.executable + '\n' + '''
+import os,sys,time
+from pathlib import Path
+name=Path(sys.argv[0]).name
+phase={'sha256sum':'checksum','dnf':'install','python3':'cli'}.get(name)
+if name=='rpm':phase='rpm-import' if sys.argv[1]=='--import' else 'signature'
+if name=='apt-get':phase='apt-update' if 'update' in sys.argv else 'install'
+with open(os.environ['WK_STAGE_TRACE'],'a') as trace:trace.write(phase+'\\n')
+if phase=='checksum':sys.stdin.buffer.read()
+if phase=='install':
+ sys.stdout.write('x'*int(os.environ['WK_STAGE_NOISE']))
+ if int(os.environ['WK_STAGE_NOISE']):sys.stdout.write('\\n')
+ sys.stdout.write(os.environ['WK_STAGE_EXTRA']);sys.stdout.flush()
+fault=os.environ['WK_STAGE_FAULT']
+if fault=='block-'+phase:
+ Path(os.environ['WK_STAGE_PID']).write_text(str(os.getpid()))
+ time.sleep(10)
+if fault==phase:raise SystemExit(23)
+if fault=='missing-cli' and phase=='cli':raise SystemExit(127)
+if phase=='cli':print('{"fixture":true}')
+'''
+        for name in ('sha256sum', 'rpm', 'dnf', 'apt-get', 'python3'):
+            path = tools / name; path.write_text(stub); path.chmod(0o755)
+        env = {'PATH': str(tools) + os.pathsep + os.defpath,
+               'WK_STAGE_TRACE': str(root / 'trace'), 'WK_STAGE_PID': str(root / 'pid'),
+               'WK_STAGE_FAULT': fault, 'WK_STAGE_NOISE': str(noise), 'WK_STAGE_EXTRA': extra}
+        for index, token in enumerate(command):
+            if token == '--env':
+                name, value = command[index + 1].split('=', 1); env[name] = value
+        yield ['bash', '-euc', shell], env, root
+
+
+class InstalledShellPhaseTests(unittest.TestCase):
+    def test_generated_shell_emits_only_applicable_phases_in_original_command_order(self):
+        for family, events, trace in (
+                ('rpm', RPM_STAGE_EVENTS, ['checksum', 'rpm-import', 'signature', 'install', 'cli']),
+                ('apt', APT_STAGE_EVENTS, ['checksum', 'apt-update', 'install', 'cli'])):
+            with self.subTest(family=family), generated_installation_shell(family) as (command, env, root):
+                result = subprocess.run(command, env=env, capture_output=True, timeout=5)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(observed_stage_lines(result.stdout), events)
+                self.assertEqual((root / 'trace').read_text().splitlines(), trace)
+                self.assertEqual(json.loads((root / 'evidence/installed-cli.json').read_text()), {'fixture': True})
+
+    def test_generated_shell_failures_keep_nonzero_and_never_emit_later_phases(self):
+        cases = [('rpm', 'checksum', 1), ('rpm', 'rpm-import', 3), ('rpm', 'signature', 3),
+                 ('rpm', 'install', 5), ('rpm', 'cli', 7), ('rpm', 'missing-cli', 7),
+                 ('apt', 'checksum', 1), ('apt', 'apt-update', 3), ('apt', 'install', 3),
+                 ('apt', 'cli', 5), ('apt', 'missing-cli', 5)]
+        for family, fault, count in cases:
+            with self.subTest(family=family, fault=fault), generated_installation_shell(family, fault=fault) as (command, env, root):
+                result = subprocess.run(command, env=env, capture_output=True, timeout=5)
+                self.assertEqual(result.returncode, 127 if fault == 'missing-cli' else 23)
+                events = RPM_STAGE_EVENTS if family == 'rpm' else APT_STAGE_EVENTS
+                self.assertEqual(observed_stage_lines(result.stdout), events[:count])
+                if fault not in ('cli', 'missing-cli'):
+                    self.assertNotIn('cli', (root / 'trace').read_text().splitlines())
+                    self.assertFalse((root / 'evidence/installed-cli.json').exists())
+
+    def test_complete_phase_markers_do_not_accept_an_invalid_cli_receipt(self):
+        with generated_installation_shell('rpm') as (command, env, root):
+            result = subprocess.run(command, env=env, capture_output=True, timeout=5)
+            self.assertEqual(result.returncode, 0)
+            self.assertEqual(observed_stage_lines(result.stdout), RPM_STAGE_EVENTS)
+            with self.assertRaisesRegex(validator.ClientValidationError, 'receipt is incomplete'):
+                validator._installed_cli_receipt(root / 'evidence/installed-cli.json', IDENTITY)
 
 
 class InstalledCLIContractTest(unittest.TestCase):

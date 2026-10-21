@@ -1393,22 +1393,34 @@ def _installed_cli_command(image, package, output, certificate, family, identity
     ))
     if family == "apt":
         install = """
+printf '\\n%s\\n' 'WK_INSTALLED_STAGE_V1:checksum:begin'
 printf '%s  %s\n' "$WK_PACKAGE_SHA256" /candidate.deb | sha256sum --check --strict
+printf '\\n%s\\n' 'WK_INSTALLED_STAGE_V1:checksum:complete'
+printf '\\n%s\\n' 'WK_INSTALLED_STAGE_V1:dependencies:begin'
 printf '#!/bin/sh\nexit 101\n' >/usr/sbin/policy-rc.d
 chmod 0755 /usr/sbin/policy-rc.d
 apt-get -o Acquire::Retries=3 update
 DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 install -y python3 /candidate.deb
+printf '\\n%s\\n' 'WK_INSTALLED_STAGE_V1:dependencies:complete'
 """
     else:
         install = """
+printf '\\n%s\\n' 'WK_INSTALLED_STAGE_V1:checksum:begin'
 printf '%s  %s\n' "$WK_PACKAGE_SHA256" /candidate.rpm | sha256sum --check --strict
+printf '\\n%s\\n' 'WK_INSTALLED_STAGE_V1:checksum:complete'
+printf '\\n%s\\n' 'WK_INSTALLED_STAGE_V1:signature:begin'
 rpm --import /reviewed-key.asc
 rpm --checksig /candidate.rpm
+printf '\\n%s\\n' 'WK_INSTALLED_STAGE_V1:signature:complete'
+printf '\\n%s\\n' 'WK_INSTALLED_STAGE_V1:dependencies:begin'
 dnf --setopt=localpkg_gpgcheck=1 --setopt=timeout=60 install -y python3 /candidate.rpm
+printf '\\n%s\\n' 'WK_INSTALLED_STAGE_V1:dependencies:complete'
 """
     command.extend((image, "timeout", "--kill-after=10s", "600s", "bash", "-euc", install + """
+printf '\\n%s\\n' 'WK_INSTALLED_STAGE_V1:cli:begin'
 python3 /acceptance.py --fixtures /fixtures --version "$WK_EXPECTED_VERSION" \
   --commit "$WK_EXPECTED_COMMIT" >/evidence/installed-cli.json
+printf '\\n%s\\n' 'WK_INSTALLED_STAGE_V1:cli:complete'
 """))
     return command
 

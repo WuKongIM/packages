@@ -18,6 +18,7 @@ import tempfile
 import threading
 import unittest
 from unittest import mock
+from test_installed_cli_acceptance import generated_installation_shell, RPM_STAGE_EVENTS, STAGE_PREFIX
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / 'tests/native_stable_clients_drill.py'
@@ -31,6 +32,83 @@ def load():
 
 
 class NativeStableClientsTests(unittest.TestCase):
+    def phase_receipt(self, events, *, truncated=False):
+        return {'schema': 'wukongim/native-installed-phase-events/v1',
+                'events': [dict(zip(('phase', 'event'), item.split(':'))) for item in events],
+                'truncated': truncated}
+
+    def test_installed_phases_survive_noisy_generated_shell_without_changing_capture(self):
+        drill = load(); evidence = {'commands': []}
+        with generated_installation_shell('rpm', noise=6000) as (command, env, _):
+            result = drill.run_command(evidence, 'installed-client', command, env=env, timeout=5)
+        record = evidence['commands'][0]
+        self.assertEqual(result.returncode, 0)
+        self.assertGreater(len(result.stdout), 4096)
+        self.assertNotIn(STAGE_PREFIX + 'checksum:begin', record['output_tail'])
+        self.assertEqual(record['output_size'], len(result.stdout))
+        self.assertEqual(record['output_sha256'], hashlib.sha256(result.stdout).hexdigest())
+        self.assertEqual(record['output_tail'], result.stdout[-4096:].decode())
+        self.assertEqual(record.get('installed_phase_events'), self.phase_receipt(RPM_STAGE_EVENTS))
+
+    def test_installed_nonzero_retains_partial_phases_and_cannot_become_success(self):
+        drill = load(); evidence = {'commands': []}
+        with generated_installation_shell('rpm', fault='install', noise=6000) as (command, env, _):
+            result = drill.run_command(evidence, 'installed-client', command, env=env, timeout=5)
+        self.assertEqual(result.returncode, 23)
+        self.assertEqual(evidence['commands'][0]['exit_code'], 23)
+        self.assertEqual(evidence['commands'][0].get('installed_phase_events'), self.phase_receipt(RPM_STAGE_EVENTS[:5]))
+
+    def test_installed_generated_shell_deadline_preserves_only_observed_phases(self):
+        drill = load(); evidence = {'commands': []}
+        with generated_installation_shell('rpm', fault='block-install') as (command, env, root):
+            with self.assertRaisesRegex(RuntimeError, 'deadline'):
+                drill.run_command(evidence, 'installed-client', command, env=env, timeout=1)
+            self.assertTrue((root / 'pid').is_file(), 'controlled dependency stage never started')
+            self.assertEqual((root / 'trace').read_text().splitlines(), ['checksum', 'rpm-import', 'signature', 'install'])
+        record = evidence['commands'][0]
+        self.assertTrue(record['timed_out'])
+        self.assertNotEqual(record['exit_code'], 0)
+        self.assertEqual(record.get('installed_phase_events'), self.phase_receipt(RPM_STAGE_EVENTS[:5]))
+
+    def test_installed_event_whitelist_preserves_duplicates_with_fixed_cap(self):
+        drill = load(); evidence = {'commands': []}
+        invalid = (STAGE_PREFIX + 'secret:complete\n' + STAGE_PREFIX + 'checksum:begin FAKE-CREDENTIAL\n'
+                   + STAGE_PREFIX + 'checksum:complete\r\n')
+        duplicates = (STAGE_PREFIX + 'checksum:begin\n') * 20
+        with generated_installation_shell('rpm', fault='install', extra=invalid + duplicates) as (command, env, _):
+            result = drill.run_command(evidence, 'installed-client', command, env=env, timeout=5)
+        self.assertEqual(result.returncode, 23)
+        parsed = evidence['commands'][0].get('installed_phase_events')
+        self.assertEqual(parsed, self.phase_receipt(RPM_STAGE_EVENTS[:5] + ['checksum:begin'] * 11, truncated=True))
+        self.assertNotIn('FAKE-CREDENTIAL', json.dumps(parsed))
+
+    def test_unknown_and_incomplete_markers_are_diagnostic_only(self):
+        drill = load()
+        for fault, extra, expected in (
+                ('', STAGE_PREFIX + 'unknown:complete\n', RPM_STAGE_EVENTS),
+                ('install', STAGE_PREFIX + 'cli:complete', RPM_STAGE_EVENTS[:5])):
+            with self.subTest(fault=fault), generated_installation_shell('rpm', fault=fault, extra=extra) as (command, env, _):
+                evidence = {'commands': []}
+                result = drill.run_command(evidence, 'installed-client', command, env=env, timeout=5)
+                self.assertEqual(result.returncode, 23 if fault else 0)
+                self.assertEqual(evidence['commands'][0].get('installed_phase_events'), self.phase_receipt(expected))
+        evidence = {'commands': []}
+        result = drill.run_command(evidence, 'installed-client', [sys.executable, '-c', 'print("ordinary output")'])
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(evidence['commands'][0].get('installed_phase_events'), self.phase_receipt([]))
+        drill.run_command(evidence, 'other-command', [sys.executable, '-c', 'print("ordinary output")'])
+        self.assertNotIn('installed_phase_events', evidence['commands'][1])
+
+    def test_installed_output_limit_remains_authoritative(self):
+        drill = load(); evidence = {'commands': []}
+        with generated_installation_shell('rpm', noise=10000) as (command, env, _):
+            with self.assertRaisesRegex(RuntimeError, 'output limit'):
+                drill.run_command(evidence, 'installed-client', command, env=env, timeout=5, maximum=4096)
+        record = evidence['commands'][0]
+        self.assertTrue(record['output_limit'])
+        self.assertLessEqual(record['output_size'], 4096)
+        self.assertIn('installed_phase_events', record)
+
     def test_https_normal_response_has_authenticated_tls_eof(self):
         """Exercise the actual fixture server with strict OpenSSL EOF handling."""
         drill = load()
