@@ -1381,5 +1381,73 @@ class ValidateProductionPackageClientsTest(unittest.TestCase):
         )
 
 
+class StableClientAdmissionTest(unittest.TestCase):
+    """The public CLI separates stable input from all legacy preview modes."""
+
+    def test_stable_missing_transport_is_an_admission_failure(self):
+        result = subprocess.run([
+            __import__("sys").executable, str(SCRIPT), "--channel", "stable",
+            "--base-url", "https://packages.githubim.com", "--expected-version", "3.0.0",
+            "--apt-public-cert", "/missing/apt", "--rpm-public-cert", "/missing/rpm",
+        ], capture_output=True, text=True)
+        self.assertEqual(1, result.returncode)
+        self.assertEqual("", result.stdout)
+        self.assertIn("stable requires transport inputs", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_stable_rejects_wrong_scope_before_native_or_network(self):
+        bad = [
+            ([], "stable requires installed CLI acceptance"),
+            (["--expected-version", "3.0.0-rc.1"], "stable target must be strict release SemVer"),
+            (["--base-url", "https://unreviewed.example"], "stable clients require the canonical HTTPS origin"),
+            (["--snapshot", "old.json"], "stable derives its snapshot from transport inputs"),
+            (["--test-product-sha", "1" * 40], "TEST ONLY product identity requires explicit test mode"),
+            (["--test-only"], "TEST ONLY clients require the fixed fixture product SHA"),
+        ]
+        for override, reason in bad:
+            with self.subTest(reason=reason):
+                result = subprocess.run([
+                    __import__("sys").executable, str(SCRIPT), "--channel", "stable",
+                    "--transport-inputs", "/missing/transport.json",
+                    "--base-url", "https://packages.githubim.com", "--expected-version", "3.0.0",
+                    "--apt-public-cert", "/missing/apt", "--rpm-public-cert", "/missing/rpm",
+                    *override,
+                ], capture_output=True, text=True)
+                self.assertEqual(1, result.returncode)
+                self.assertIn(reason, result.stderr)
+                self.assertEqual("", result.stdout)
+                self.assertNotIn("Traceback", result.stderr)
+
+    def test_stable_download_command_preserves_checks_and_has_fixed_deadline(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            certificate = root / 'public.asc'; certificate.write_text('public')
+            bootstrap = root / 'bootstrap.pkg'; bootstrap.write_text('bootstrap')
+            for family in ('apt', 'rpm'):
+                command = validator.stable_client_command('image@sha256:' + '1' * 64,
+                    root, certificate, family, bootstrap)
+                self.assertEqual(command[-7:-1], ['timeout', '--signal=TERM', '--kill-after=10s', '300s', 'bash', '-c'])
+                self.assertNotIn('preview', command[-1])
+                if family == 'rpm':
+                    self.assertIn('mirrorlist=https://packages.githubim.com/rpm/stable/el/9/x86_64/mirrorlist', command[-1])
+                    self.assertNotIn('baseurl=', command[-1])
+                    for check in ('sslverify=1', 'gpgcheck=1', 'repo_gpgcheck=1'):
+                        self.assertIn(check, command[-1])
+
+    def test_preview_cannot_accept_test_identity_or_transport(self):
+        for extra in (["--test-only"], ["--transport-inputs", "ignored.json"],
+                      ["--test-product-sha", "1" * 40]):
+            with self.subTest(extra=extra):
+                result = subprocess.run([
+                    __import__("sys").executable, str(SCRIPT),
+                    "--base-url", "https://packages.githubim.com",
+                    "--apt-public-cert", "/missing/apt", "--rpm-public-cert", "/missing/rpm",
+                    *extra,
+                ], capture_output=True, text=True)
+                self.assertEqual(1, result.returncode)
+                self.assertIn("stable-only options require explicit stable mode", result.stderr)
+                self.assertEqual("", result.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -729,3 +729,30 @@ TEST ONLY loopback evidence remains separate. The explicit offline composite
 planner retains both channels and all supplied generations without uploading or
 activating. Stable remains disabled and no production workflow is connected.
 See [the operator contract](stable-audit-transport.md) for identities, inputs and verification limits.
+
+### Explicit stable package-client acceptance
+
+Use `scripts/validate-production-package-clients.py --channel stable
+--transport-inputs <reviewed-composite-inputs.json> --base-url
+https://packages.githubim.com --expected-version <X.Y.Z> --apt-public-cert
+<apt-stable.asc> --rpm-public-cert <rpm-stable.asc> --verify-installed-cli`.
+Stable requires installed CLI acceptance; it cannot report a release-qualified
+success from a download-only run. The same-process host verifier requires
+GnuPG/gpgv, rpm/rpmkeys, dpkg-deb and zstd. Preview remains the default and keeps
+its existing interface and receipt schema.
+
+Stable returns `wukongim/stable-package-client-validation/v1` and derives its
+identity from the explicitly reviewed current stable transport descriptor,
+canonical candidate archive, signatures, public keys and immutable bootstrap.
+It rechecks stable InRelease and mirrorlist at both ends. Root `/repo`,
+`/status.json` and `/bootstrap/manifest.json` remain preview and are not stable
+identity evidence. Local resolution evidence is not a fresh GitHub query.
+
+The native repository safety workflow adds an independent contents-read-only
+stable-client job. It uses fixed real product source, disposable TEST ONLY
+signing material and four pinned Linux images; production signer/publication
+jobs and their permissions do not change. The explicit test opt-in and fixed
+test source identity are unavailable to production mode. See
+[stable audit transport](stable-audit-transport.md) for the isolated A/B and
+installed-client network boundaries. A passing TEST ONLY run is preparation
+for, and does not replace, exact-version public APT/RPM release verification.

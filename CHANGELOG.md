@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Add explicit stable four-client acceptance with required installed CLI checks
+  and isolated TEST ONLY A/B repository switching; stable publication remains disabled.
+
 - Add explicit stable audit sealing with fresh source/control verification and offline composite transport planning; keep stable disabled and production publication unconnected.
 
 - Build and independently verify first-generation stable offline repository
