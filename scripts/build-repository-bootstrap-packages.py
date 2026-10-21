@@ -11,6 +11,7 @@ import errno
 import gzip
 import hashlib
 import io
+import importlib.util
 import json
 import os
 import re
@@ -21,7 +22,7 @@ import sys
 import tarfile
 import tempfile
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 
 MANIFEST_SCHEMA = "wukongim.native_package_bootstrap/v1"
@@ -98,6 +99,43 @@ touch -h -d "@${SOURCE_DATE_EPOCH}" \
 /etc/pki/rpm-gpg/RPM-GPG-KEY-wukongim-preview
 %config(noreplace) /etc/yum.repos.d/wukongim-preview.repo
 """
+
+
+class BootstrapLayout(NamedTuple):
+    """Closed package identities and owned paths for one repository channel."""
+    channel: str
+    apt_name: str
+    rpm_name: str
+    apt_keyring_path: str
+    apt_source_path: str
+    rpm_key_path: str
+    rpm_repo_path: str
+    apt_source: bytes
+    rpm_repository: bytes
+    rpm_spec: str
+
+
+PREVIEW_LAYOUT = BootstrapLayout(
+    "preview", APT_NAME, RPM_NAME, APT_KEYRING_PATH, APT_SOURCE_PATH,
+    RPM_KEY_PATH, RPM_REPO_PATH, APT_SOURCE, RPM_REPOSITORY, RPM_SPEC_TEMPLATE,
+)
+STABLE_LAYOUT = BootstrapLayout(
+    "stable", "wukongim-archive-keyring-stable", "wukongim-release-stable",
+    "usr/share/keyrings/wukongim-archive-keyring-stable.pgp",
+    "etc/apt/sources.list.d/wukongim-stable.sources",
+    "etc/pki/rpm-gpg/RPM-GPG-KEY-wukongim-stable",
+    "etc/yum.repos.d/wukongim-stable.repo",
+    APT_SOURCE.replace(b"preview", b"stable").replace(
+        b"wukongim-archive-keyring.pgp", b"wukongim-archive-keyring-stable.pgp"),
+    RPM_REPOSITORY.replace(b"preview", b"stable").replace(
+        b"baseurl=https://packages.githubim.com/rpm/stable/el/9/x86_64",
+        b"mirrorlist=https://packages.githubim.com/rpm/stable/el/9/x86_64/mirrorlist",
+    ).replace(b"includepkgs=wukongim,wukongim-release\n",
+              b"includepkgs=wukongim,wukongim-release-stable\n"),
+    RPM_SPEC_TEMPLATE.replace("preview", "stable").replace(
+        "wukongim-release", "wukongim-release-stable"),
+)
+STABLE_PREPARATION_SCHEMA = "wukongim.stable_bootstrap_preparation/v1"
 
 
 class BootstrapBuildError(RuntimeError):
@@ -261,9 +299,9 @@ def _ar_member(name: str, data: bytes) -> bytes:
     return header + data + (b"\n" if len(data) % 2 else b"")
 
 
-def _deb_control(version: str, installed_size: int) -> bytes:
+def _deb_control(version: str, installed_size: int, layout: BootstrapLayout = PREVIEW_LAYOUT) -> bytes:
     return (
-        "Package: wukongim-archive-keyring\n"
+        f"Package: {layout.apt_name}\n"
         f"Version: {version}\n"
         "Section: misc\n"
         "Priority: optional\n"
@@ -271,25 +309,25 @@ def _deb_control(version: str, installed_size: int) -> bytes:
         "Maintainer: WuKongIM Team <support@wukongim.com>\n"
         f"Installed-Size: {installed_size}\n"
         "Homepage: https://github.com/WuKongIM/WuKongIM\n"
-        "Description: WuKongIM preview repository signing keyring\n"
+        f"Description: WuKongIM {layout.channel} repository signing keyring\n"
         " Installs the dedicated OpenPGP keyring used to authenticate the\n"
-        " WuKongIM preview APT repository.\n"
+        f" WuKongIM {layout.channel} APT repository.\n"
     ).encode("utf-8")
 
 
-def _deb_installed_size(keyring: bytes) -> int:
+def _deb_installed_size(keyring: bytes, layout: BootstrapLayout = PREVIEW_LAYOUT) -> int:
     keyring_size = max(1, (len(keyring) + 1023) // 1024)
-    source_size = max(1, (len(APT_SOURCE) + 1023) // 1024)
+    source_size = max(1, (len(layout.apt_source) + 1023) // 1024)
     return keyring_size + source_size
 
 
-def build_deb(path: Path, version: str, keyring: bytes) -> None:
-    installed_size = _deb_installed_size(keyring)
-    control = _deb_control(version, installed_size)
-    conffiles = f"/{APT_SOURCE_PATH}\n".encode("utf-8")
+def build_deb(path: Path, version: str, keyring: bytes, layout: BootstrapLayout = PREVIEW_LAYOUT) -> None:
+    installed_size = _deb_installed_size(keyring, layout)
+    control = _deb_control(version, installed_size, layout)
+    conffiles = f"/{layout.apt_source_path}\n".encode("utf-8")
     control_tar = _tar_gzip([("./control", control), ("./conffiles", conffiles)], [])
     data_tar = _tar_gzip(
-        [(f"./{APT_SOURCE_PATH}", APT_SOURCE), (f"./{APT_KEYRING_PATH}", keyring)],
+        [(f"./{layout.apt_source_path}", layout.apt_source), (f"./{layout.apt_keyring_path}", keyring)],
         [
             "./etc",
             "./etc/apt",
@@ -359,7 +397,7 @@ def _inspect_tar_gzip(data: bytes, label: str) -> dict[str, tuple[tarfile.TarInf
     return result
 
 
-def inspect_deb(path: Path, version: str, keyring: bytes) -> None:
+def inspect_deb(path: Path, version: str, keyring: bytes, layout: BootstrapLayout = PREVIEW_LAYOUT) -> None:
     members = _parse_ar(checked_regular_file(path, "built DEB"))
     require(list(members) == ["debian-binary", "control.tar.gz", "data.tar.gz"],
             "DEB member inventory is invalid")
@@ -367,10 +405,10 @@ def inspect_deb(path: Path, version: str, keyring: bytes) -> None:
     control_members = _inspect_tar_gzip(members["control.tar.gz"], "DEB control archive")
     require(set(control_members) == {"./control", "./conffiles"},
             "DEB control archive contains scripts or unexpected files")
-    installed_size = _deb_installed_size(keyring)
-    require(control_members["./control"][1] == _deb_control(version, installed_size),
+    installed_size = _deb_installed_size(keyring, layout)
+    require(control_members["./control"][1] == _deb_control(version, installed_size, layout),
             "DEB control metadata is invalid")
-    require(control_members["./conffiles"][1] == f"/{APT_SOURCE_PATH}\n".encode("utf-8"),
+    require(control_members["./conffiles"][1] == f"/{layout.apt_source_path}\n".encode("utf-8"),
             "DEB conffile inventory is invalid")
     data_members = _inspect_tar_gzip(members["data.tar.gz"], "DEB data archive")
     expected = {
@@ -380,13 +418,13 @@ def inspect_deb(path: Path, version: str, keyring: bytes) -> None:
         "./etc",
         "./etc/apt",
         "./etc/apt/sources.list.d",
-        f"./{APT_SOURCE_PATH}",
-        f"./{APT_KEYRING_PATH}",
+        f"./{layout.apt_source_path}",
+        f"./{layout.apt_keyring_path}",
     }
     require(set(data_members) == expected, "DEB payload inventory is invalid")
-    require(data_members[f"./{APT_KEYRING_PATH}"][1] == keyring,
+    require(data_members[f"./{layout.apt_keyring_path}"][1] == keyring,
             "DEB keyring payload differs from the reviewed certificate")
-    require(data_members[f"./{APT_SOURCE_PATH}"][1] == APT_SOURCE,
+    require(data_members[f"./{layout.apt_source_path}"][1] == layout.apt_source,
             "DEB source configuration payload is invalid")
 
 
@@ -428,16 +466,17 @@ def _write_build_source(path: Path, data: bytes) -> None:
     os.utime(path, (SOURCE_DATE_EPOCH, SOURCE_DATE_EPOCH))
 
 
-def build_rpm(path: Path, version: str, certificate: bytes, build_root: Path) -> tuple[str, dict[str, str]]:
+def build_rpm(path: Path, version: str, certificate: bytes, build_root: Path,
+              layout: BootstrapLayout = PREVIEW_LAYOUT) -> tuple[str, dict[str, str]]:
     top = build_root / "rpm"
     for directory in (
         "BUILD", "BUILDROOT", "HOME", "RPMDB", "RPMS", "SOURCES", "SPECS", "SRPMS", "TMP"
     ):
         (top / directory).mkdir(parents=True, exist_ok=False)
-    _write_build_source(top / "SOURCES/RPM-GPG-KEY-wukongim-preview", certificate)
-    _write_build_source(top / "SOURCES/wukongim-preview.repo", RPM_REPOSITORY)
-    spec_path = top / "SPECS/wukongim-release.spec"
-    _write_build_source(spec_path, RPM_SPEC_TEMPLATE.replace("@VERSION@", version).encode("utf-8"))
+    _write_build_source(top / "SOURCES" / Path(layout.rpm_key_path).name, certificate)
+    _write_build_source(top / "SOURCES" / Path(layout.rpm_repo_path).name, layout.rpm_repository)
+    spec_path = top / "SPECS" / f"{layout.rpm_name}.spec"
+    _write_build_source(spec_path, layout.rpm_spec.replace("@VERSION@", version).encode("utf-8"))
 
     rpmbuild = _tool("rpmbuild")
     rpm = _tool("rpm")
@@ -470,8 +509,8 @@ def build_rpm(path: Path, version: str, certificate: bytes, build_root: Path) ->
     path.chmod(0o644)
     os.utime(path, (SOURCE_DATE_EPOCH, SOURCE_DATE_EPOCH))
     expected_digests = {
-        f"/{RPM_KEY_PATH}": hashlib.sha256(certificate).hexdigest(),
-        f"/{RPM_REPO_PATH}": hashlib.sha256(RPM_REPOSITORY).hexdigest(),
+        f"/{layout.rpm_key_path}": hashlib.sha256(certificate).hexdigest(),
+        f"/{layout.rpm_repo_path}": hashlib.sha256(layout.rpm_repository).hexdigest(),
     }
     return rpm, expected_digests
 
@@ -482,6 +521,7 @@ def inspect_rpm(
     rpm: str,
     expected_digests: dict[str, str],
     state_root: Path,
+    layout: BootstrapLayout = PREVIEW_LAYOUT,
 ) -> None:
     environment = _rpm_environment(state_root)
     rpm_command = [rpm, "--dbpath", str(state_root / "RPMDB")]
@@ -499,7 +539,7 @@ def inspect_rpm(
         ).stdout.decode("utf-8", "strict")
     except UnicodeDecodeError as error:
         raise BootstrapBuildError("RPM identity is not UTF-8") from error
-    require(identity == f"{RPM_NAME}\t0\t{version}\t1\tnoarch\n", "RPM identity is invalid")
+    require(identity == f"{layout.rpm_name}\t0\t{version}\t1\tnoarch\n", "RPM identity is invalid")
     files = _run(
         [*rpm_command, "-qpl", str(path)],
         "RPM file-list query",
@@ -544,7 +584,7 @@ def inspect_rpm(
     for filename, expected_digest in expected_digests.items():
         require(filename in parsed, "RPM file metadata omits an expected payload")
         digest, flags, mode = parsed[filename]
-        expected_flags = "17" if filename == f"/{RPM_REPO_PATH}" else "0"
+        expected_flags = "17" if filename == f"/{layout.rpm_repo_path}" else "0"
         require(digest == expected_digest and flags == expected_flags and mode == "-rw-r--r--",
                 f"RPM file metadata is invalid for {filename}")
     _run(
@@ -613,9 +653,50 @@ def rename_directory_exclusive(source: Path, destination: Path) -> None:
 
 
 def build(args: argparse.Namespace) -> dict[str, object]:
-    manifest = load_manifest(args.manifest)
-    apt_certificate = checked_regular_file(args.apt_public_cert, "APT public certificate")
-    rpm_certificate = checked_regular_file(args.rpm_public_cert, "RPM public certificate")
+    channel = getattr(args, "channel", "preview")
+    require(channel in {"preview", "stable"}, "unsupported bootstrap channel")
+    if channel == "stable":
+        require(args.manifest is None and args.apt_public_cert is None
+                and args.rpm_public_cert is None,
+                "stable derives manifest and certificates from --control-root")
+        require(args.control_root is not None, "stable preparation requires --control-root")
+        root = args.control_root
+        manifest = load_manifest(root / "manifests/bootstrap-packages.json")
+        # Executable validation always comes from this builder's trusted checkout;
+        # control-root supplies data only, never Python code or private keys.
+        spec = importlib.util.spec_from_file_location(
+            "bootstrap_control_validator", Path(__file__).with_name("validate-control.py"))
+        assert spec is not None and spec.loader is not None
+        control = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(control)
+        try:
+            certificates = control.load_stable_public_certificates(root)
+            require(len(certificates) == 2, "stable preparation requires complete public roles")
+            certificate_paths = {family: path for family, path, _, _ in certificates}
+            reviewed_certificates = {
+                family: checked_regular_file(path, f"stable {family} public certificate")
+                for family, path in certificate_paths.items()
+            }
+            control.validate_channels(root, manifest["enabled"])
+            control.validate_signing(root)
+        except (control.ContractError, OSError) as error:
+            raise BootstrapBuildError(f"stable public control is invalid: {error}") from error
+        apt_path, rpm_path = certificate_paths["apt"], certificate_paths["rpm"]
+        layout = STABLE_LAYOUT
+    else:
+        require(getattr(args, "control_root", None) is None,
+                "preview uses explicit manifest and certificate paths, not --control-root")
+        require(args.manifest is not None and args.apt_public_cert is not None
+                and args.rpm_public_cert is not None,
+                "preview requires --manifest, --apt-public-cert and --rpm-public-cert")
+        manifest = load_manifest(args.manifest)
+        apt_path, rpm_path = args.apt_public_cert, args.rpm_public_cert
+        layout = PREVIEW_LAYOUT
+    apt_certificate = checked_regular_file(apt_path, "APT public certificate")
+    rpm_certificate = checked_regular_file(rpm_path, "RPM public certificate")
+    if channel == "stable":
+        require({"apt": apt_certificate, "rpm": rpm_certificate} == reviewed_certificates,
+                "stable certificate changed during public validation")
     apt_keyring = dearmor_public_certificate(apt_certificate, "APT public certificate")
     rpm_keyring = dearmor_public_certificate(rpm_certificate, "RPM public certificate")
     require(apt_keyring != rpm_keyring,
@@ -631,18 +712,18 @@ def build(args: argparse.Namespace) -> dict[str, object]:
     require(stat.S_ISDIR(parent_metadata.st_mode), "output parent must be a real directory")
 
     version = manifest["version"]
-    apt_filename = f"{APT_NAME}_{version}_all.deb"
-    rpm_filename = f"{RPM_NAME}-{version}-1.noarch.rpm"
+    apt_filename = f"{layout.apt_name}_{version}_all.deb"
+    rpm_filename = f"{layout.rpm_name}-{version}-1.noarch.rpm"
     stage = Path(tempfile.mkdtemp(prefix=f".{output.name}.build-", dir=parent))
     rpm_build_root: Path | None = None
     try:
         apt_path = stage / apt_filename
         rpm_path = stage / rpm_filename
-        build_deb(apt_path, version, apt_keyring)
-        inspect_deb(apt_path, version, apt_keyring)
+        build_deb(apt_path, version, apt_keyring, layout)
+        inspect_deb(apt_path, version, apt_keyring, layout)
         rpm_build_root = Path(tempfile.mkdtemp(prefix=f".{output.name}.rpm-", dir=parent))
         rpm_tool, expected_rpm_digests = build_rpm(
-            rpm_path, version, rpm_certificate, rpm_build_root
+            rpm_path, version, rpm_certificate, rpm_build_root, layout
         )
         inspect_rpm(
             rpm_path,
@@ -650,6 +731,7 @@ def build(args: argparse.Namespace) -> dict[str, object]:
             rpm_tool,
             expected_rpm_digests,
             rpm_build_root / "rpm",
+            layout,
         )
         shutil.rmtree(rpm_build_root)
         rpm_build_root = None
@@ -662,7 +744,7 @@ def build(args: argparse.Namespace) -> dict[str, object]:
             "version": version,
             "packages": {
                 "apt": _inventory_entry(
-                    name=APT_NAME,
+                    name=layout.apt_name,
                     version=version,
                     architecture="all",
                     filename=apt_filename,
@@ -671,16 +753,18 @@ def build(args: argparse.Namespace) -> dict[str, object]:
                     size=apt_size,
                 ),
                 "rpm": _inventory_entry(
-                    name=RPM_NAME,
+                    name=layout.rpm_name,
                     version=version,
                     architecture="noarch",
                     filename=rpm_filename,
-                    repository_path=f"rpm/preview/el/9/x86_64/Packages/{rpm_filename}",
+                    repository_path=f"rpm/{layout.channel}/el/9/x86_64/Packages/{rpm_filename}",
                     digest=rpm_digest,
                     size=rpm_size,
                 ),
             },
         }
+        if channel == "stable":
+            inventory.update(schema=STABLE_PREPARATION_SCHEMA, channel="stable", published=False)
         rename_directory_exclusive(stage, output)
         return inventory
     except BaseException:
@@ -693,9 +777,12 @@ def build(args: argparse.Namespace) -> dict[str, object]:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--manifest", required=True, type=Path)
-    parser.add_argument("--apt-public-cert", required=True, type=Path)
-    parser.add_argument("--rpm-public-cert", required=True, type=Path)
+    parser.add_argument("--channel", choices=("preview", "stable"), default="preview")
+    parser.add_argument("--control-root", type=Path,
+                        help="reviewed public control checkout; required only for stable preparation")
+    parser.add_argument("--manifest", type=Path)
+    parser.add_argument("--apt-public-cert", type=Path)
+    parser.add_argument("--rpm-public-cert", type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)
     return parser
 

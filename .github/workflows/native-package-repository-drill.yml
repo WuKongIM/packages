@@ -125,6 +125,43 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
 
+      - name: Build and coinstall TEST ONLY preview and stable bootstrap preparations
+        shell: bash
+        run: |
+          set -euo pipefail
+          jq -e '.enabled == true' manifests/signing-toolchain.json >/dev/null
+          image="$(jq -r '.image + "@" + .digest' manifests/signing-toolchain.json)"
+          bootstrap_output="$RUNNER_TEMP/bootstrap-preparation-native"
+          mkdir "$bootstrap_output"
+          chmod 0777 "$bootstrap_output"
+          container="wk-bootstrap-preparation-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          trap 'docker rm --force "$container" >/dev/null 2>&1 || true' EXIT
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
+          # Root and SYS_CHROOT are limited to scratch native package databases.
+          # This data-only installation drill has no signing input or network.
+          timeout --signal=TERM --kill-after=10s 5m docker run --rm --name "$container" \
+            --platform linux/amd64 --network none --read-only --cap-drop ALL \
+            --cap-add SYS_CHROOT --security-opt no-new-privileges --user 0:0 \
+            --cpus 1 --memory 512m --pids-limit 128 \
+            --tmpfs /tmp:rw,nosuid,nodev,size=268435456 \
+            --volume "$GITHUB_WORKSPACE:/control:ro" \
+            --volume "$bootstrap_output:/evidence" \
+            --workdir /tmp "$image" \
+            python3 -B /control/tests/native_bootstrap_preparation_drill.py \
+            --output-dir /evidence --source-sha "$GITHUB_SHA"
+          jq -e '.test_only == true and .passed == true and .scratch_removed == true and (.cases | length) == 6 and all(.cases[]; .passed == true)' \
+            "$bootstrap_output/native-bootstrap-preparation.json" >/dev/null
+
+      - name: Preserve TEST ONLY native bootstrap preparation evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-bootstrap-preparation-test-only
+          path: ${{ runner.temp }}/bootstrap-preparation-native/native-bootstrap-preparation.json
+          if-no-files-found: warn
+          retention-days: 30
+
       - name: Set up fixed GoReleaser toolchain
         uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
