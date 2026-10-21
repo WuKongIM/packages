@@ -460,6 +460,9 @@ def pipeline(scratch: Path, trusted: Path, evidence: dict, env: dict) -> None:
            '--output', scratch / 'forbidden-transport.json'), env, reject=True)
     require({case['case'] for case in evidence['cases']} == set(CASES) and len(evidence['cases']) == len(CASES),
             'native case inventory differs from its predeclared set')
+    transport = load_fixture('stable_seal_transport_native', 'native_stable_seal_transport_drill.py')
+    transport.exercise(scratch=scratch,control=control,source=source,plan=plan,archive=archive,
+        receipt=receipt,receipts=receipts,evidence=evidence,env=env)
     evidence['public_artifacts'] = {name: facts(path) for name, path in
                                     [('plan', plan), ('snapshot', snapshot), ('archive', archive), ('receipt', receipt)]}
 

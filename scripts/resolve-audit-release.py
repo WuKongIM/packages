@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import ipaddress
 import json
 import os
@@ -23,6 +24,12 @@ import urllib.request
 from pathlib import Path
 from typing import Any, BinaryIO
 
+
+STABLE_SPEC = importlib.util.spec_from_file_location(
+    "stable_seal_inputs", Path(__file__).resolve().with_name("verify-stable-seal-inputs.py"))
+assert STABLE_SPEC is not None and STABLE_SPEC.loader is not None
+stable = importlib.util.module_from_spec(STABLE_SPEC)
+STABLE_SPEC.loader.exec_module(stable)
 
 AUDIT_REPOSITORY = "WuKongIM/packages"
 RECEIPT_SCHEMA = "wukongim/package-audit-release-resolution/v1"
@@ -45,7 +52,12 @@ class ResolutionError(RuntimeError):
     """An audit Release failed a fail-closed identity or state check."""
 
 
-def expected_asset_names(release_id: int) -> tuple[str, str]:
+def expected_asset_names(release_id: int, channel: str = "preview",
+                         candidate: dict[str, Any] | None = None) -> tuple[str, str]:
+    if channel == "stable":
+        if candidate is None:
+            raise ResolutionError("stable candidate identity is required")
+        return stable.AUDIT.candidate_archive_names(candidate['version'],candidate['snapshot_sha256'])
     return (
         f"wukongim-preview-r{release_id}-site.tar",
         f"wukongim-preview-r{release_id}-receipt.json",
@@ -107,13 +119,18 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 class GitHubReader:
-    def __init__(self, api_base_url: str, download_base_url: str, token: str | None) -> None:
+    def __init__(self, api_base_url: str, download_base_url: str, token: str | None,
+                 *, deny_redirects: bool = False) -> None:
         self.api_base_url = _validated_base_url(api_base_url, "API base URL")
         self.download_base_url = _validated_base_url(
             download_base_url, "download base URL"
         )
         self.token = token
-        self._no_redirect = urllib.request.build_opener(_NoRedirect())
+        self.deny_redirects = deny_redirects
+        handlers = [_NoRedirect()]
+        if deny_redirects:
+            handlers.append(urllib.request.ProxyHandler({}))
+        self._no_redirect = urllib.request.build_opener(*handlers)
         parsed_api = urllib.parse.urlsplit(self.api_base_url)
         if token and parsed_api.scheme != "https" and not _is_loopback_host(
             parsed_api.hostname or ""
@@ -185,6 +202,8 @@ class GitHubReader:
                 raise ResolutionError(
                     f"audit asset {asset_id} download failed: HTTP {error.code}"
                 ) from error
+            if self.deny_redirects:
+                raise ResolutionError("TEST ONLY asset redirects are forbidden") from error
             location = error.headers.get("Location")
             if not location:
                 raise ResolutionError(
@@ -215,21 +234,22 @@ class GitHubReader:
             ) from error
 
 
-def expected_release_identity(release_id: int) -> tuple[str, str]:
+def expected_release_identity(release_id: int, channel: str = "preview") -> tuple[str, str]:
     return (
-        f"native-package-preview-r{release_id}",
-        f"WuKongIM preview package snapshot r{release_id}",
+        f"native-package-{channel}-r{release_id}",
+        f"WuKongIM {channel} package snapshot r{release_id}",
     )
 
 
 def _release_snapshot(
-    release: dict[str, Any], release_id: int, expected_control_sha: str
+    release: dict[str, Any], release_id: int, expected_control_sha: str,
+    channel: str = "preview", candidate: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if release.get("id") != release_id:
         raise ResolutionError(
             "audit Release id does not match the requested numeric id"
         )
-    expected_tag, expected_name = expected_release_identity(release_id)
+    expected_tag, expected_name = expected_release_identity(release_id, channel)
     tag_name = _require_string(release.get("tag_name"), "audit Release tag_name")
     if tag_name != expected_tag:
         raise ResolutionError(
@@ -267,7 +287,7 @@ def _release_snapshot(
             published_at, "immutable audit Release published_at"
         )
 
-    archive_name, receipt_name = expected_asset_names(release_id)
+    archive_name, receipt_name = expected_asset_names(release_id, channel, candidate)
     expected_names = {archive_name, receipt_name}
     raw_assets = release.get("assets")
     if not isinstance(raw_assets, list):
@@ -314,6 +334,13 @@ def _release_snapshot(
         }
         asset_ids.add(asset_id)
 
+    if channel == "stable":
+        for family in ('archive','receipt'):
+            expected = candidate[family]
+            if expected['name'] in assets:
+                actual = assets[expected['name']]
+                if any(actual[key] != expected[key] for key in ('name','size','sha256')):
+                    raise ResolutionError("remote candidate asset differs from external anchor")
     names = set(assets)
     if draft:
         if not names:
@@ -336,7 +363,7 @@ def _release_snapshot(
     return {
         "id": release_id,
         "tag_name": tag_name,
-        "name": name,
+        "name": expected_name if channel == "stable" else name,
         "prerelease": prerelease,
         "target_commitish": target_commitish,
         "draft": draft,
@@ -451,6 +478,10 @@ def resolve_audit_release(
     download_base_url: str,
     token: str | None,
     expected_tag_state: str = "auto",
+    channel: str = "preview",
+    test_only: bool = False,
+    candidate_plan: Path | None = None,
+    candidate_receipt: Path | None = None,
 ) -> dict[str, Any]:
     """Classify, download, and revalidate one numeric package audit Release."""
 
@@ -462,14 +493,26 @@ def resolve_audit_release(
         raise ResolutionError("expected control SHA must be a lowercase 40-hex commit")
     if expected_tag_state not in {"auto", "absent", "exact"}:
         raise ResolutionError("expected tag state must be auto, absent, or exact")
+    try:
+        stable.network_mode(channel, test_only, api_base_url, download_base_url)
+    except stable.StableInputError as error:
+        raise ResolutionError(str(error)) from error
+    candidate = None
+    if channel == "stable":
+        try:
+            candidate = stable.candidate_identity(candidate_plan,candidate_receipt,test_only=test_only)
+        except stable.StableInputError as error:
+            raise ResolutionError(str(error)) from error
+    elif candidate_plan is not None or candidate_receipt is not None:
+        raise ResolutionError("candidate inputs require explicit stable mode")
     output_dir = Path(output_dir)
-    reader = GitHubReader(api_base_url, download_base_url, token)
+    reader = GitHubReader(api_base_url, download_base_url, token, deny_redirects=test_only)
     created_output = _prepare_output_directory(output_dir)
     created_assets: list[Path] = []
     release_path = f"repos/{AUDIT_REPOSITORY}/releases/{release_id}"
     try:
         initial = _release_snapshot(
-            reader.api_json(release_path), release_id, expected_control_sha
+            reader.api_json(release_path), release_id, expected_control_sha, channel, candidate
         )
         if expected_tag_state == "absent" and not initial["draft"]:
             raise ResolutionError("only an unpublished draft may require an absent audit tag")
@@ -488,7 +531,7 @@ def resolve_audit_release(
             )
             created_assets.append(destination)
         final = _release_snapshot(
-            reader.api_json(release_path), release_id, expected_control_sha
+            reader.api_json(release_path), release_id, expected_control_sha, channel, candidate
         )
         if final != initial:
             raise ResolutionError(
@@ -505,7 +548,7 @@ def resolve_audit_release(
                     "audit Release tag target changed during resolution"
                 )
         receipt_assets = [downloaded[name] for name in sorted(downloaded)]
-        return {
+        result = {
             "schema": RECEIPT_SCHEMA,
             "repository": AUDIT_REPOSITORY,
             "release_id": release_id,
@@ -524,6 +567,10 @@ def resolve_audit_release(
             "release_revalidated": True,
             "id_bound_downloads": True,
         }
+        if channel == "stable":
+            result.update(schema="wukongim/package-audit-release-resolution/v2",
+                          channel=channel,test_only=test_only,candidate=candidate)
+        return result
     except Exception:
         for path in created_assets:
             path.unlink(missing_ok=True)
@@ -536,6 +583,10 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Classify and resolve one numeric WuKongIM/packages audit Release."
     )
+    parser.add_argument("--channel", choices=("preview","stable"), default="preview")
+    parser.add_argument("--test-only", action="store_true")
+    parser.add_argument("--candidate-plan", type=Path)
+    parser.add_argument("--candidate-receipt", type=Path)
     parser.add_argument("--release-id", required=True, type=int)
     parser.add_argument("--expected-control-sha", required=True)
     parser.add_argument(
@@ -571,6 +622,8 @@ def main(argv: list[str] | None = None) -> int:
             download_base_url=args.download_base_url or args.api_base_url,
             token=token,
             expected_tag_state=args.expected_tag_state,
+            channel=args.channel,test_only=args.test_only,
+            candidate_plan=args.candidate_plan,candidate_receipt=args.candidate_receipt,
         )
     except ResolutionError as error:
         print(f"audit Release resolution failed: {error}", file=sys.stderr)

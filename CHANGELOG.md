@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Add explicit stable audit sealing with fresh source/control verification and offline composite transport planning; keep stable disabled and production publication unconnected.
+
 - Build and independently verify first-generation stable offline repository
   candidates with the existing local signing tools and canonical archive
   recovery. Candidate artifacts remain unsealed and cannot be published by

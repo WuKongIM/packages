@@ -270,8 +270,216 @@ def _snapshot(item: dict[str, Any], base: Path) -> dict[str, Any]:
     return result
 
 
-def make_plan(input_path: Path) -> dict[str, Any]:
+def composite_inputs(input_path: Path, test_only: bool) -> dict[str, Any]:
+    input_path=C.candidate_path(input_path.parent,input_path.name,'composite inputs')
+    inputs=C.exact(C.load_json(input_path,'composite planner inputs'),
+        {'schema','channel','current','retain','test_only'},'composite planner inputs')
+    require(inputs['schema']=='wukongim.object_storage_plan_inputs/v2'
+            and inputs['channel']=='composite','explicit composite v2 input is required')
+    require(type(inputs['test_only']) is bool and inputs['test_only'] is test_only,
+            'TEST ONLY input requires matching explicit test_only mode')
+    C.exact(inputs['current'],{'preview','stable'},'current composite channels')
+    require(isinstance(inputs['retain'],list),'retained snapshots must be an array')
+    return inputs
+
+
+STABLE_DESCRIPTOR_FIELDS = {
+    'channel','audit_release_id','seal_control_sha','candidate','resolution','resolution_sha256',
+    'archive','receipt','plan','control_dir','source_dir','apt_receipt','rpm_receipt',
+}
+
+
+def _stable_snapshot(item: dict[str, Any], base: Path, test_only: bool) -> dict[str, Any]:
+    P=_load('storage_stable_inputs','verify-stable-seal-inputs.py')
+    def path(field: str, directory: bool = False) -> Path:
+        value=local_path(item[field],base,field)
+        C.candidate_path(value if directory else value.parent,'probe' if directory else value.name,field)
+        if directory: real_directory(value,field)
+        return value
+    control=path('control_dir',True); source=path('source_dir',True)
+    archive=path('archive'); receipt=path('receipt'); plan=path('plan')
+    resolution_path=path('resolution')
+    resolution_raw=C.read_checked(resolution_path,'external seal resolution',maximum_bytes=R.MAX_JSON_BYTES)
+    require(hashlib.sha256(resolution_raw).hexdigest()==item['resolution_sha256'],
+            'seal resolution differs from independent anchor')
+    resolution=json.loads(resolution_raw,object_pairs_hook=C.reject_duplicate_pairs)
+    require(resolution_raw==C.canonical_json(resolution),'seal resolution must use canonical JSON encoding')
+    C.exact(resolution,{'schema','repository','release_id','tag_name','name','prerelease','control_sha',
+        'tag_commit_verified','classification','draft','immutable','published_at','asset_count','total_size',
+        'assets','release_revalidated','id_bound_downloads','channel','test_only','candidate'},'seal resolution')
+    require(resolution['schema']=='wukongim/package-audit-release-resolution/v2'
+            and resolution['repository']=='WuKongIM/packages' and resolution['channel']=='stable'
+            and resolution['test_only'] is test_only
+            and resolution['release_id']==item['audit_release_id']
+            and resolution['control_sha']==item['seal_control_sha'], 'seal identity differs from descriptor')
+    require(resolution['classification']=='immutable_complete' and resolution['draft'] is False
+            and resolution['immutable'] is True and resolution['prerelease'] is True
+            and resolution['tag_commit_verified'] is True and resolution['release_revalidated'] is True
+            and resolution['id_bound_downloads'] is True and isinstance(resolution['published_at'],str)
+            and bool(resolution['published_at']), 'planner requires a complete immutable seal observation')
+    require(resolution['tag_name']==f"native-package-stable-r{item['audit_release_id']}"
+            and resolution['name']==f"WuKongIM stable package snapshot r{item['audit_release_id']}",
+            'stable reserved audit identity differs')
+    candidate=P.candidate_identity(plan,receipt,test_only=test_only)
+    require(candidate==item['candidate']==resolution['candidate'],'candidate tuple differs from external seal anchors')
+    archive_facts=checked_file(archive,'stable archive',maximum_bytes=candidate['archive']['size'],
+                               expected_size=candidate['archive']['size'])
+    require(archive_facts=={key:candidate['archive'][key] for key in ('size','sha256')},
+            'candidate archive differs from independent anchor')
+    require(isinstance(resolution['assets'],list) and len(resolution['assets'])==2
+            and type(resolution['asset_count']) is int and resolution['asset_count']==2,
+            'sealed audit requires exactly two assets')
+    assets={};ids=set()
+    for raw in resolution['assets']:
+        value=C.exact(raw,{'id','name','size','sha256','downloaded_file'},'sealed asset')
+        C.positive_integer(value['id'],'sealed asset id');C.positive_integer(value['size'],'sealed asset size')
+        require(value['id'] not in ids and value['name'] not in assets,'duplicate sealed asset identity')
+        require(value['downloaded_file']==value['name'],'sealed downloaded filename differs')
+        ids.add(value['id']);assets[value['name']]={key:value[key] for key in ('name','size','sha256')}
+    require(assets=={candidate[k]['name']:candidate[k] for k in ('archive','receipt')}
+            and type(resolution['total_size']) is int
+            and resolution['total_size']==sum(value['size'] for value in assets.values()),
+            'sealed assets differ from candidate pair')
+    P.verify_candidate(archive_path=archive,receipt_path=receipt,plan_path=plan,control_root=control,
+        source_root=source,apt_receipt=path('apt_receipt'),rpm_receipt=path('rpm_receipt'),test_only=test_only)
+    with tempfile.TemporaryDirectory(prefix='wk-stable-transport-') as temporary:
+        root=Path(temporary)/'snapshot'
+        summary=R.snapshot_archive.extract_snapshot(archive_path=archive,output_dir=root,
+            max_members=R.snapshot_archive.DEFAULT_MAX_MEMBERS,max_total_size=R.ARCHIVE_MAX_TOTAL_BYTES)
+        require({'sha256':summary['sha256'],'size':summary['size']}==archive_facts,
+                'stable archive changed during planning')
+        files,_=C.collect_tree(root/'site','stable snapshot site')
+        for name in files: _public_path(name)
+        bootstrap=C.validate_bootstrap_inventory(C.load_json(root/'site/bootstrap/manifest.json',
+            'stable bootstrap',canonical=True),prepared=False,channel='stable')
+        rpm_receipt=C.load_json(root/'audit/rpm-signing.json','stable RPM receipt',canonical=True)
+        repo='rpm/stable/el/9/x86_64/'
+        immutable={value['download_path'] for value in bootstrap['packages'].values()} | {
+            name for name in files if name.startswith('apt/pool/') or '/by-hash/SHA256/' in name
+            or name.startswith(repo+'Packages/')}
+        for value in rpm_receipt['result']['repodata']:
+            name=value['path'];_public_path(name)
+            if name not in ('repodata/repomd.xml','repodata/repomd.xml.asc') and Path(name).name.startswith(value['sha256']+'-'):
+                immutable.add(repo+name)
+        prefix=f"snapshots/stable/r{item['audit_release_id']}-{candidate['snapshot_sha256']}"
+        objects=[]
+        for member in summary['members']:
+            if member['type']!='file': continue
+            name=member['name'];_public_path(name)
+            facts=C.hash_file(root/name,'stable snapshot member')
+            objects.append({'object_key':prefix+'/'+name,**facts,
+                'cache_control':'no-store' if name.startswith('site/') and name[5:] not in immutable else IMMUTABLE_CACHE,
+                'source':{'audit_release_id':item['audit_release_id'],'channel':'stable','member':name}})
+    require(checked_file(archive,'stable archive',maximum_bytes=archive_facts['size'],expected_size=archive_facts['size'])==archive_facts,
+            'stable archive changed during planning')
+    require(P.candidate_identity(plan,receipt,test_only=test_only)==candidate,
+            'candidate anchors changed during planning')
+    return {'identity':{'channel':'stable','audit_release_id':item['audit_release_id'],
+        'seal_control_sha':item['seal_control_sha'],'candidate':candidate,
+        'resolution_sha256':item['resolution_sha256']},'prefix':prefix,'objects':objects,
+        'files':files,'immutable':immutable}
+
+
+def make_composite_plan(input_path: Path, test_only: bool, output_path: Path | None = None) -> dict[str, Any]:
+    inputs=composite_inputs(input_path,test_only)
+    descriptors=[inputs['current']['preview'],inputs['current']['stable'],*inputs['retain']]
+    require(len(descriptors)<=MAX_SNAPSHOTS,'planner accepts at most 8 snapshots')
+    identities=[];sizes=[]
+    for number,raw in enumerate(descriptors):
+        require(isinstance(raw,dict),'snapshot descriptor must be an object')
+        channel=raw.get('channel')
+        if number<2: require(channel==('preview','stable')[number],'current snapshot channel differs')
+        if channel=='preview':
+            C.exact(raw,{'channel','snapshot'},'preview descriptor')
+            item=descriptor_identity(raw['snapshot'])
+            identities.append(item['audit_release_id']);sizes.append(item['archive_size'])
+        else:
+            require(channel=='stable','unsupported snapshot channel')
+            C.exact(raw,STABLE_DESCRIPTOR_FIELDS,'stable descriptor')
+            C.positive_integer(raw['audit_release_id'],'stable audit release ID')
+            require(isinstance(raw['seal_control_sha'],str) and R.LOWER_SHA.fullmatch(raw['seal_control_sha']),
+                    'seal control SHA is invalid')
+            R.sha256_string(raw['resolution_sha256'],'resolution SHA')
+            candidate=C.exact(raw['candidate'],{'version','control_sha','source','archive','receipt',
+                'snapshot_sha256','plan_sha256'},'candidate identity')
+            size=C.positive_integer(candidate['archive']['size'],'candidate archive size')
+            identities.append(raw['audit_release_id']);sizes.append(size)
+    require(len(set(identities))==len(identities),'duplicate audit identity in planner inputs')
+    require(sum(sizes)<=MAX_TOTAL_ARCHIVE_BYTES,'planner total archive byte limit is 2 GiB')
+    if output_path is not None:
+        boundaries=[input_path]
+        for raw in descriptors:
+            item=raw['snapshot'] if raw['channel']=='preview' else raw
+            fields=('archive','receipt','control_dir') if raw['channel']=='preview' else (
+                'archive','receipt','plan','resolution','control_dir','source_dir','apt_receipt','rpm_receipt')
+            for field in fields:
+                path=local_path(item[field],input_path.parent,field)
+                if os.path.lexists(path): boundaries.append(path)
+        C.validate_candidate_output_paths((output_path,),tuple(boundaries))
+    snapshots=[]
+    for raw in descriptors:
+        if raw['channel']=='preview':
+            snapshot=_snapshot(raw['snapshot'],input_path.parent)
+            snapshot['identity']['channel']='preview'
+            for obj in snapshot['objects']: obj['source']['channel']='preview'
+        else:
+            snapshot=_stable_snapshot(raw,input_path.parent,test_only)
+        snapshots.append(snapshot)
+    preview,stable=snapshots[:2]
+    aliases={}
+    for snapshot in snapshots:
+        for path in sorted(snapshot['immutable']):
+            facts=snapshot['files'][path]
+            value={'public_uri':'/'+path,'object_key':'public/'+path,**facts,'cache_control':IMMUTABLE_CACHE,
+                'source':{'audit_release_id':snapshot['identity']['audit_release_id'],
+                          'channel':snapshot['identity']['channel'],'member':'site/'+path}}
+            if path in aliases:
+                require(all(aliases[path][key]==value[key] for key in ('object_key','sha256','size','cache_control')),
+                        'immutable URI conflict across snapshots: /'+path)
+            else: aliases[path]=value
+    entrypoints=[]
+    for snapshot in (preview,stable):
+        for path,facts in sorted(snapshot['files'].items()):
+            if path in snapshot['immutable']: continue
+            if snapshot is stable and not (path.startswith('apt/') or path.startswith('keys/')): continue
+            entrypoints.append({'public_uri':'/'+path,'object_key':snapshot['prefix']+'/site/'+path,
+                                **facts,'cache_control':'no-store'})
+    # The mirrorlist is a transport object. The archived, signed repomd bytes are untouched.
+    mirror=('https://packages.githubim.com/'+stable['prefix']+'/site/rpm/stable/el/9/x86_64/\n')
+    mirror_facts={'sha256':hashlib.sha256(mirror.encode()).hexdigest(),'size':len(mirror.encode())}
+    mirror_key='generated/stable-mirrorlists/'+mirror_facts['sha256']+'.txt'
+    generated=[{'object_key':mirror_key,**mirror_facts,'cache_control':'no-store','content_utf8':mirror}]
+    entrypoints.append({'public_uri':'/rpm/stable/el/9/x86_64/mirrorlist','object_key':mirror_key,
+                        **mirror_facts,'cache_control':'no-store'})
+    public={}
+    for value in [*aliases.values(),*entrypoints]:
+        uri=value['public_uri']
+        require(uri not in public or all(public[uri][key]==value[key] for key in ('sha256','size','cache_control')),
+                'public URI conflict between channels: '+uri)
+        public[uri]=value
+    return {'schema':'wukongim.object_storage_publication_plan/v2','channel':'composite',
+        'status':'plan_only','plan_only':True,'test_only':test_only,
+        'current_audit_release_ids':{'preview':identities[0],'stable':identities[1]},
+        'verification':{'archive_and_receipt_consistent':True,'metadata_closure_checked':True,
+            'signatures_verified':False,'stable_signatures_verified':True,'github_provenance_verified':False,
+            'control_commit_verified':False,'cloud_verified':False,'activation_authorized':False},
+        'snapshots':sorted((item['identity'] for item in snapshots),key=lambda item:item['audit_release_id']),
+        'snapshot_objects':sorted((obj for item in snapshots for obj in item['objects']),key=lambda obj:obj['object_key']),
+        'immutable_aliases':[aliases[key] for key in sorted(aliases)],
+        'entrypoints':sorted(entrypoints,key=lambda item:item['public_uri']),'generated_objects':generated,
+        'retention':{'policy':'retain_all_supplied_snapshots_no_gc','retained_audit_ids':sorted(identities[2:]),'delete_objects':[]},
+        'limitations':['Local seal JSON is caller-reviewed evidence, not authenticated GitHub truth.',
+            'Production activation must fresh-resolve exact audit/source/control identities.',
+            'Preview signatures are not reverified by the legacy offline planner.',
+            'No upload, activation, cloud state, atomic switch or deletion is established.']}
+
+
+def make_plan(input_path: Path, *, composite: bool = False, test_only: bool = False,
+              output_path: Path | None = None) -> dict[str, Any]:
     """Build a deterministic plan, retaining every explicitly supplied generation."""
+    if composite:
+        return make_composite_plan(input_path,test_only,output_path)
+    require(not test_only,'TEST ONLY requires explicit composite mode')
     inputs = C.exact(C.load_json(input_path, 'planner inputs'),
                      {'schema', 'channel', 'current', 'retain'}, 'planner inputs')
     require(inputs['schema'] == INPUT_SCHEMA, f'planner input schema must be {INPUT_SCHEMA}')
@@ -329,13 +537,15 @@ def make_plan(input_path: Path) -> dict[str, Any]:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--composite',action='store_true')
+    parser.add_argument('--test-only',action='store_true')
     parser.add_argument('--inputs', required=True, type=Path, help='Local descriptor with independently reviewed identities')
     parser.add_argument('--output', required=True, type=Path, help='New canonical JSON plan; existing paths are rejected')
     args = parser.parse_args(argv)
     try:
         require(not os.path.lexists(args.output), 'planner output already exists')
         real_directory(args.output.parent, 'output parent')
-        plan = make_plan(args.inputs)
+        plan = make_plan(args.inputs,composite=args.composite,test_only=args.test_only,output_path=args.output)
         raw = C.canonical_json(plan)
         R._write_exclusive(args.output, plan)
     except (PlanningError, C.CompositionError, R.AuditReceiptError,
