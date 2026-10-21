@@ -198,6 +198,46 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
 
+      - name: Verify native TEST ONLY preview and stable delivery fixtures
+        shell: bash
+        run: |
+          set -euo pipefail
+          jq -e '.enabled == true' manifests/signing-toolchain.json >/dev/null
+          image="$(jq -r '.image + "@" + .digest' manifests/signing-toolchain.json)"
+          fixture_output="$RUNNER_TEMP/native-delivery-fixture"
+          mkdir "$fixture_output"
+          chmod 0777 "$fixture_output"
+          container="wk-native-delivery-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          trap 'docker rm --force "$container" >/dev/null 2>&1 || true' EXIT
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
+          timeout --signal=TERM --kill-after=10s 15m docker run --rm --name "$container" \
+            --platform linux/amd64 --init --network none --read-only --cap-drop ALL \
+            --security-opt no-new-privileges --user 65532:65532 \
+            --cpus 1 --memory 512m --pids-limit 128 \
+            --tmpfs /tmp:rw,nosuid,nodev,size=536870912 \
+            --volume "$GITHUB_WORKSPACE:/control:ro" \
+            --volume "$fixture_output:/evidence" \
+            --workdir /tmp "$image" \
+            python3 -B /control/tests/native_object_delivery_fixture_drill.py \
+            --output-dir /evidence --source-sha "$GITHUB_SHA" \
+            --trusted-root /control/.trusted/wukongim
+          jq -e --arg source "$GITHUB_SHA" '.source_sha == $source and .test_only == true and .passed == true and .scratch_removed == true and (.cases | length) == 29 and all(.cases[]; .passed == true) and .verification.native_preview_verified == true and .verification.native_stable_verified == true and .verification.github_provenance_verified == false and .verification.fresh_production_auth_verified == false and .verification.activation_authorized == false' \
+            "$fixture_output/result.json" >/dev/null
+          jq -e '.test_only == true and .data_only == true and .secret_tree_removed == true and .source_provenance_verified == false' \
+            "$fixture_output/fixture-export.json" >/dev/null
+
+      - name: Preserve public native delivery fixture evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-object-delivery-fixture-test-only
+          path: |
+            ${{ runner.temp }}/native-delivery-fixture/result.json
+            ${{ runner.temp }}/native-delivery-fixture/fixture-export.json
+          if-no-files-found: warn
+          retention-days: 30
+
       - name: Set up fixed GoReleaser toolchain
         uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
