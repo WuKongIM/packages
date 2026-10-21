@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Add optional offline contracts for explicit-credential OSS/CDN SDK operations
+  and fresh delivery-input authentication, with complete configuration observations
+  bound before writes and credential logging rejected before SDK entry. Production
+  activation remains unsupported.
+
 - Keep TEST ONLY DNF generation-switch metadata selected across makecache
   shutdown and download, with verified exact-A delivery through the planned B
   mirrorlist and payload prefix. Production client policy is unchanged.
