@@ -89,30 +89,52 @@ protected control-plane review.
 ## Source preflight
 
 The read-only source preflight accepts a numeric Release ID, never a release
-name or download URL. It requires a published immutable prerelease with the
+name or download URL. It requires a published immutable source Release with the
 exact four archives, unsigned amd64 DEB and RPM, and checksum asset. It peels
 the Git tag, proves the source commit remains reachable from `main`, downloads
 each asset by numeric asset ID, checks API and local SHA-256 values plus the
 checksum closure, then repeats the Release, tag, and ancestry checks after the
 downloads.
 
-The standalone resolver and source-attestation verifier also support explicit
+The hosted preflight accepts an expected `source_channel` of `preview` or
+`stable`, and passes it unchanged to source resolution, attestation verification,
+and metadata inspection. The three standalone commands also accept explicit
 `--channel stable` for read-only source preparation. Their default remains
 `preview`: it requires a SemVer prerelease and `prerelease: true`. Stable
 inspection requires a strict version without a prerelease suffix and
-`prerelease: false`. Both commands reject build metadata, invalid numeric
+`prerelease: false`. All three commands reject build metadata, invalid numeric
 identifiers, and inconsistent source classification. The source-resolution
 receipt retains its existing schema with the exact tag, version, and
 classification; selecting a source channel does not authorize publishing it.
 
-Stable preparation must pass `--channel stable` to both
-`scripts/resolve-source-release.py` and `scripts/verify-source-attestations.py`.
-It retains the same numeric Release ID, immutable identity, seven-asset
-checksum closure, main ancestry, exact source SHA, and fixed signer-workflow
-checks. This is not a complete stable package preflight: the hosted workflow
-and its DEB/RPM metadata mapping still support preview only. The reviewed
-stable channel, signing, storage, bootstrap and publication gates remain
-disabled until their separate implementation and provisioning are complete.
+Stable preparation must pass `--channel stable` to
+`scripts/resolve-source-release.py`, `scripts/verify-source-attestations.py`,
+and `scripts/verify-source-package-metadata.py`. It retains the same numeric
+Release ID, immutable identity, seven-asset checksum closure, main ancestry,
+exact source SHA, and fixed signer-workflow checks. Selecting an expected source
+classification cannot alter the reviewed publication controls. The stable
+channel, signing, storage, bootstrap and publication gates remain disabled
+until their separate implementation and provisioning are complete.
+
+Metadata inspection validates the complete source receipt and all seven asset
+bytes before and after native queries. Stable package versions are exactly
+`X.Y.Z`; preview DEB versions are `X.Y.Z~prerelease`, with remaining hyphens
+changed to underscores for RPM. Both families must be named `wukongim` with
+amd64/x86_64 architecture. RPM requires release `1`, epoch `0` (including an
+unset epoch), and no SIGPGP, SIGGPG, RSAHEADER or DSAHEADER signature. Native
+queries run with a fresh home and without inherited credentials. The v2
+metadata receipt binds the expected channel, numeric source Release ID, tag,
+source SHA, and each package's asset ID, digest and size. It is metadata evidence,
+not an independent proof of GitHub provenance; the preceding attestation step
+remains mandatory for a successful hosted preflight.
+
+The TEST ONLY PR drill builds tiny data-only stable and preview DEB/RPM fixtures
+inside the existing pinned toolchain with networking disabled. It uses a
+scratch-only ephemeral RSA key to exercise actual RSAHEADER rejection; fixture
+packages are never installed or executed, and private test material is never
+uploaded. Native evidence names the signature tags actually observed. Separate
+CLI tests reject each legacy/header signature field independently; they do not
+claim all historical signing formats were produced by the current native tools.
 
 After those checks succeed, the resolver seals the public source assets as
 read-only files in a read-and-traverse-only directory (`0444` files and a
