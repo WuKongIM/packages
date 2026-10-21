@@ -1,5 +1,7 @@
 """Lightweight boundaries for the opt-in native stable client laboratory."""
 import importlib.util
+import copy
+import email.utils
 import http.client
 import hashlib
 import json
@@ -504,6 +506,145 @@ class NativeStableClientsTests(unittest.TestCase):
                         self.assertEqual(calls[-1], failure)
                         with self.assertRaisesRegex(RuntimeError, 'by-hash fault response'):
                             drill.verify_apt_by_hash_fault(mode, observed, 'Hash Sum mismatch')
+
+    def rpm_request_fixture(self):
+        drill = load()
+        repo = 'site/rpm/stable/el/9/x86_64/'
+        identities = [{'channel': 'stable', 'audit_release_id': number,
+                       'candidate': {'snapshot_sha256': marker * 64}} for number, marker in ((4242, 'a'), (4243, 'b'))]
+        prefixes = {item['audit_release_id']: f"snapshots/stable/r{item['audit_release_id']}-{item['candidate']['snapshot_sha256']}/" for item in identities}
+        plan = {'snapshots': identities, 'snapshot_objects': [], 'immutable_aliases': [], 'entrypoints': []}
+        def obj(number, member, raw, immutable=False):
+            value = {'object_key': prefixes[number] + member, 'sha256': hashlib.sha256(raw).hexdigest(),
+                     'size': len(raw), 'cache_control': 'public, max-age=31536000, immutable' if immutable else 'no-store',
+                     'source': {'channel': 'stable', 'audit_release_id': number, 'member': member}}
+            plan['snapshot_objects'].append(value)
+            return value
+        metadata = [obj(4242, repo + 'repodata/' + name, ('A ' + name).encode())
+                    for name in ('repomd.xml', 'repomd.xml.asc', 'primary.xml.gz')]
+        payload = obj(4242, repo + 'Packages/wukongim_3.0.0_linux_amd64.rpm', b'A signed RPM', True)
+        obj(4243, repo + 'Packages/wukongim_3.0.1_linux_amd64.rpm', b'B signed RPM', True)
+        mirror = (drill.ORIGIN + '/' + prefixes[4242] + repo + '\n').encode()
+        mirror_facts = {'sha256': hashlib.sha256(mirror).hexdigest(), 'size': len(mirror)}
+        plan['entrypoints'].append({'public_uri': drill.MIRROR, **mirror_facts})
+        def response(path, value):
+            return {'path': path, 'status': 200, 'sha256': value['sha256'], 'size': value['size'],
+                    'etag': '"' + value['sha256'] + '"', 'response_write_completed': True,
+                    'if_none_match': None, 'if_modified_since': None}
+        alias = dict(payload, public_uri='/' + prefixes[4243] + payload['source']['member'])
+        alias['object_key'] = 'public' + alias['public_uri']
+        plan['immutable_aliases'].append(alias)
+        observed = [response(drill.MIRROR, mirror_facts),
+                    *[response('/' + item['object_key'], item) for item in metadata],
+                    response(drill.MIRROR, {'sha256': hashlib.sha256((drill.ORIGIN + '/' + prefixes[4243] + repo + '\n').encode()).hexdigest(), 'size': len(mirror)}),
+                    response(alias['public_uri'], alias)]
+        return drill, plan, observed, payload, alias
+
+    def test_rpm_switch_accepts_only_planned_exact_retained_payload_bytes(self):
+        drill, plan, observed, payload, alias = self.rpm_request_fixture()
+        drill.verify_rpm_requests(observed, plan, 4242, switching=True)
+        original_path = observed[-1]['path']
+        observed[-1]['path'] = '/' + payload['object_key']
+        drill.verify_rpm_requests(observed, plan, 4242, switching=True)
+        observed[-1]['path'] = original_path
+        # An identical signed member in another verified snapshot may own a
+        # deduplicated source locator; the semantic identity remains A's bytes.
+        duplicate = copy.deepcopy(payload)
+        duplicate['source']['audit_release_id'] = 4243
+        duplicate['object_key'] = alias['public_uri'].lstrip('/')
+        plan['snapshot_objects'].append(duplicate)
+        alias['source'] = copy.deepcopy(duplicate['source'])
+        drill.verify_rpm_requests(observed, plan, 4242, switching=True)
+        plan['immutable_aliases'].clear()
+        drill.verify_rpm_requests(observed, plan, 4242, switching=True)
+
+    def test_rpm_switch_rejects_unbound_paths_sources_and_delivery(self):
+        for mutation in ('no-alias', 'unknown-source', 'wrong-member', 'source-sha', 'source-size',
+                         'alias-sha', 'alias-size', 'alias-channel', 'alias-architecture',
+                         'payload-sha', 'payload-size', 'payload-status', 'payload-incomplete',
+                         'metadata-prefix', 'metadata-sha', 'metadata-size', 'metadata-status',
+                         'metadata-incomplete', 'unknown-metadata', 'missing-metadata', 'missing-payload',
+                         'missing-signature', 'missing-mirror', 'wrong-first-mirror', 'wrong-later-mirror',
+                         'mirror-status', 'mirror-incomplete', 'alias-object-key', 'alias-destination',
+                         'alias-cache', 'payload-family', 'payload-version'):
+            with self.subTest(mutation=mutation):
+                drill, plan, observed, payload, alias = self.rpm_request_fixture()
+                if mutation == 'no-alias': plan['immutable_aliases'].clear()
+                elif mutation == 'unknown-source': alias['source'] = dict(alias['source'], audit_release_id=999)
+                elif mutation == 'wrong-member': alias['source'] = dict(alias['source'], member='site/apt/pool/other.deb')
+                elif mutation.startswith('source-'):
+                    # Add an explicitly named retained source which disagrees
+                    # with A; matching only the URI/basename must not pass.
+                    duplicate = copy.deepcopy(payload); duplicate['source']['audit_release_id'] = 4243
+                    duplicate['object_key'] = alias['public_uri'].lstrip('/')
+                    duplicate['sha256' if mutation == 'source-sha' else 'size'] = 'f' * 64 if mutation == 'source-sha' else 999
+                    plan['snapshot_objects'].append(duplicate); alias['source'] = copy.deepcopy(duplicate['source'])
+                elif mutation == 'alias-sha': alias['sha256'] = 'f' * 64
+                elif mutation == 'alias-size': alias['size'] += 1
+                elif mutation == 'alias-object-key': alias['object_key'] = 'public/wrong/path'
+                elif mutation == 'alias-destination':
+                    alias['public_uri'] = alias['public_uri'].replace('r4243-', 'r9999-')
+                    alias['object_key'] = 'public' + alias['public_uri']; observed[-1]['path'] = alias['public_uri']
+                elif mutation == 'alias-cache': alias['cache_control'] = 'no-store'
+                elif mutation == 'alias-channel': alias['source'] = dict(alias['source'], channel='preview')
+                elif mutation == 'alias-architecture':
+                    alias['public_uri'] = alias['public_uri'].replace('x86_64/', 'aarch64/')
+                    observed[-1]['path'] = alias['public_uri']
+                elif mutation == 'payload-family': observed[-1]['path'] = '/apt/pool/other.deb'
+                elif mutation == 'payload-version': observed[-1]['path'] = observed[-1]['path'].replace('3.0.0', '3.0.1')
+                elif mutation.startswith('payload-'):
+                    field, value = {'payload-sha': ('sha256', 'f' * 64), 'payload-size': ('size', 999),
+                        'payload-status': ('status', 404), 'payload-incomplete': ('response_write_completed', False)}[mutation]
+                    observed[-1][field] = value
+                elif mutation == 'unknown-metadata': observed[1]['path'] += '.unknown'
+                elif mutation == 'missing-metadata': observed[:] = [item for item in observed if '/repodata/' not in item['path']]
+                elif mutation == 'missing-payload': observed.pop()
+                elif mutation == 'metadata-prefix': observed[1]['path'] = observed[1]['path'].replace('r4242-' + 'a'*64, 'r4243-' + 'b'*64)
+                elif mutation.startswith('metadata-'):
+                    field, value = {'metadata-sha': ('sha256', 'f' * 64), 'metadata-size': ('size', 999),
+                        'metadata-status': ('status', 404), 'metadata-incomplete': ('response_write_completed', False)}[mutation]
+                    observed[1][field] = value
+                elif mutation == 'missing-signature': observed[:] = [item for item in observed if not item['path'].endswith('repomd.xml.asc')]
+                elif mutation == 'missing-mirror': observed[:] = [item for item in observed if item['path'] != drill.MIRROR]
+                elif mutation == 'wrong-first-mirror': observed[0]['sha256'] = 'f' * 64
+                elif mutation == 'wrong-later-mirror': observed[-2]['sha256'] = 'f' * 64
+                elif mutation == 'mirror-status': observed[0]['status'] = 404
+                elif mutation == 'mirror-incomplete': observed[0]['response_write_completed'] = False
+                with self.assertRaises(RuntimeError):
+                    drill.verify_rpm_requests(observed, plan, 4242, switching=True)
+
+    def test_rpm_conditional_metadata_binds_exact_object_and_header_precedence(self):
+        for condition in ('etag', 'modified', 'wrong-etag', 'wrong-modified', 'wrong-response-etag', 'missing', 'conflicting', 'body', 'incomplete', 'wrong-url'):
+            with self.subTest(condition=condition):
+                drill, plan, observed, payload, alias = self.rpm_request_fixture()
+                item = observed[1]; expected_sha = item['sha256']
+                modified = email.utils.formatdate(1700000000 + int(expected_sha[:6], 16), usegmt=True)
+                item.update(status=304, size=0, sha256=hashlib.sha256(b'').hexdigest())
+                if condition in ('etag', 'wrong-response-etag'): item['if_none_match'] = item['etag']
+                elif condition == 'modified': item['if_modified_since'] = modified
+                elif condition == 'wrong-etag': item['if_none_match'] = '"other"'
+                elif condition == 'wrong-modified': item['if_modified_since'] = 'Wed, 01 Jan 2020 00:00:00 GMT'
+                elif condition == 'conflicting': item.update(if_none_match='"other"', if_modified_since=modified)
+                if condition == 'wrong-response-etag': item['etag'] = '"other"'
+                if condition in ('body', 'incomplete', 'wrong-url'): item['if_none_match'] = item['etag']
+                if condition == 'body': item['size'] = 1
+                if condition == 'incomplete': item['response_write_completed'] = False
+                if condition == 'wrong-url': item['path'] = item['path'].replace('r4242-', 'r4243-')
+                if condition in ('etag', 'modified'):
+                    drill.verify_rpm_requests(observed, plan, 4242, switching=False)
+                else:
+                    with self.assertRaises(RuntimeError):
+                        drill.verify_rpm_requests(observed, plan, 4242, switching=False)
+
+    def test_fixture_conditional_etag_precedes_modified_since(self):
+        drill = load()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); (root / 'body').write_bytes(b'metadata')
+            route = drill.RouteTable(root, {'A': {drill.INRELEASE: {'file': 'body'}}, 'B': {}})
+            route.configure({'serial': 1, 'generation': 'A', 'mode': 'normal'})
+            _, _, headers = route.response(drill.INRELEASE, {})
+            self.assertEqual(route.response(drill.INRELEASE, {'If-None-Match': '"other"',
+                'If-Modified-Since': headers['Last-Modified']})[0], 200)
 
     def test_cleanup_only_uses_recorded_ids_and_reports_inspection_errors(self):
         drill = load()

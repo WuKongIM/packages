@@ -78,6 +78,22 @@ their default hash preference across a generation switch. Each additional alias
 copies the original authenticated archive member; signed metadata, archives and
 the preview-only planner are unchanged.
 
+Stable RPM payloads are also retained under each supplied stable snapshot's RPM
+base URL. DNF's separate `makecache --refresh` and download invocations can select
+A's signed metadata, then reread the floating mirrorlist after it points to B.
+The composite plan therefore adds explicit missing `Packages/*.rpm` aliases
+under B's prefix for A's verified product and bootstrap bytes, and likewise for
+the other supplied stable snapshots. Each alias binds an original archive member,
+size and SHA-256; it does not create a new signed candidate or metadata file.
+Original snapshot objects remain unchanged. Both original objects and aliases
+participate in URI conflict checks: identical bytes can share a deterministic
+source, while conflicting bytes fail closed, including a same-version bootstrap
+that has been signed again. Reuse identical signed bytes or change its version.
+The existing limit of eight total snapshots, including current preview, permits
+at most seven stable snapshots; each verified stable candidate contains exactly
+the product and bootstrap RPM, so at most 84 missing cross-generation aliases
+are added. Only supplied stable generations participate; preview is unchanged.
+
 The only derived object is a no-store stable RPM mirrorlist pointing to the
 complete immutable snapshot RPM base URL. Its exact UTF-8 bytes, size and digest
 are in `generated_objects`. No floating stable repomd/plain-metadata alias is
@@ -129,7 +145,19 @@ keys are destroyed before public fixture export and host verification.
 The four digest-pinned Ubuntu, Debian, Rocky Linux and AlmaLinux download
 clients use an internal Docker network and an ephemeral CA for the exact
 `packages.githubim.com` name. A deterministic server switches after serving A's
-InRelease or mirrorlist; retained by-hash and immutable RPM objects remain A.
+InRelease or mirrorlist. APT retains A's authenticated by-hash indexes. DNF must
+read A's exact immutable metadata URLs and bytes, including `repomd.xml` and its
+detached signature during the switch. Its RPM URL may use another supplied
+stable prefix only when the plan explicitly resolves that path to the exact
+original member, size and SHA-256 selected from A. This replaces the earlier
+assumption that both DNF invocations would keep every request under A's prefix;
+native signature, exact downloaded package and installed version/source checks
+remain required. Unknown aliases, cross-family/architecture paths, mismatched
+source members or bytes, and incomplete response writes fail the proof.
+For cache cases, a metadata 304 must refer to the same immutable object, carry
+its expected ETag and match the request's conditional validator. `If-None-Match`
+takes precedence over the object's hash-derived `Last-Modified` value. Native
+signature verification and independent cache-read evidence remain required.
 The HTTPS fixture completes bounded TLS shutdown, including `close_notify`;
 intentional truncation still fails the declared HTTP response length. APT faults
 cover both supported by-hash algorithms without forcing a client hash choice.

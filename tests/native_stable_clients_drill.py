@@ -123,6 +123,84 @@ def verify_apt_by_hash_fault(mode, observed, diagnostic):
     raise RuntimeError('native rejection lacks the actual by-hash fault response')
 
 
+def verify_rpm_requests(observed, plan, audit_release_id, *, switching):
+    """Bind DNF metadata to its selected snapshot and payloads to those exact bytes.
+
+    Separate DNF invocations may reread the floating mirrorlist. A retained RPM
+    can then use a different snapshot prefix, but only through an explicit plan
+    object whose original verified member matches the selected payload.
+    """
+    repo = 'site/rpm/stable/el/9/x86_64/'
+    prefixes = {item['audit_release_id']: '/snapshots/stable/r' + str(item['audit_release_id'])
+                + '-' + item['candidate']['snapshot_sha256'] + '/'
+                for item in plan['snapshots'] if item['channel'] == 'stable'}
+    require(audit_release_id in prefixes, 'selected RPM snapshot is absent from the verified plan')
+    prefix = prefixes[audit_release_id]
+    originals = {'/' + item['object_key']: item for item in plan['snapshot_objects']}
+    aliases = {item['public_uri']: item for item in plan['immutable_aliases']}
+    selected = {path[len(prefix):]: item for path, item in originals.items() if path.startswith(prefix + repo)}
+    fields = ('sha256', 'size')
+    def matches(left, right, keys=fields):
+        return all(left.get(key) == right.get(key) for key in keys)
+    mirrors = [item for item in observed if item['path'] == MIRROR]
+    entry = next(item for item in plan['entrypoints'] if item['public_uri'] == MIRROR)
+    require(mirrors and matches(mirrors[0], entry), 'DNF did not select the expected initial mirrorlist')
+    allowed_mirrors = [(ORIGIN + value + repo + '\n').encode() for value in prefixes.values()]
+    for item in mirrors:
+        require(item['status'] == 200 and item.get('response_write_completed') is True
+                and any(matches(item, {'sha256': hashlib.sha256(raw).hexdigest(), 'size': len(raw)})
+                        for raw in allowed_mirrors), 'DNF mirrorlist response is not a supplied stable snapshot')
+    metadata = set()
+    payloads = []
+    for item in observed:
+        path = item['path']
+        if '/repodata/' in path:
+            expected = originals.get(path)
+            require(path.startswith(prefix + repo + 'repodata/') and expected is not None,
+                    'DNF metadata escaped its selected immutable snapshot')
+            require(item.get('response_write_completed') is True, 'DNF metadata response did not complete')
+            if item['status'] == 304:
+                etag = '"' + expected['sha256'] + '"'
+                modified = email.utils.formatdate(1700000000 + int(expected['sha256'][:6], 16), usegmt=True)
+                conditional = (item.get('if_none_match') == etag if item.get('if_none_match') is not None
+                               else item.get('if_modified_since') == modified)
+                require(item.get('etag') == etag and conditional and item['size'] == 0
+                        and item['sha256'] == hashlib.sha256(b'').hexdigest(),
+                        'DNF conditional metadata is not bound to the selected object')
+            else:
+                require(item['status'] == 200 and matches(item, expected), 'DNF metadata bytes differ from the selected object')
+            metadata.add(path)
+        elif '/Packages/' in path:
+            destination = next((value for value in prefixes.values() if path.startswith(value + repo + 'Packages/')), None)
+            require(destination is not None, 'DNF RPM path is outside supplied stable snapshots')
+            member = path[len(destination):]
+            expected = selected.get(member)
+            require(expected is not None and member.endswith('.rpm'), 'DNF RPM is absent from the selected snapshot')
+            alias = aliases.get(path)
+            planned = alias if alias is not None else originals.get(path)
+            require(planned is not None and matches(planned, expected, (*fields, 'cache_control')),
+                    'DNF RPM path lacks a plan object with the selected payload bytes')
+            if alias is not None:
+                require(alias['object_key'] == 'public' + path, 'DNF RPM alias object key differs from its public path')
+            source = planned['source']
+            source_prefix = prefixes.get(source['audit_release_id'])
+            require(source['channel'] == 'stable' and source['member'] == member and source_prefix is not None,
+                    'DNF RPM source is not a supplied canonical stable member')
+            original = originals.get(source_prefix + member)
+            require(original is not None and original['source'] == source
+                    and matches(original, expected, (*fields, 'cache_control')),
+                    'DNF RPM source does not bind the selected authenticated bytes')
+            require(item['status'] == 200 and item.get('response_write_completed') is True and matches(item, expected),
+                    'DNF RPM response differs from the selected authenticated bytes')
+            payloads.append({'path': path, 'source': source, 'sha256': expected['sha256'],
+                             'size': expected['size'], 'retained_alias': alias is not None})
+    require(metadata and payloads, 'DNF lacks selected metadata or RPM response evidence')
+    if switching:
+        require(all(prefix + repo + 'repodata/' + name in metadata for name in ('repomd.xml', 'repomd.xml.asc')),
+                'DNF switch lacks selected repomd and detached signature requests')
+    return {'metadata_paths': sorted(metadata), 'payloads': payloads}
+
+
 class RouteTable:
     """Serve only frozen planner objects; switch after the exact response barrier."""
     def __init__(self, root, maps):
@@ -168,8 +246,9 @@ class RouteTable:
                 raw = (self.root / other['file']).read_bytes()
             if self.mode == 'disconnect' and path in (INRELEASE, MIRROR):
                 result['X-Test-Disconnect'] = 'true'
-            if self.mode == 'normal' and (headers.get('If-None-Match') == result['ETag']
-                    or headers.get('If-Modified-Since') == result['Last-Modified']):
+            conditional = (headers.get('If-None-Match') == result['ETag'] if headers.get('If-None-Match') is not None
+                           else headers.get('If-Modified-Since') == result['Last-Modified'])
+            if self.mode == 'normal' and conditional:
                 return 304, b'', result
             if ((self.mode in ('apt-switch', 'missing-byhash', 'corrupt-byhash') and path == INRELEASE)
                     or (self.mode == 'rpm-switch' and path == MIRROR)) and not self.switched:
@@ -771,14 +850,13 @@ def exercise(args, evidence, owned):
                         require(len(hashes) == 1, 'candidate product package identity is ambiguous')
                         value = validator._download_receipt(directory, family, {next(iter(hashes)): [entry['version']]})
                         observed = requests(number)
+                        rpm_requests = None
                         if family == 'apt':
                             require(any(apt_by_hash_path(item['path']) and item['status'] == 200 for item in observed)
                                     or persisted, 'native APT did not use authenticated by-hash')
                         else:
-                            prefix = '/snapshots/stable/r' + str(descriptors[generation]['audit_release_id']) + '-'
-                            require(any(item['path'] == MIRROR for item in observed), 'native DNF did not request mirrorlist')
-                            metadata = [item['path'] for item in observed if '/repodata/' in item['path'] or '/Packages/' in item['path']]
-                            require(metadata and all(path.startswith(prefix) for path in metadata), 'DNF escaped its selected immutable snapshot')
+                            rpm_requests = verify_rpm_requests(observed, plans[generation],
+                                descriptors[generation]['audit_release_id'], switching=mode == 'rpm-switch')
                         if mode.endswith('-switch'):
                             expected_barrier = INRELEASE if family == 'apt' else MIRROR
                             require(any(item['path'] == expected_barrier for item in observed), 'missing exact switch request barrier')
@@ -787,7 +865,7 @@ def exercise(args, evidence, owned):
                             cache_result = cache_evidence(cache_before, cache_tool(cache, 'inventory'),
                                 require_reuse=previous_cache_generation == generation)
                             previous_cache_generation = generation
-                        return {'download': value, 'requests': observed, 'cache': cache_result}
+                        return {'download': value, 'requests': observed, 'rpm_requests': rpm_requests, 'cache': cache_result}
                     record(distribution + '-A-to-B-request-barrier', lambda: download('A', family + '-switch'))
                     record(distribution + '-cache-A-first', lambda: download('A', 'normal', persisted=True))
                     record(distribution + '-cache-A-repeat', lambda: download('A', 'normal', persisted=True))
