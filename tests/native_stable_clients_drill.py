@@ -129,7 +129,7 @@ def verify_apt_by_hash_fault(mode, observed, diagnostic):
     raise RuntimeError('native rejection lacks the actual by-hash fault response')
 
 
-def verify_rpm_requests(observed, plan, audit_release_id, *, switching):
+def verify_rpm_requests(observed, plan, audit_release_id, *, switching, after_audit_release_id=None):
     """Bind DNF metadata to its selected snapshot and payloads to those exact bytes.
 
     Separate DNF invocations may reread the floating mirrorlist. A retained RPM
@@ -204,6 +204,19 @@ def verify_rpm_requests(observed, plan, audit_release_id, *, switching):
     if switching:
         require(all(prefix + repo + 'repodata/' + name in metadata for name in ('repomd.xml', 'repomd.xml.asc')),
                 'DNF switch lacks selected repomd and detached signature requests')
+        require(after_audit_release_id in prefixes and after_audit_release_id != audit_release_id,
+                'DNF switch lacks an explicit different after-generation')
+        serials = {item.get('serial') for item in observed}
+        require(len(serials) == 1 and all(type(value) is int and value > 0 for value in serials),
+                'DNF switch request evidence mixes or omits case serials')
+        after_prefix = prefixes[after_audit_release_id]
+        after_mirror = (ORIGIN + after_prefix + repo + '\n').encode()
+        after_facts = {'sha256': hashlib.sha256(after_mirror).hexdigest(), 'size': len(after_mirror)}
+        positions = [index for index, item in enumerate(observed)
+                     if item['path'] == MIRROR and matches(item, after_facts)]
+        require(positions and any(index > positions[0] and item['path'].startswith(after_prefix + repo + 'Packages/')
+                                  for index, item in enumerate(observed)),
+                'DNF switch lacks selected payload delivery after the exact after-generation mirrorlist')
     return {'metadata_paths': sorted(metadata), 'payloads': payloads}
 
 
@@ -426,6 +439,24 @@ class OwnedDocker:
 def fixture_user():
     require(os.getuid() != 0, 'fixture export requires a non-root host user')
     return str(os.getuid()) + ':' + str(os.getgid())
+
+
+def download_client_command(validator, image, downloads, certificate, family, bootstrap, *, mode):
+    """Hold selected RPM metadata only during the TEST ONLY switch download phase."""
+    command = validator.stable_client_command(image, downloads, certificate, family, bootstrap)
+    if family == 'rpm' and mode == 'rpm-switch':
+        first = 'dnf "${dnf_options[@]}" makecache --refresh'
+        second = 'dnf "${dnf_options[@]}" install --downloadonly'
+        script = command[-1]
+        require(script.count(first) == 1 and script.count(second) == 1
+                and script.index(first) < script.index(second), 'ambiguous RPM switch phase boundaries')
+        command = list(command)
+        # Separate DNF invocations otherwise permit metadata_expire=0 to select
+        # B after A's response barrier. This explicit phase still downloads via
+        # the floating mirrorlist; all normal and cache cases keep native policy.
+        command[-1] = script.replace(second,
+            'dnf "${dnf_options[@]}" --setopt=wukongim-stable.metadata_expire=-1 install --downloadonly')
+    return command
 
 
 def cache_mounts(family):
@@ -852,8 +883,8 @@ def exercise(args, evidence, owned):
                         bootstrap = json.loads((site / 'bootstrap/manifest.json').read_bytes())['packages'][family]
                         directory = scratch / ('download-' + distribution + '-' + str(number)); directory.mkdir(mode=0o777); directory.chmod(0o777)
                         cert = fixtures / entry['control'] / ('keys/' + family + '-stable.asc')
-                        command = validator.stable_client_command(client_image, directory, cert, family,
-                                                                  site / bootstrap['repository_path'])
+                        command = download_client_command(validator, client_image, directory, cert, family,
+                                                          site / bootstrap['repository_path'], mode=mode)
                         result = client(command, cache=cache if persisted else None, wrong_ca=wrong_ca, allow_failure=expected_failure)
                         if expected_failure:
                             text = result.stdout.decode(errors='replace')
@@ -884,7 +915,8 @@ def exercise(args, evidence, owned):
                                     or persisted, 'native APT did not use authenticated by-hash')
                         else:
                             rpm_requests = verify_rpm_requests(observed, plans[generation],
-                                descriptors[generation]['audit_release_id'], switching=mode == 'rpm-switch')
+                                descriptors[generation]['audit_release_id'], switching=mode == 'rpm-switch',
+                                after_audit_release_id=descriptors['B']['audit_release_id'] if mode == 'rpm-switch' else None)
                         if mode.endswith('-switch'):
                             expected_barrier = INRELEASE if family == 'apt' else MIRROR
                             require(any(item['path'] == expected_barrier for item in observed), 'missing exact switch request barrier')

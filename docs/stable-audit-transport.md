@@ -145,14 +145,22 @@ keys are destroyed before public fixture export and host verification.
 The four digest-pinned Ubuntu, Debian, Rocky Linux and AlmaLinux download
 clients use an internal Docker network and an ephemeral CA for the exact
 `packages.githubim.com` name. A deterministic server switches after serving A's
-InRelease or mirrorlist. APT retains A's authenticated by-hash indexes. DNF must
-read A's exact immutable metadata URLs and bytes, including `repomd.xml` and its
-detached signature during the switch. Its RPM URL may use another supplied
-stable prefix only when the plan explicitly resolves that path to the exact
-original member, size and SHA-256 selected from A. This replaces the earlier
-assumption that both DNF invocations would keep every request under A's prefix;
-native signature, exact downloaded package and installed version/source checks
-remain required. Unknown aliases, cross-family/architecture paths, mismatched
+InRelease or mirrorlist. APT retains A's authenticated by-hash indexes. The RPM
+switch case first runs the normal signed `makecache --refresh`, then sets only
+that case's second DNF invocation to `wukongim-stable.metadata_expire=-1` so it
+uses the already authenticated A metadata. With the packaged `metadata_expire=0`,
+two separate DNF invocations can instead refresh to B as A's cache ages; a
+request barrier alone does not pin a transaction across those invocations.
+The explicit second phase keeps the floating mirrorlist and must record B's
+exact planned mirrorlist response before an exact-A payload response under B's
+planned prefix, within the same case. An A-only download or another retained
+generation cannot satisfy this proof. Packaged configuration, production
+validation, fresh-B clients and all persistent-cache/negative cases retain their
+original metadata policy. DNF must read A's exact immutable metadata URLs and
+bytes, including `repomd.xml` and its detached signature during the switch. The
+B-prefix RPM path must resolve through the plan to the exact original member,
+size and SHA-256 selected from A. Native signature, exact downloaded package and
+installed version/source checks remain required. Unknown aliases, cross-family/architecture paths, mismatched
 source members or bytes, and incomplete response writes fail the proof.
 For cache cases, a metadata 304 must refer to the same immutable object, carry
 its expected ETag and match the request's conditional validator. `If-None-Match`
