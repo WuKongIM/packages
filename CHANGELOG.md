@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Prepare exact preview/composite object-storage deliveries locally and exercise
+  create-only upload, routing and acceptance failures through explicit simulated
+  APIs, with independent current-control fences and exact stable receipt input/plan
+  binding. No cloud writer or production activation is enabled.
+
 - Add explicit stable four-client acceptance with required installed CLI checks
   and isolated TEST ONLY A/B repository switching; stable publication remains disabled.
 - Retain stable SHA512 index aliases for native APT generation switching,
