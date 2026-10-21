@@ -39,6 +39,43 @@ def config(name, args, config_id):
                 FunctionArgs={'FunctionArg':[{'ArgName':k,'ArgValue':v} for k,v in args.items()]})
 
 
+def native_routes_fixture():
+    return json.loads((ROOT/'tests/provider_sdk/fixtures/native-composite-routes.json').read_bytes())
+
+
+def inverse_finite_rules(functions):
+    """Independently decode the closed literal grammar; do not enumerate regex samples."""
+    def literal(value):
+        decoded=re.sub(r'\\(.)',r'\1',value)
+        if re.escape(decoded)!=value or not decoded:
+            raise AssertionError('nonliteral alternative')
+        return decoded
+    pairs={}
+    for number,item in enumerate(functions,1):
+        if item['functionName']!='back_to_origin_url_rewrite':raise AssertionError('function')
+        if [x['argName'] for x in item['functionArgs']]!=['source_url','target_url','flag','sequence']:
+            raise AssertionError('argument order')
+        args={x['argName']:x['argValue'] for x in item['functionArgs']}
+        source=args['source_url'];target=args['target_url']
+        if args['flag']!='break' or args['sequence']!=str(number) or len(source.encode())>1024:
+            raise AssertionError('rule bounds')
+        if not source.startswith('^') or not source.endswith(r'\z'):raise AssertionError('anchors')
+        inner=source[1:-2]
+        if '(' in inner:
+            prefix,tail=inner.split('(',1)
+            if not tail.endswith(')') or tail.count(')')!=1 or '(' in tail:
+                raise AssertionError('capture grammar')
+            if not target.endswith('$1') or target.count('$')!=1:raise AssertionError('capture target')
+            values=[(literal(prefix)+literal(s),target[:-2]+literal(s)) for s in tail[:-1].split('|')]
+        else:
+            if '$' in target:raise AssertionError('literal target')
+            values=[(literal(inner),target)]
+        for uri,destination in values:
+            if uri in pairs:raise AssertionError('duplicate language')
+            pairs[uri]=destination
+    return pairs
+
+
 class Wire(BaseAdapter):
     """Return provider XML/JSON at requests' transport boundary after SDK signing."""
     def __init__(self):
@@ -366,6 +403,180 @@ class ProviderContract(unittest.TestCase):
         for urls in (['https://other.invalid/repo'],['https://packages.githubim.com/'],['https://packages.githubim.com/repo?x=1'],['https://packages.githubim.com/repo']*2):
             with self.assertRaises(self.p.ProviderError):self.client.refresh(urls,max_polls=1,poll_interval=0)
         self.assertFalse(self.writes())
+
+
+    def test_native_route_fixture_has_exact_public_provenance_and_object_facts(self):
+        path=ROOT/'tests/provider_sdk/fixtures/native-composite-routes.json'
+        self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(),'b135eddc8b6691dfa983e2c5ed606aaa4ca3f877d6d03b391ef3949b79026ef8')
+        fixture=native_routes_fixture();self.assertTrue(fixture['test_only']);self.assertFalse(fixture['production_authorization'])
+        self.assertEqual(fixture['readback_manifest_sha256'],'fecd657aa0440079faa851f7450893d00aebb872799fda947b1036f7d21e44a6')
+        manifest=fixture['readback_manifest']
+        self.assertEqual(json.loads(fixture['readback_manifest_json']),manifest)
+        self.assertEqual(hashlib.sha256(fixture['readback_manifest_json'].encode()).hexdigest(),fixture['readback_manifest_sha256'])
+        hashes={x['path']:x['sha256'] for x in manifest['files']}
+        self.assertEqual(fixture['source_binding']['head'],'19ce29fb2233b3039e29c503963e27bd1fab972a')
+        self.assertEqual(fixture['source_binding']['fixture_manifest_sha256'],'d9ea88a690de4c82dfe7316cc3d6c7a8f8671a70963462c886f6bd0be7471ca0')
+        for label,current in [('A',4242),('B',4243)]:
+            docs=fixture['generations'][label];delivery=docs['delivery.json'];plan=docs['transport-plan.json']
+            for name,value in {**docs,'routes.json':delivery['routes']}.items():
+                raw=(json.dumps(value,sort_keys=True,separators=(',',':'))+'\n').encode()
+                self.assertEqual(hashlib.sha256(raw).hexdigest(),hashes['first-run/'+label+'/'+name])
+            self.assertEqual(delivery['plan_sha256'],hashes['first-run/'+label+'/transport-plan.json'])
+            self.assertEqual(delivery['inputs_sha256'],hashes['first-run/'+label+'/inputs.json'])
+            self.assertEqual(plan['current_audit_release_ids'],{'preview':10,'stable':current})
+            self.assertEqual([x['audit_release_id'] for x in delivery['client_requests']],[10,current])
+            self.assertEqual({x['audit_release_id'] for x in delivery['snapshots']},{10,4242,4243})
+            self.assertEqual(len(delivery['routes']),178)
+            objects={x['object_key']:x for x in delivery['objects']};self.assertEqual(len(objects),153)
+            for row in delivery['routes']:
+                self.assertEqual({k:row[k] for k in FACTS},{k:objects[row['object_key']][k] for k in FACTS})
+            for key in ('production_enabled','publication_verified','cloud_verified'):self.assertFalse(delivery[key])
+            for key in ('activation_authorized','github_provenance_verified','control_commit_verified'):
+                self.assertFalse(delivery['planner_verification'][key])
+
+    def test_native_generations_compile_to_exact_finite_maps_without_mutation(self):
+        for label,docs in native_routes_fixture()['generations'].items():
+            with self.subTest(generation=label):
+                rows=docs['delivery.json']['routes'];original=copy.deepcopy(rows)
+                functions=self.p.compile_rewrites(rows)
+                self.assertEqual(len(functions),17)
+                self.assertEqual(max(len(x['functionArgs'][0]['argValue'].encode()) for x in functions),1017)
+                self.assertEqual(inverse_finite_rules(functions),{x['public_uri']:'/'+x['object_key'] for x in rows})
+                self.assertEqual(rows,original)
+                patterns=[re.compile(x['functionArgs'][0]['argValue'].replace(r'\z',r'\Z')) for x in functions]
+                expected={x['public_uri'] for x in rows}
+                for uri in expected:
+                    matches=[p.fullmatch(uri) for p in patterns if p.fullmatch(uri)]
+                    self.assertEqual(len(matches),1)
+                    for other in (uri+'x',uri+'/',uri+'\n',uri+'?x=1',uri+'#x',uri.replace('/','//',1),uri+'%00',uri+'%252f',uri+'/../x'):
+                        if other not in expected:self.assertFalse(any(p.fullmatch(other) for p in patterns),other)
+
+    def test_literal_fifty_and_fifty_one_duplicate_inputs_keep_original_bytes_order(self):
+        rows=[route('/p'+str(i)) for i in range(50)]
+        expected=[{'functionName':'back_to_origin_url_rewrite','functionArgs':[
+            {'argName':'source_url','argValue':'^/p'+str(i)+r'\z'},
+            {'argName':'target_url','argValue':'/'+rows[i]['object_key']},
+            {'argName':'flag','argValue':'break'},{'argName':'sequence','argValue':str(i+1)}]} for i in range(50)]
+        for inputs in (rows,rows[:7]+[copy.deepcopy(rows[3])]+rows[7:]):
+            self.assertEqual(json.dumps(self.p.compile_rewrites(inputs)),json.dumps(expected))
+        with self.assertRaises(self.p.ProviderError):self.p.compile_rewrites(rows+[route('/p50')])
+
+    def test_finite_groups_keep_unknown_mappings_literal_and_enforce_output_fifty(self):
+        aliases=[route('/a'+str(i),'public/a'+str(i)) for i in range(51)]
+        unknown=[route('/p'+str(i)) for i in range(49)]
+        functions=self.p.compile_rewrites(aliases+unknown)
+        self.assertEqual(len(functions),50)
+        self.assertEqual(inverse_finite_rules(functions),{x['public_uri']:'/'+x['object_key'] for x in aliases+unknown})
+        with self.assertRaises(self.p.ProviderError):self.p.compile_rewrites(aliases+unknown+[route('/p49')])
+        prefix='/snapshots/preview/not-a-release/'
+        with self.assertRaises(self.p.ProviderError):
+            self.p.compile_rewrites([route(prefix+str(i),(prefix+str(i))[1:]) for i in range(51)])
+
+    def test_group_expression_1024_accepts_and_1025_singleton_rejects(self):
+        prefix='/snapshots/preview/r10-'+'a'*64+'/'
+        aliases=[route('/a'+str(i),'public/a'+str(i)) for i in range(51)]
+        suffix='x'*(1024-len(re.escape(prefix))-5);uri=prefix+suffix
+        functions=self.p.compile_rewrites(aliases+[route(uri,uri[1:])])
+        self.assertEqual(max(len(x['functionArgs'][0]['argValue'].encode()) for x in functions),1024)
+        self.assertEqual(inverse_finite_rules(functions)[uri],uri)
+        with self.assertRaises(self.p.ProviderError):self.p.compile_rewrites(aliases+[route(uri+'x',uri[1:]+'x')])
+
+    def test_group_chunks_split_before_1025_without_losing_an_alternative(self):
+        prefix='/snapshots/stable/r42-'+'b'*64+'/'
+        aliases=[route('/a'+str(i),'public/a'+str(i)) for i in range(51)]
+        first='a'*400;second='b'*(1024-len(re.escape(prefix))-6-len(first))
+        for extra,wanted in [('',2),('b',3)]:
+            rows=aliases+[route(prefix+s,(prefix+s)[1:]) for s in (first,second+extra)]
+            functions=self.p.compile_rewrites(rows);self.assertEqual(len(functions),wanted)
+            self.assertEqual(inverse_finite_rules(functions),{x['public_uri']:'/'+x['object_key'] for x in rows})
+            self.assertLessEqual(max(len(x['functionArgs'][0]['argValue'].encode()) for x in functions),1024)
+
+    def test_literal_and_group_escaping_reject_all_unsafe_inputs_and_conflicts(self):
+        rows=[route('/apt/a.b+c-d~_/file'+str(i),'public/apt/a.b+c-d~_/file'+str(i)) for i in range(51)]
+        original=copy.deepcopy(rows);functions=self.p.compile_rewrites(rows+[copy.deepcopy(rows[0])])
+        self.assertEqual(inverse_finite_rules(functions),{x['public_uri']:'/'+x['object_key'] for x in rows})
+        self.assertEqual(rows,original)
+        self.assertEqual(inverse_finite_rules(self.p.compile_rewrites(rows[:2])),{x['public_uri']:'/'+x['object_key'] for x in rows[:2]})
+        with self.assertRaises(self.p.ProviderError):self.p.compile_rewrites([])
+        for changes in ({'object_key':'public/other'},{'size':2},{'sha256':'0'*64},{'cache_control':'other'}):
+            with self.subTest(changes=changes),self.assertRaises(self.p.ProviderError):
+                self.p.compile_rewrites(rows+[{**rows[0],**changes}])
+        for uri in ('/a/../b','/a/./b','//x','/a//b','/x?z=1','/x#z','/x\n','/a%2fb','/a%252fb','/a(b)','/a|b','/a$b'):
+            with self.subTest(uri=uri),self.assertRaises(self.p.ProviderError):self.p.compile_rewrites(rows+[route(uri)])
+        with self.assertRaises(self.p.ProviderError):self.p.compile_rewrites(rows+[route('/unknown','foreign/a')])
+
+    def test_distinct_current_retained_and_alias_prefixes_never_cross(self):
+        rows=native_routes_fixture()['generations']['A']['delivery.json']['routes']
+        functions=self.p.compile_rewrites(rows)
+        mapped=inverse_finite_rules(functions)
+        self.assertIn('/snapshots/stable/r4242-',mapped['/apt/dists/stable/InRelease'])
+        for row in rows:
+            self.assertEqual(mapped[row['public_uri']],'/'+row['object_key'])
+        # Same physical suffix in another generation is a distinct target group.
+        uri='/extra';target='snapshots/stable/r99-'+'c'*64+'/site/extra'
+        changed=rows+[route(uri,target)]
+        self.assertEqual(inverse_finite_rules(self.p.compile_rewrites(changed))[uri],'/'+target)
+
+    def test_native_sdk_configuration_reuses_source_ids_across_a_b(self):
+        generations=native_routes_fixture()['generations'];previous=None
+        for label in ('A','B'):
+            rows=generations[label]['delivery.json']['routes'];before=self.client.read_configuration()
+            ids=[x['ConfigId'] for x in self.w.configs if x['FunctionName']==self.p.FUNCTION]
+            self.w.requests.clear();result=self.client.apply_rewrites(rows,before=before,managed_ids=ids)
+            self.assertEqual(result['state'],'readback_verified');self.assertEqual(result['batches_attempted'],1)
+            for key in self.p.FALSE_FIELDS:self.assertFalse(result[key])
+            batches=[r for r in self.w.requests if r[2]=='BatchSetCdnDomainConfig'];self.assertEqual(len(batches),1)
+            self.assertEqual(batches[0][3]['DomainNames'],[RESOURCE['domain']])
+            functions=json.loads(batches[0][3]['Functions'][0]);self.assertEqual(len(functions),17)
+            self.assertEqual(inverse_finite_rules(functions),{x['public_uri']:'/'+x['object_key'] for x in rows})
+            actual={x['FunctionArgs']['FunctionArg'][0]['ArgValue']:x for x in self.w.configs if x['FunctionName']==self.p.FUNCTION}
+            if previous is not None:
+                self.assertEqual(set(actual),set(previous))
+                self.assertEqual({s:v['ConfigId'] for s,v in actual.items()},{s:v['ConfigId'] for s,v in previous.items()})
+                self.assertEqual(sum(actual[s]['FunctionArgs']!=previous[s]['FunctionArgs'] for s in actual),2)
+                self.assertEqual({x['configId'] for x in functions},set(ids))
+            previous=copy.deepcopy(actual)
+            with self.assertRaises(self.p.ProviderError):self.client.activate()
+            self.assertFalse(any(r[0].method=='PUT' or r[2]=='RefreshObjectCaches' for r in self.w.requests))
+
+    def test_grouping_or_rechunking_cannot_delete_preexisting_sources(self):
+        real=native_routes_fixture()['generations']['A']['delivery.json']['routes']
+        aliases=[route('/a'+str(i),'public/a'+str(i)) for i in range(51)]
+        for before_rows,after_rows in [(real,real[1:]),(aliases[:50],aliases),(aliases,aliases+[route('/a51','public/a51')])]:
+            self.w.configs=self.w.configs[:4]
+            functions=self.p.compile_rewrites(before_rows)
+            self.w.configs += [config(self.p.FUNCTION,{x['argName']:x['argValue'] for x in f['functionArgs']},100+i) for i,f in enumerate(functions)]
+            before=self.client.read_configuration();ids=[x['ConfigId'] for x in self.w.configs[4:]];self.w.requests.clear()
+            with self.assertRaisesRegex(self.p.ProviderError,'deletion'):
+                self.client.apply_rewrites(after_rows,before=before,managed_ids=ids)
+            self.assertFalse(self.writes())
+
+    def test_grouped_sdk_unknown_outcomes_remain_incomplete_without_retry(self):
+        rows=native_routes_fixture()['generations']['A']['delivery.json']['routes']
+        for fault in ('zero','missing','duplicate','partial','timeout','wrongid'):
+            with self.subTest(fault=fault):
+                self.w.configs=self.w.configs[:4];self.w.batch_fault=fault;before=self.client.read_configuration();self.w.requests.clear()
+                result=self.client.apply_rewrites(rows,before=before,managed_ids=[])
+                self.assertEqual(result['state'],'incomplete');self.assertTrue(result['write_attempted'])
+                self.assertIsNotNone(result['after_sha256']);self.assertFalse(result['wire_equivalence_verified'])
+                self.assertEqual(len([r for r in self.w.requests if r[2]=='BatchSetCdnDomainConfig']),1)
+                self.assertFalse(any(r[2]=='RefreshObjectCaches' for r in self.w.requests))
+
+    def test_grouped_observation_tampering_and_drift_prevent_all_writes(self):
+        rows=native_routes_fixture()['generations']['A']['delivery.json']['routes'];baseline=copy.deepcopy(self.w.configs)
+        for fault in ('body','domain','resource','unmanaged','drift','cap'):
+            with self.subTest(fault=fault):
+                self.w.configs=copy.deepcopy(baseline)
+                if fault=='unmanaged':self.w.configs.append(config(self.p.FUNCTION,{'source_url':r'^/old\z','target_url':'/public/old','flag':'break','sequence':'1'},90))
+                before=self.client.read_configuration()
+                if fault=='body':before['configs']=[]
+                if fault=='domain':before['domain']='foreign.invalid'
+                if fault=='resource':before['resource_sha256']='0'*64
+                if fault=='drift':self.w.configs[0]['FunctionArgs']['FunctionArg'][0]['ArgValue']='off'
+                self.w.requests.clear()
+                values=[route('/p'+str(i)) for i in range(51)] if fault=='cap' else rows
+                with self.assertRaises(self.p.ProviderError):self.client.apply_rewrites(values,before=before,managed_ids=[])
+                self.assertFalse(self.writes())
 
 
 if __name__=='__main__':

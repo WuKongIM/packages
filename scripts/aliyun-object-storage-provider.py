@@ -72,7 +72,11 @@ def safe_path(value, absolute=False):
 
 
 def compile_rewrites(routes):
-    """Compile a bounded literal candidate; never attest live PCRE/query semantics."""
+    """Compile exact finite candidates; never attest live PCRE/query semantics.
+
+    Preserve the original literal output through 50 unique routes. Larger maps
+    use only proven snapshot/public prefix relations, never wildcard coverage.
+    """
     require(isinstance(routes,list) and routes, 'routes required')
     seen={}; result=[]
     for row in routes:
@@ -87,6 +91,47 @@ def compile_rewrites(routes):
         require(len(expression.encode())<=1024, 'literal expression exceeds local capability bound')
         result.append({'functionName':FUNCTION,'functionArgs':[
             {'argName':'source_url','argValue':expression}, {'argName':'target_url','argValue':'/'+key},
+            {'argName':'flag','argValue':'break'}, {'argName':'sequence','argValue':str(len(result)+1)}]})
+    if len(result)<=50:
+        return result
+
+    groups={};candidates=[]
+    snapshot=r'/snapshots/(?:preview|stable)/r[0-9]+-[a-f0-9]{64}/'
+    for number,(uri,facts) in enumerate(seen.items()):
+        target='/'+facts['object_key'];prefix=None;replacement=None
+        if uri!='/' and not facts['object_key'].startswith('generated/'):
+            identity=re.match(snapshot,uri)
+            current=re.match(snapshot+'site/',target)
+            if target==uri and identity:
+                prefix=replacement=identity.group()
+            elif facts['object_key']=='public'+uri:
+                prefix='/';replacement='/public/'
+            elif current and target==current.group()+uri[1:]:
+                prefix='/';replacement=current.group()
+        if prefix is None:
+            candidates.append((number,'^'+re.escape(uri)+r'\z',target))
+        else:
+            groups.setdefault((prefix,replacement),[]).append((uri[len(prefix):],number))
+
+    for (prefix,replacement),members in groups.items():
+        # Sorted finite alternatives make chunk boundaries stable for an exact
+        # source set. Changed boundaries require deletion, refused by apply.
+        chunk=[];first=None
+        def expression(values):
+            return '^'+re.escape(prefix)+'('+'|'.join(values)+r')\z'
+        for suffix,number in sorted(members):
+            escaped=re.escape(suffix)
+            require(suffix and len(expression([escaped]).encode())<=1024,
+                    'finite expression exceeds local capability bound')
+            if chunk and len(expression(chunk+[escaped]).encode())>1024:
+                candidates.append((first,expression(chunk),replacement+'$1'))
+                chunk=[];first=None
+            chunk.append(escaped);first=number if first is None else min(first,number)
+        if chunk:candidates.append((first,expression(chunk),replacement+'$1'))
+    result=[]
+    for _,expression,target in sorted(candidates):
+        result.append({'functionName':FUNCTION,'functionArgs':[
+            {'argName':'source_url','argValue':expression}, {'argName':'target_url','argValue':target},
             {'argName':'flag','argValue':'break'}, {'argName':'sequence','argValue':str(len(result)+1)}]})
     require(len(result)<=50, 'domain rewrite limit exceeded')
     return result

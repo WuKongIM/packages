@@ -70,9 +70,9 @@ metadata agree. This does not permit conflicting payloads. Floating entrypoints
 retain `no-store`; immutable aliases retain the original immutable cache value.
 
 `--max-routes` bounds this exact request table (maximum 10,000), not Alibaba CDN
-wire rules. This slice does not merge rules or assert provider expressibility.
-A future provider adapter must compile equivalent routing, prove every listed
-and neighboring URI's behavior, and enforce the provider's actual rule limit.
+wire rules. Preparation does not merge rules. The optional SDK compiler below
+can represent some larger finite tables without changing them; live provider
+equivalence and neighboring URI behavior still require separate acceptance.
 No cloud API parameters, ConfigIds or atomic-switch semantics are invented here.
 
 ## Explicit in-memory simulation seam
@@ -189,12 +189,38 @@ PUT. GET requires EOF, exact length, SHA-256 and cache metadata; it closes the
 stream on every outcome. No raw SDK exception, authorization or token is a
 public receipt. No resource creation, deletion or permission change API exists.
 
-Literal rewrite compilation is a **static review candidate** only. It uses the
+Finite rewrite compilation is a **static review candidate** only. It uses the
 official `back_to_origin_url_rewrite` arguments `source_url`, `target_url`,
 `flag=break`, and explicit `sequence`, with an absolute PCRE end anchor. It keeps
 exact source alias targets, rejects unsafe paths/collisions, caps the entire
 domain at 50 rules, and caps a request at 20 functions. A 1,024-byte local
-capability bound is conservative, not a provider limit claim. Live PCRE behavior,
+capability bound is conservative, not a provider limit claim. After exact route
+deduplication, at most 50 routes keep the original literal bytes and order.
+Larger tables can group only three proven relations: identical snapshot paths
+under `/snapshots/{preview,stable}/r<ID>-<64 lowercase hex>/`, aliases whose key
+is exactly `public` plus the URI, or a URI suffix under one exact current
+snapshot's `/site/` target prefix. Root, generated objects and unknown mappings
+remain literal; arbitrary routes sharing a target are not coalesced.
+
+Each group emits `^escaped_prefix(escaped_suffix1|escaped_suffix2|...)\z`
+and its fixed target prefix plus `$1`. Every alternative is a complete listed
+suffix, with one capture and no wildcard coverage. Lexicographic suffix chunks
+fit the 1,024-byte expression bound; rules are ordered by their earliest original
+route and retain explicit sequence. An oversized singleton or more than 50
+resulting rules is rejected. Source URLs stay the first function argument and
+the configuration identity. Literal-to-group changes, source removal or new
+chunk boundaries that would delete an existing source still fail before writes.
+
+The frozen TEST ONLY native A/B fixture retains all 178 routes, 153 objects and
+original source/archive/receipt/control/input/plan anchors per generation.
+Both maps compile to 17 rules, longest 1,017 bytes, with exact finite inverse
+equality and official SDK HTTP serialization/readback tests. Their source sets
+match and only two targets change, so this pair reuses its ConfigIds. Seventeen
+is a result for these fixed groups, not a global minimum or a guarantee for
+future inputs. These contracts use public data captured after actual native
+verification; they neither repeat signatures nor upload all 153 objects.
+
+Live PCRE behavior,
 encoded URI/query normalization and actual parameter limits remain unverified,
 so this compiler cannot authorize activation. The SDK configuration primitive
 binds the complete observed body and its digest to the exact resource and domain,
