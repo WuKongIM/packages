@@ -490,28 +490,69 @@ def validate_key_topology(
     }
 
 
+def validate_candidate_audit(args: argparse.Namespace, plan: dict[str, Any], root: Path) -> None:
+    """Close archived public evidence against independent external input bytes."""
+    expected = {"audit/snapshot.json", "audit/plan.json", "audit/apt-signing.json",
+                "audit/rpm-signing.json", "audit/signing-toolchain.json"}
+    require(read_checked(root/"audit/plan.json", "archived candidate plan", maximum=8*1024*1024)
+            == read_checked(args.plan, "external candidate plan", maximum=8*1024*1024),
+            "archived plan differs from external plan")
+    for family in ("apt", "rpm"):
+        receipt = C.load_signing_receipt(root/f"audit/{family}-signing.json", family)
+        C.require_reviewed_key_receipt(receipt["key"], C.candidate_keys(args.control_root)[family], family)
+    for name, facts in plan["candidate"]["control_files"].items():
+        path = "audit/control/" + name
+        C.read_checked(root/path, "archived control " + name, expected=facts, maximum_bytes=1024*1024)
+        expected.add(path)
+    for name, facts in plan["candidate"]["source_files"].items():
+        if not name.startswith("assets/"):
+            path = "audit/source/" + name
+            C.read_checked(root/path, "archived source " + name, expected=facts, maximum_bytes=8*1024*1024)
+            expected.add(path)
+    require(hash_file(root/"audit/signing-toolchain.json", "archived signing toolchain", maximum=1024*1024)
+            == plan["candidate"]["control_files"]["manifests/signing-toolchain.json"],
+            "archived signing toolchain differs from external control")
+    files, directories = collect_tree(root, "candidate archive")
+    require_tree_closure(files, directories, expected | {name for name in files if name.startswith("site/")},
+                         "candidate archive")
+
+
 def validate_snapshot_and_control(args: argparse.Namespace) -> dict[str, Any]:
+    candidate = C.candidate_mode(args)
+    channel = "stable" if candidate else "preview"
     try:
-        control = C.validate_channels(load_json(args.channels, "channels manifest"))
-        reviewed_keys = C.validate_signing_manifest(
-            load_json(args.signing, "preview signing manifest"),
-            args.apt_public_cert,
-            args.rpm_public_cert,
-        )
+        if candidate:
+            C.require_candidate_paths(args)
+            require(getattr(args, "plan", None) is not None,
+                    "candidate verification requires an external plan")
+            plan = C.validate_candidate_plan(load_json(args.plan, "external candidate plan", canonical=True),
+                args.control_root, args.candidate_source_root, test_only=args.test_only)
+            control = C.candidate_control(plan, args.control_root)
+            reviewed_keys = C.candidate_keys(args.control_root)
+        else:
+            require(getattr(args, "plan", None) is None, "preview verifier forbids a candidate plan")
+            control = C.validate_channels(load_json(args.channels, "channels manifest"))
+            reviewed_keys = C.validate_signing_manifest(
+                load_json(args.signing, "preview signing manifest"), args.apt_public_cert, args.rpm_public_cert)
     except C.CompositionError as error:
         raise VerificationError(str(error)) from error
 
     snapshot_raw = read_checked(args.snapshot, "snapshot", maximum=8 * 1024 * 1024)
     snapshot = exact(load_json(args.snapshot, "snapshot", canonical=True),
-                     SNAPSHOT_FIELDS, "snapshot")
-    require(snapshot["schema"] == C.SNAPSHOT_SCHEMA,
+                     SNAPSHOT_FIELDS | ({"candidate_plan"} if candidate else set()), "snapshot")
+    require(snapshot["schema"] == (C.CANDIDATE_SNAPSHOT_SCHEMA if candidate else C.SNAPSHOT_SCHEMA),
             f"snapshot schema must be {C.SNAPSHOT_SCHEMA}")
     publication = control["publication"]
     require(snapshot["audit_release_id"] == publication["audit_release_id"],
             "snapshot audit Release differs from reviewed channels")
-    require(isinstance(snapshot["control_sha"], str) and C.SHA_RE.fullmatch(snapshot["control_sha"]),
-            "snapshot control_sha is invalid")
-    require(snapshot["releases"] == control["preview"]["releases"],
+    if candidate:
+        require(canonical_json(snapshot["candidate_plan"]) == canonical_json(plan),
+                "snapshot candidate plan differs from external plan")
+        require(snapshot["control_sha"] == plan["control_sha"], "snapshot control identity differs")
+    else:
+        require(isinstance(snapshot["control_sha"], str) and C.SHA_RE.fullmatch(snapshot["control_sha"]),
+                "snapshot control_sha is invalid")
+    require(snapshot["releases"] == (control["channel_releases"] if candidate else control["preview"]["releases"]),
             "snapshot releases differ from reviewed channels")
     require(snapshot["retirement"] == control["retirement"],
             "snapshot retirement differs from reviewed channels")
@@ -526,7 +567,7 @@ def validate_snapshot_and_control(args: argparse.Namespace) -> dict[str, Any]:
         prior = ""
         for index, raw in enumerate(values):
             try:
-                item = C.validate_snapshot_entry(raw, family, index)
+                item = C.validate_snapshot_entry(raw, family, index, channel=channel)
             except C.CompositionError as error:
                 raise VerificationError(str(error)) from error
             version = item["version"]
@@ -554,7 +595,7 @@ def validate_snapshot_and_control(args: argparse.Namespace) -> dict[str, Any]:
     for family, external in (("apt", args.apt_public_cert), ("rpm", args.rpm_public_cert)):
         reviewed = reviewed_keys[family]
         try:
-            archived = C.validate_public_key_snapshot(public_keys[family], family, args.site_root)
+            archived = C.validate_public_key_snapshot(public_keys[family], family, args.site_root, channel=channel)
         except C.CompositionError as error:
             raise VerificationError(str(error)) from error
         require(archived == reviewed,
@@ -595,32 +636,35 @@ def validate_snapshot_and_control(args: argparse.Namespace) -> dict[str, Any]:
             "snapshot toolchain differs from its archived manifest")
 
     operation = publication["operation"]
-    evidence = root / "audit/source-attestations"
-    evidence_arg = evidence if operation == "add_release" else None
-    plan_view = {"operation": operation, "target_version": publication["target_version"]}
-    try:
-        expected_source, _ = C.validate_source_attestations(evidence_arg, plan_view, control)
-        actual_source = C.validate_source_attestation_snapshot(
-            snapshot["source_attestations"], root, "snapshot source attestations"
-        )
-    except C.CompositionError as error:
-        raise VerificationError(str(error)) from error
-    require(actual_source == expected_source,
-            "snapshot source-attestation inventory differs from archived evidence")
+    if candidate:
+        require(snapshot["source_attestations"] is None,
+                "candidate source evidence must use its bound source inventory")
+        validate_candidate_audit(args, plan, root)
+    else:
+        evidence = root / "audit/source-attestations"
+        evidence_arg = evidence if operation == "add_release" else None
+        plan_view = {"operation": operation, "target_version": publication["target_version"]}
+        try:
+            expected_source, _ = C.validate_source_attestations(evidence_arg, plan_view, control)
+            actual_source = C.validate_source_attestation_snapshot(
+                snapshot["source_attestations"], root, "snapshot source attestations")
+        except C.CompositionError as error:
+            raise VerificationError(str(error)) from error
+        require(actual_source == expected_source,
+                "snapshot source-attestation inventory differs from archived evidence")
 
-    status = exact(load_json(args.site_root / "status.json", "site status", canonical=True),
-                   STATUS_FIELDS, "site status")
-    require(status == {
-        "schema": C.STATUS_SCHEMA,
-        "apt": True,
-        "rpm": True,
-        "reason": "ready",
-        "audit_release_id": snapshot["audit_release_id"],
-        "control_sha": snapshot["control_sha"],
-        "snapshot_sha256": digest_bytes(snapshot_raw),
-        "operation": operation,
+    status = load_json(args.site_root / "status.json", "site status", canonical=True)
+    expected_status = {
+        "schema": C.STATUS_SCHEMA, "apt": True, "rpm": True, "reason": "ready",
+        "audit_release_id": snapshot["audit_release_id"], "control_sha": snapshot["control_sha"],
+        "snapshot_sha256": digest_bytes(snapshot_raw), "operation": operation,
         "target_version": publication["target_version"],
-    }, "site status differs from snapshot and reviewed publication")
+    }
+    if candidate:
+        expected_status.update(schema="wukongim.native_package_repository_status/v3", reason="offline_candidate",
+                               test_only=plan["candidate"]["test_only"], channel="stable")
+    require(canonical_json(status) == canonical_json(expected_status),
+            "site status differs from snapshot and reviewed publication")
 
     target = publication["target_version"]
     if operation == "add_release":
@@ -636,6 +680,7 @@ def validate_snapshot_and_control(args: argparse.Namespace) -> dict[str, Any]:
         require(target not in control["releases"],
                 "remove_payloads target must be absent from the resulting snapshot")
     return {
+        "channel": channel,
         "control": control,
         "snapshot": snapshot,
         "payloads": payloads,
@@ -671,7 +716,7 @@ def validate_bootstrap_manifest(
                 canonical=True,
             ),
             prepared=False,
-            label="site bootstrap manifest",
+            label="site bootstrap manifest", channel=context.get("channel", "preview"),
         )
     except C.CompositionError as error:
         raise VerificationError(str(error)) from error
@@ -727,7 +772,7 @@ def validate_bootstrap_manifest(
         maximum=C.MAX_REPOSITORY_ENTRYPOINT_BYTES,
     )
     expected_entrypoint = C.repository_entrypoint_bytes(
-        manifest, context["keys"]["rpm"]["sha256"]
+        manifest, context["keys"]["rpm"]["sha256"], channel=context.get("channel", "preview")
     )
     require(entrypoint == expected_entrypoint,
             "repository setup entrypoint differs from reviewed bootstrap identities")
@@ -827,6 +872,7 @@ def inspect_apt_bootstrap_package(
     package: Path,
     version: str,
     certificate: Path,
+    *, channel: str = "preview",
 ) -> None:
     """Require the DEB to contain only the reviewed keyring and source config."""
     try:
@@ -836,7 +882,7 @@ def inspect_apt_bootstrap_package(
         keyring = B.dearmor_public_certificate(
             certificate_bytes, "reviewed APT certificate"
         )
-        B.inspect_deb(package, version, keyring)
+        B.inspect_deb(package, version, keyring, layout=B.STABLE_LAYOUT if channel == "stable" else B.PREVIEW_LAYOUT)
     except B.BootstrapBuildError as error:
         raise VerificationError(f"APT bootstrap package content is invalid: {error}") from error
 
@@ -845,14 +891,16 @@ def inspect_rpm_bootstrap_package(
     package: Path,
     _version: str,
     certificate: Path,
+    *, channel: str = "preview",
 ) -> None:
     """Require the RPM to be data-only and contain the exact reviewed repo files."""
     certificate_bytes = read_checked(
         certificate, "reviewed RPM certificate", maximum=MAX_CERT_BYTES
     )
+    layout = B.STABLE_LAYOUT if channel == "stable" else B.PREVIEW_LAYOUT
     expected_digests = {
-        f"/{B.RPM_KEY_PATH}": digest_bytes(certificate_bytes),
-        f"/{B.RPM_REPO_PATH}": digest_bytes(B.RPM_REPOSITORY),
+        f"/{layout.rpm_key_path}": digest_bytes(certificate_bytes),
+        f"/{layout.rpm_repo_path}": digest_bytes(layout.rpm_repository),
     }
     rpm = _tool("rpm")
     files = run_command([rpm, "-qpl", str(package)], "RPM bootstrap file-list query")
@@ -895,7 +943,7 @@ def inspect_rpm_bootstrap_package(
         require(filename in parsed,
                 "RPM bootstrap package content is invalid: expected payload is missing")
         digest, flags, mode = parsed[filename]
-        expected_flags = "17" if filename == f"/{B.RPM_REPO_PATH}" else "0"
+        expected_flags = "17" if filename == f"/{layout.rpm_repo_path}" else "0"
         require(digest == expected_digest and flags == expected_flags and mode == "-rw-r--r--",
                 f"RPM bootstrap package content is invalid for {filename}")
     digest_check = run_command(
@@ -936,7 +984,7 @@ def parse_apt_package_stanzas(data: bytes) -> list[dict[str, str]]:
     return paragraphs
 
 
-def validate_release_policy_headers(data: bytes) -> None:
+def validate_release_policy_headers(data: bytes, *, channel: str = "preview") -> None:
     try:
         lines = data.decode("utf-8").splitlines()
     except UnicodeDecodeError as error:
@@ -965,8 +1013,8 @@ def validate_release_policy_headers(data: bytes) -> None:
     expected = {
         "Origin": "WuKongIM",
         "Label": "WuKongIM",
-        "Suite": "preview",
-        "Codename": "preview",
+        "Suite": channel,
+        "Codename": channel,
         "Architectures": "amd64",
         "Components": "main",
         "Acquire-By-Hash": "yes",
@@ -998,11 +1046,12 @@ def validate_apt(
     site_files: dict[str, dict[str, Any]],
     bootstrap_manifest: dict[str, Any] | None = None,
 ) -> set[str]:
+    channel = context.get("channel", "preview")
     root = args.site_root / "apt"
-    release_relative = "apt/dists/preview/Release"
-    inrelease_relative = "apt/dists/preview/InRelease"
-    detached_relative = "apt/dists/preview/Release.gpg"
-    packages_relative = "apt/dists/preview/main/binary-amd64/Packages"
+    release_relative = f"apt/dists/{channel}/Release"
+    inrelease_relative = f"apt/dists/{channel}/InRelease"
+    detached_relative = f"apt/dists/{channel}/Release.gpg"
+    packages_relative = f"apt/dists/{channel}/main/binary-amd64/Packages"
     packages_gz_relative = f"{packages_relative}.gz"
     for relative in (release_relative, inrelease_relative, detached_relative,
                      packages_relative, packages_gz_relative):
@@ -1029,7 +1078,7 @@ def validate_apt(
             "APT InRelease signature must use OpenPGP SHA-256 (8)")
     release_bytes = read_checked(args.site_root / release_relative, "APT Release",
                                  maximum=C.MAX_METADATA_BYTES)
-    validate_release_policy_headers(release_bytes)
+    validate_release_policy_headers(release_bytes, channel=channel)
     require(inline["cleartext"] == release_bytes,
             "APT InRelease cleartext differs byte-for-byte from Release")
 
@@ -1108,9 +1157,11 @@ def validate_apt(
             "version": bootstrap["version"],
             "architecture": bootstrap["architecture"],
         }, "APT bootstrap package header identity differs from its manifest")
-        inspect_apt_bootstrap_package(
-            args.site_root / path, bootstrap["version"], args.apt_public_cert
-        )
+        if channel == "stable":
+            inspect_apt_bootstrap_package(args.site_root / path, bootstrap["version"],
+                                            args.apt_public_cert, channel="stable")
+        else:
+            inspect_apt_bootstrap_package(args.site_root / path, bootstrap["version"], args.apt_public_cert)
     require(indexed == expected_indexed,
             "APT Packages does not exactly contain active reviewed and bootstrap payloads")
     stanzas = parse_apt_package_stanzas(packages_bytes)
@@ -1137,7 +1188,7 @@ def validate_apt(
 
     by_hash_paths: set[str] = set()
     for site_name in (packages_relative, packages_gz_relative):
-        relative = f"apt/dists/preview/main/binary-amd64/by-hash/SHA256/{site_files[site_name]['sha256']}"
+        relative = f"apt/dists/{channel}/main/binary-amd64/by-hash/SHA256/{site_files[site_name]['sha256']}"
         require(relative in site_files and site_files[relative] == site_files[site_name],
                 f"APT by-hash copy differs from {site_name}")
         require(read_checked(args.site_root / relative, f"APT by-hash {relative}",
@@ -1216,7 +1267,8 @@ def validate_rpm(
     site_files: dict[str, dict[str, Any]],
     bootstrap_manifest: dict[str, Any] | None = None,
 ) -> set[str]:
-    repository = "rpm/preview/el/9/x86_64"
+    channel = context.get("channel", "preview")
+    repository = f"rpm/{channel}/el/9/x86_64"
     repomd_relative = f"{repository}/repodata/repomd.xml"
     signature_relative = f"{repomd_relative}.asc"
     require(repomd_relative in site_files and signature_relative in site_files,
@@ -1324,9 +1376,11 @@ def validate_rpm(
             "version": bootstrap["version"], "release": "1",
             "architecture": bootstrap["architecture"],
         }, "RPM bootstrap package header identity differs from its manifest")
-        inspect_rpm_bootstrap_package(
-            args.site_root / path, bootstrap["version"], args.rpm_public_cert
-        )
+        if channel == "stable":
+            inspect_rpm_bootstrap_package(args.site_root / path, bootstrap["version"],
+                                            args.rpm_public_cert, channel="stable")
+        else:
+            inspect_rpm_bootstrap_package(args.site_root / path, bootstrap["version"], args.rpm_public_cert)
 
     primary_root = _xml(records["primary"][1], "metadata", "RPM primary metadata")
     primary_packages = [item for item in primary_root if C.local_name(item.tag) == "package"]
@@ -1408,6 +1462,7 @@ def validate_rpm(
 
 def verify(args: argparse.Namespace) -> dict[str, Any]:
     context = validate_snapshot_and_control(args)
+    candidate = context["channel"] == "stable"
     site_files, site_directories = collect_tree(args.site_root, "production package site")
     site_size = sum(item["size"] for item in site_files.values())
     limit = context["control"]["manifest"]["site_limit_bytes"]
@@ -1416,6 +1471,13 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
     bootstrap_manifest, bootstrap_expected = validate_bootstrap_manifest(
         args, context, site_files
     )
+    if candidate:
+        require(bootstrap_manifest is not None, "candidate requires both bootstrap packages")
+        plan = context["snapshot"]["candidate_plan"]
+        for family, validator in (("apt", C.validate_apt_tree), ("rpm", C.validate_rpm_tree)):
+            inventory = {version:{**item, "new":True} for version,item in context["payloads"][family].items()}
+            validator(args.site_root/family, args.snapshot.parent/f"{family}-signing.json",
+                      inventory, bootstrap_manifest["packages"][family], plan["active_versions"], [], channel="stable")
     apt_expected = validate_apt(args, context, site_files, bootstrap_manifest)
     rpm_expected = validate_rpm(args, context, site_files, bootstrap_manifest)
     apt_key = context["keys"]["apt"]
@@ -1431,6 +1493,9 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
         "APT_RELEASE=apt/dists/preview/Release\n"
         "RPM_REPOSITORY=rpm/preview/el/9/x86_64\n"
     ).encode("ascii")
+    if candidate:
+        manifest = manifest.replace(b"TEST_ONLY=false", b"TEST_ONLY=" + str(args.test_only).lower().encode()).replace(b"/preview/", b"/stable/")
+        manifest += b"STAGE=offline_candidate\n"
     require(read_checked(args.site_root / "signing-manifest.txt", "site signing manifest",
                          maximum=16 * 1024) == manifest,
             "site signing manifest differs from reviewed signing control")
@@ -1448,16 +1513,22 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
             "<h1>WuKongIM Linux packages</h1>\n"
             "<p>The signed preview APT and RPM repositories and bootstrap packages are ready.</p>\n"
         ).encode("utf-8")
+    if candidate:
+        index = index.replace(b"The signed preview APT and RPM repositories and bootstrap packages are ready.",
+                              b"UNPUBLISHED stable offline candidate. Public installation has not been verified.")
     require(read_checked(args.site_root / "index.html", "site index", maximum=64 * 1024) == index,
             "site index differs from the fixed production page")
     expected_files = apt_expected | rpm_expected | bootstrap_expected | {
         "index.html", "status.json", "signing-manifest.txt",
-        "keys/apt-preview.asc", "keys/rpm-preview.asc",
+        context["keys"]["apt"]["path"], context["keys"]["rpm"]["path"],
     }
     require_tree_closure(site_files, site_directories, expected_files,
                          "production package site")
+    if candidate:
+        C.validate_candidate_plan(context["snapshot"]["candidate_plan"], args.control_root,
+                                  args.candidate_source_root, test_only=args.test_only)
     return {
-        "schema": VERIFICATION_SCHEMA,
+        "schema": "wukongim/production-package-site-verification/v2" if candidate else VERIFICATION_SCHEMA,
         "audit_release_id": context["snapshot"]["audit_release_id"],
         "control_sha": context["snapshot"]["control_sha"],
         "operation": context["operation"],
@@ -1477,6 +1548,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--signing", required=True, type=Path)
     parser.add_argument("--apt-public-cert", required=True, type=Path)
     parser.add_argument("--rpm-public-cert", required=True, type=Path)
+    parser.add_argument("--plan", type=Path)
+    C.candidate_arguments(parser)
     return parser
 
 
@@ -1484,7 +1557,7 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         receipt = verify(args)
-    except (VerificationError, OSError) as error:
+    except (VerificationError, C.CompositionError, OSError) as error:
         print(f"production package-site verification failed: {error}", file=sys.stderr)
         return 1
     print(canonical_json(receipt).decode("utf-8"), end="")

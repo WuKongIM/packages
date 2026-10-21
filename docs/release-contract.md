@@ -592,3 +592,130 @@ match current control byte-for-byte, verifies public downloads and all installed
 clients, and rechecks main. It shares the non-cancelling `packages-pages` group;
 no control merge, publication, binding or snapshot replacement may race this run.
 It neither signs nor deploys, creates Releases, or changes immutable audit tags.
+
+
+## Stable first-generation offline candidate
+
+The existing `plan-package-publication.py`, `prepare-package-site.py`,
+`compose-package-site.py`, `package-audit-receipt.py` and
+`verify-production-package-site.py` have an explicit candidate mode. Every
+candidate invocation requires `--channel stable --offline-candidate
+--control-root CONTROL --candidate-source-root SOURCE`; omission is an error,
+not a schema-based fallback. Preview remains the default. The checked-in
+stable channel must stay disabled with no releases and
+`status=object_storage_required`. No production workflow or live site is changed.
+
+This mode supports exactly the first `add_release` of one strict `X.Y.Z`
+version. There is no base, retained/removed payload, key history, rotation,
+bootstrap update, retirement, or prerelease/build-metadata version. The plan's
+`audit_release_id`, `base_audit_release_id` and release `package_release_id`
+are null. The candidate carries `stage=offline_candidate`, `channel=stable`
+and an exact boolean `test_only`; the stage always means unpublished and
+unsealed. Production consumers continue to require their original sealed
+preview protocols and reject candidate inputs.
+
+| Artifact | Candidate schema (explicit opt-in only) |
+| --- | --- |
+| Plan | `wukongim.native_package_publication_plan/v2` |
+| Prepared product inventory | `wukongim.native_package_payload_inventory/v2` |
+| Prepared/signed bootstrap inventory | `wukongim.native_package_bootstrap_inventory/v2` |
+| Snapshot | `wukongim.native_package_snapshot/v4` |
+| Composition result | `wukongim.native_package_site_composition/v2` |
+| Independent verification | `wukongim/production-package-site-verification/v2` |
+| External audit receipt | `wukongim/package-audit-receipt/v3` |
+
+The public control root supplies the existing channels, preview signing,
+stable public roles, bootstrap, trusted-toolchain and signing-toolchain
+manifests plus all four public certificates. There is no additional signing
+manifest, credential environment or exchange protocol. Stable current/next
+roles come exclusively from `stable-public-keys.json`; full fingerprints and
+16/8-hex key IDs must remain distinct across all four families. Actual public
+certificate topology and current-key signatures are checked by the existing
+bootstrap builder and independent verifier, not inferred from receipt strings.
+
+For production input, `SOURCE` contains exactly `resolution.json` (the original
+successful stable source-resolution receipt), `metadata.json` (the original
+v2 stable native-metadata receipt), `assets/` (all seven original source
+assets), and `attestations/` (the exact seven per-asset JSON files plus
+`source-attestations.json`). The planner reuses strict stable source receipt
+validation and binds every asset/evidence SHA-256 and size. Prepare repeats the
+actual metadata-only DEB/RPM inspections against the seven bound assets. No
+source package or maintainer script is executed. Source bytes are bounded by
+750 MiB total, evidence JSON by 8 MiB, and public controls by 1 MiB per file;
+the existing 750 MiB site and 64 MiB decompression limits remain in force.
+Use canonical absolute paths. Control/source roots reject linked parent components or
+hardlinked/special files; outputs must be new and outside all input roots.
+
+`--control-sha` is required for a production candidate. It is the operator's
+**declared** reviewed control revision, not a new proof of a Git tree or online
+GitHub provenance. The independently supplied plan and the exact control,
+source and local producer file bytes are the offline trust anchors. Every
+stage rebuilds that plan against those external bytes; the verifier requires
+an external `--plan` and never trusts the embedded copy as its own anchor.
+The archive retains the original public preflight receipts/evidence, control
+files and signing receipts. Binding their bytes does not rerun GitHub
+attestation verification or authenticate a current GitHub Release. Future
+sealing/publication must repeat the established source and immutable-identity
+checks; local candidate success makes no public-deployment claim.
+
+The TEST ONLY branch additionally requires `--test-only`. Its source root has
+only `resolution.json` and two tiny native assets. The resolution schema is
+`wukongim/test-source-fixture/v1`, with fields `version`, `source_sha:null`,
+`release_id:null`, and exactly two assets `{name,id:null,size,sha256}` named
+`wukongim_X.Y.Z_linux_amd64.deb` and `.rpm`. Scratch control revision is null:
+do not pass `--control-sha`. This branch does not invent GitHub asset IDs,
+commits, attestation claims or a source metadata receipt. Production input
+rejects it. TEST ONLY private material is removed before independent archive
+verification, and only bounded public JSON evidence may leave scratch.
+
+The local sequence uses the original CLI arguments plus the common candidate
+flags above:
+
+1. Plan with `--channels CONTROL/manifests/channels.json`; save canonical
+   stdout as `PLAN`. Production also supplies its declared `--control-sha`.
+2. Prepare with `--plan PLAN --source-assets SOURCE/assets`, the fixed control
+   bootstrap/certificate paths, and the trusted builder whose bytes match
+   `trusted-toolchain.json`. Use this checkout's bootstrap builder, not code
+   from the control root. Save the product and bootstrap inventories; the
+   unsigned trees are `OUTPUT/apt` and `OUTPUT/rpm`.
+3. Invoke the unchanged family signer explicitly. APT uses
+   `--apt-release dists/stable/Release`; RPM uses
+   `--rpm-repository stable/el/9/x86_64`. Its three canonical v1 allowlists
+   name both product and stable bootstrap packages: all are new, none are
+   preserved, and both are active. Select local secret inputs separately;
+   candidate commands never locate or read production private keys.
+4. Compose with the external plan, prepared inventories, signed family trees
+   and signing receipts. `--signing` means the fixed
+   `CONTROL/manifests/stable-public-keys.json` in this explicit mode. The
+   composer itself copies the closed public audit evidence set. The result
+   contains `site/` and `audit/`, including its embedded plan and snapshot.
+5. Independently verify with `--plan PLAN --site-root OUTPUT/site
+   --snapshot OUTPUT/audit/snapshot.json` and the same external controls and
+   source root. This executes actual current-key/SHA256 APT and RPM checks,
+   exact package identities and bootstrap contents, APT cleartext/detached
+   Release/index/gzip/by-hash closure, and RPM signed payload/three metadata
+   compressed/open hash closure. Signed bootstrap downloads must be
+   byte-identical to their indexed packages.
+6. Use the existing canonical archiver. The archive basename is
+   `wukongim-stable-X.Y.Z-SNAPSHOT_SHA256-candidate-site.tar`, with the actual
+   SHA-256 of `audit/snapshot.json`; the external receipt replaces `-site.tar`
+   with `-receipt.json`. Audit `create`/`verify` receives the external plan,
+   family receipts, control/source roots and archive. It extracts canonical
+   members, compares every public evidence copy, and calls the independent
+   verifier again. Extract and verify once more to test local recovery.
+   Determinism means identical frozen signed inputs, not repeated signatures
+   with different creation times.
+
+The candidate `/repo` is clearly marked UNPUBLISHED and is generated for the
+separate stable package names. This private candidate tree does not replace
+public preview `/repo`. Its normal stable bootstrap configuration retains the
+planned mirrorlist endpoint and has no floating baseurl fallback; that endpoint
+is not created or contacted here. No claim is made about client installability,
+atomic repository switching, caches, A/B routing or cloud storage.
+
+A future audit seal must bind the **exact existing candidate archive digest**
+from outside the archive, after independent source/signature verification.
+Filling null IDs inside an existing snapshot would create different bytes and
+must not be described as sealing the same artifact. This slice does not
+implement that seal, upload/activation, production signing or public exact-version
+APT/DNF acceptance. Those remain release completion requirements.
