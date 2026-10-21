@@ -34,6 +34,7 @@ MIRROR = '/rpm/stable/el/9/x86_64/mirrorlist'
 INRELEASE = '/apt/dists/stable/InRelease'
 MAX_LOG = 8 * 1024 * 1024
 MAX_REQUESTS = 20000
+CORRUPT_APT_INDEX = b'changed authenticated index\n'
 
 
 def canonical(value):
@@ -101,6 +102,27 @@ def run_command(evidence, stage, command, *, timeout=300, maximum=MAX_LOG, env=N
                       output_tail=bytes(output[-4096:]).decode(errors='replace'))
 
 
+def apt_by_hash_path(path):
+    """Recognize immutable APT index paths for both native strong-hash choices."""
+    return re.fullmatch(r'/apt/.*/by-hash/(?:SHA256/[0-9a-f]{64}|SHA512/[0-9a-f]{128})', path) is not None
+
+
+def verify_apt_by_hash_fault(mode, observed, diagnostic):
+    """Require the intended fault response in addition to native client rejection."""
+    require(mode in ('missing-byhash', 'corrupt-byhash'), 'unsupported by-hash fault mode')
+    integrity = re.search(r'\b(?:Hash Sum mismatch|Size mismatch|File has unexpected size)\b', diagnostic, re.I)
+    missing = mode == 'missing-byhash' and re.search(r'\b404\s+Not\s+Found\b', diagnostic, re.I)
+    require(integrity or missing, 'native rejection lacks the matching APT fault diagnostic')
+    for item in observed:
+        if not apt_by_hash_path(item['path']) or item.get('response_write_completed') is not True:
+            continue
+        if ((mode == 'missing-byhash' and item['status'] == 404)
+                or (mode == 'corrupt-byhash' and item['status'] == 200
+                    and item['sha256'] == hashlib.sha256(CORRUPT_APT_INDEX).hexdigest())):
+            return item
+    raise RuntimeError('native rejection lacks the actual by-hash fault response')
+
+
 class RouteTable:
     """Serve only frozen planner objects; switch after the exact response barrier."""
     def __init__(self, root, maps):
@@ -133,10 +155,10 @@ class RouteTable:
                 return 302, b'', {'Location': 'https://forbidden.invalid/object'}
             if self.mode == 'wrong-mirror' and path == MIRROR:
                 raw = b'https://forbidden.invalid/repodata/\n'
-            if self.mode == 'missing-byhash' and '/by-hash/SHA256/' in path:
+            if self.mode == 'missing-byhash' and apt_by_hash_path(path):
                 return 404, b'', result
-            if self.mode == 'corrupt-byhash' and '/by-hash/SHA256/' in path:
-                raw = b'changed authenticated index\n'
+            if self.mode == 'corrupt-byhash' and apt_by_hash_path(path):
+                raw = CORRUPT_APT_INDEX
             if self.mode == 'missing-metadata' and '/repodata/' in path and not path.endswith(('repomd.xml', 'repomd.xml.asc')):
                 return 404, b'', result
             if self.mode == 'wrong-asc' and path.endswith('/repomd.xml.asc'):
@@ -159,6 +181,18 @@ class RouteTable:
 def serve(root):
     maps = json.loads((root / 'routes.json').read_bytes())
     routes = RouteTable(root, maps)
+    class TLSServer(ThreadingHTTPServer):
+        def shutdown_request(self, request):
+            # A TCP half-close alone violates TLS: strict OpenSSL clients reject
+            # even complete HTTP bodies without close_notify. Bound the peer's
+            # reciprocal shutdown; truncation faults still fail Content-Length.
+            try:
+                request.settimeout(2)
+                request = request.unwrap()
+            except OSError:
+                pass
+            finally:
+                super().shutdown_request(request)
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_):
             pass
@@ -171,19 +205,27 @@ def serve(root):
                     if self.server.count >= MAX_REQUESTS:
                         raise RuntimeError('request count limit exceeded')
                     self.server.count += 1
-                    with (root / 'requests.jsonl').open('ab') as log:
-                        log.write(canonical({'serial': state['serial'], 'mode': state['mode'], 'path': self.path, 'status': status,
+                receipt = {'serial': state['serial'], 'mode': state['mode'], 'path': self.path, 'status': status,
                             'sha256': hashlib.sha256(raw).hexdigest(), 'size': len(raw),
                             'if_none_match': self.headers.get('If-None-Match'),
                             'if_modified_since': self.headers.get('If-Modified-Since'),
-                            'cache_control': headers.get('Cache-Control'), 'etag': headers.get('ETag')}))
-                self.send_response(status)
-                for key, value in headers.items():
-                    if not key.startswith('X-Test-'):
-                        self.send_header(key, value)
-                self.send_header('Content-Length', str(len(raw) + (7 if 'X-Test-Disconnect' in headers else 0)))
-                self.end_headers()
-                self.wfile.write(raw)
+                            'cache_control': headers.get('Cache-Control'), 'etag': headers.get('ETag'),
+                            'response_write_completed': False}
+                try:
+                    self.send_response(status)
+                    for key, value in headers.items():
+                        if not key.startswith('X-Test-'):
+                            self.send_header(key, value)
+                    self.send_header('Content-Length', str(len(raw) + (7 if 'X-Test-Disconnect' in headers else 0)))
+                    self.end_headers()
+                    self.wfile.write(raw)
+                    self.wfile.flush()
+                    # This proves only server write completion, not peer receipt.
+                    receipt['response_write_completed'] = True
+                finally:
+                    with routes.lock:
+                        with (root / 'requests.jsonl').open('ab') as log:
+                            log.write(canonical(receipt))
                 if 'X-Test-Disconnect' in headers:
                     self.close_connection = True
             except (BrokenPipeError, ConnectionResetError):
@@ -191,7 +233,7 @@ def serve(root):
             except Exception:
                 (root / 'server-error').write_text('bounded HTTPS handler failed\n')
                 self.close_connection = True
-    server = ThreadingHTTPServer(('0.0.0.0', 443), Handler)
+    server = TLSServer(('0.0.0.0', 443), Handler)
     server.count = 0
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.load_cert_chain(root / 'tls.crt', root / 'tls.key')
@@ -710,12 +752,16 @@ def exercise(args, evidence, owned):
                             text = result.stdout.decode(errors='replace')
                             require(result.returncode not in (0, 124, 125, 126, 127, 137, 143), 'fault did not produce a package-client rejection')
                             require(not re.search(r'Traceback|command not found|Usage:', text), 'fault failed at the harness layer')
-                            require(re.search(r'(?i)certificate|SSL|checksum|hash sum|unexpected size|signature|GPG|404|failed to (fetch|download)|cannot (download|prepare)|curl error|transfer|connection|could not resolve', text),
+                            require(re.search(r'(?i)certificate|SSL|checksum|hash sum|unexpected size|size mismatch|signature|GPG|404|failed to (fetch|download)|cannot (download|prepare)|curl error|transfer|connection|could not resolve', text),
                                     'fault lacks an authentication or transport diagnostic')
+                            observed = requests(number)
                             if not wrong_ca and mode != 'wrong-san':
-                                require(requests(number), 'fault did not reach the HTTPS fixture')
+                                require(observed, 'fault did not reach the HTTPS fixture')
+                            fault_response = (verify_apt_by_hash_fault(mode, observed, text)
+                                if mode in ('missing-byhash', 'corrupt-byhash') else None)
                             return {'exit_code': result.returncode, 'request_serial': number, 'fault': mode,
-                                    'output_sha256': hashlib.sha256(result.stdout).hexdigest()}
+                                    'output_sha256': hashlib.sha256(result.stdout).hexdigest(),
+                                    'by_hash_fault_response': fault_response}
                         require(result.returncode == 0, 'download client failed')
                         # Indexed payload expected bytes come directly from the exact
                         # candidate source/signing site, not from what was downloaded.
@@ -726,7 +772,7 @@ def exercise(args, evidence, owned):
                         value = validator._download_receipt(directory, family, {next(iter(hashes)): [entry['version']]})
                         observed = requests(number)
                         if family == 'apt':
-                            require(any('/by-hash/SHA256/' in item['path'] and item['status'] == 200 for item in observed)
+                            require(any(apt_by_hash_path(item['path']) and item['status'] == 200 for item in observed)
                                     or persisted, 'native APT did not use authenticated by-hash')
                         else:
                             prefix = '/snapshots/stable/r' + str(descriptors[generation]['audit_release_id']) + '-'
