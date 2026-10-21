@@ -148,3 +148,81 @@ equivalent CDN wire configuration/readback, public origin checks and execution
 of the existing four clients. Those operations still require their actual
 resource and publication authorization. No production enablement can be inferred
 from local plans, fixture successes or JSON fields.
+
+
+## Optional official SDK library contracts
+
+`aliyun-object-storage-provider.py` and `verify-object-storage-delivery-inputs.py`
+are importable libraries, with no production command or publisher integration.
+The original planner, materializer, simulation, signed producers and four-client
+validator remain unchanged. SDK operation receipts always retain
+`production_enabled=false`, `publication_verified=false`, `cloud_verified=false`
+and `wire_equivalence_verified=false`. `activate()` unconditionally rejects.
+No local JSON flag or saved journal supplies publication authority.
+
+The optional lock pins OSS V2 1.4.1, official SDK Core 2.16.1, CDN 3.8.8 and STS
+3.1.3, plus every transitive dependency and published artifact SHA-256. Install
+with `python3 -m pip install --only-binary=:all: --require-hashes -r
+requirements-object-storage-provider.lock`. The independent PR/main CI installs
+this lock and requires a nonempty SDK suite with zero skips. Ordinary stdlib
+tests do not import these dependencies. The SDK contracts mount an in-memory
+HTTP adapter on an instance session, exercise real SDK signing/serialization and
+response handling, and forbid provider sockets. They are not live acceptance.
+
+The Core client's instance session avoids the newer Tea/Darabonba client's
+global session state. SDK signing is unchanged. Credentials are explicit
+temporary inputs, never discovered from environment, files or instance metadata.
+Sessions ignore proxies and netrc, forbid redirects and content encoding, verify
+TLS, bound control responses, and disable retries. SDK debug logging is rejected
+before constructing SDK clients or entering credential-bearing SDK operations,
+with an additional transport check. Core's logger is global: callers must keep
+debug disabled throughout an operation, including concurrent code. The library
+does not claim isolation from concurrent global logging reconfiguration.
+The adapter does not mutate process environment or global SDK HTTP state.
+
+Each create-only PUT first verifies the exact caller, private bucket owner and
+never-enabled versioning. A bounded frozen copy prevents local file replacement
+between hashing and upload. PUT uses the exact length, Cache-Control and
+`x-oss-forbid-overwrite=true`; only `FileAlreadyExists` is an accepted conflict.
+An unknown transport result triggers complete GET verification, never another
+PUT. GET requires EOF, exact length, SHA-256 and cache metadata; it closes the
+stream on every outcome. No raw SDK exception, authorization or token is a
+public receipt. No resource creation, deletion or permission change API exists.
+
+Literal rewrite compilation is a **static review candidate** only. It uses the
+official `back_to_origin_url_rewrite` arguments `source_url`, `target_url`,
+`flag=break`, and explicit `sequence`, with an absolute PCRE end anchor. It keeps
+exact source alias targets, rejects unsafe paths/collisions, caps the entire
+domain at 50 rules, and caps a request at 20 functions. A 1,024-byte local
+capability bound is conservative, not a provider limit claim. Live PCRE behavior,
+encoded URI/query normalization and actual parameter limits remain unverified,
+so this compiler cannot authorize activation. The SDK configuration primitive
+binds the complete observed body and its digest to the exact resource and domain,
+then compares a fresh complete observation before any configuration write. It
+records attempted batches and before/after digests, including partial or unknown
+outcomes. It refuses unmanaged rewrites, deletion, unknown functions/groups or
+observed drift; it neither implements a transaction nor guarantees atomic POP
+changes. The complete raw configuration observation is available to its caller.
+
+Refresh primitives accept exact canonical file URLs and query only returned task
+IDs (at most ten per query); exact URL/type/ID and Complete status are required.
+They do not prove public origin/cache/TLS readiness. RefreshTaskById requires
+read permission on Resource `*`; do not misdescribe it as domain scoped.
+
+Fresh input authentication recomputes the original v1/v2 plan, authenticates
+historical controls, reads exact immutable audit/tag/assets, and runs the
+existing source resolver plus actual attestation/metadata helpers. Historical
+candidate control, historical seal control, executor control and product source
+SHA remain distinct. V2 compares historical sealed asset IDs; v1 first anchors
+IDs from fresh resolution because its descriptor contains only byte identities.
+Call again with the previous observation before the next write phase; any
+source/audit/current-control/input/plan drift rejects. A future reviewed writer
+must bind this fence to its exact preparation/resource and must invoke the
+unchanged four-client verifier. This slice does not supply that writer, channel
+authority, production resources, origin/TLS checks or public acceptance.
+
+Official references: [OSS V2](https://pypi.org/project/alibabacloud-oss-v2/1.4.1/),
+[SDK Core](https://pypi.org/project/aliyun-python-sdk-core/2.16.1/),
+[CDN SDK](https://pypi.org/project/aliyun-python-sdk-cdn/3.8.8/),
+[STS SDK](https://pypi.org/project/aliyun-python-sdk-sts/3.1.3/), and
+[CDN function contract](https://www.alibabacloud.com/help/en/cdn/developer-reference/parameters-for-configuring-features-for-domain-names).
