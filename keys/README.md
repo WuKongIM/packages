@@ -48,6 +48,19 @@ on the Mac or NAS, and never enter GitHub-hosted CI; see the
 [release contract](../docs/release-contract.md). This is an online-workstation
 model, not an offline-signing claim.
 
+`manifests/stable-public-keys.json` is the sole public role declaration for
+`apt-stable.asc` and `rpm-stable.asc`. It records only the certificate path and
+primary/current/next/historical fingerprints; it has no secret, Environment or
+publication-enable fields. The same public certificate checks and 30/45/180-day
+policy apply, and full fingerprints plus 16-hex and 8-hex key IDs must be unique
+across both channels and both package families. Historical control roots may
+omit this entire registration; a partial registration is rejected.
+
+This registration does not enable stable signing or publication. Preview
+snapshots, audit archives and bootstrap packages continue to contain only
+their reviewed preview certificates. Stable private material remains on the
+operator's Mac; the public role declaration is not backup-recovery evidence.
+
 For local signing, `scripts/sign-package-family.py` accepts exactly one of
 `--secret-subkey-base64-file`, `--secret-subkey-base64-stdin`, or the existing
 `--secret-subkey-base64-env`, and exactly one of `--passphrase-file` or

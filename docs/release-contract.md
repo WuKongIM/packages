@@ -370,6 +370,15 @@ Promoting an RPM preserves the same unsigned payload, NEVRA, and provenance,
 but its bytes change when it is signed with the independent stable key. This
 custody choice does not enable the stable channel or authorize publication.
 
+The optional `manifests/stable-public-keys.json` declaration registers only the
+two independent stable public certificates and their exact signing roles. It
+reuses public-certificate validation and the existing lifetime policy, with
+fingerprint and short-key-ID uniqueness across preview and stable. The complete
+declaration and both certificates must be present together. Older controls
+without any stable registration remain valid. Registration changes neither the
+disabled stable channel nor the preview manifest, snapshot, archive or bootstrap
+certificate inputs; it creates no GitHub secret or signing Environment.
+
 The credential-free TEST ONLY PR drill also exercises the local file and
 existing environment inputs with tiny data-only packages and independent
 ephemeral APT/RPM keys, plus the stdin subkey option. After signing, it removes

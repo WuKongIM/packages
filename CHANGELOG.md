@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Register the independent stable APT/RPM public certificates and reviewed
+  signing roles, while retaining the disabled stable channel and preview
+  publication inputs.
+
 - Accept encrypted current-subkey and passphrase files for local family signing,
   retaining the existing CI environment inputs and verification, with native
   TEST ONLY signing regression coverage. Document Mac local stable-key custody;
