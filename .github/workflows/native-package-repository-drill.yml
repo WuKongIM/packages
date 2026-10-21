@@ -57,6 +57,40 @@ jobs:
             '.files | to_entries[] | "\(.value)  .trusted/wukongim/\(.key)"' \
             manifests/trusted-toolchain.json | sha256sum --check --strict
 
+      - name: Check real native source metadata in isolated TEST ONLY fixtures
+        shell: bash
+        run: |
+          set -euo pipefail
+          jq -e '.enabled == true' manifests/signing-toolchain.json >/dev/null
+          image="$(jq -r '.image + "@" + .digest' manifests/signing-toolchain.json)"
+          docker pull "$image"
+          metadata_output="$RUNNER_TEMP/source-metadata-native"
+          mkdir "$metadata_output"
+          chmod 0777 "$metadata_output"
+          container="wk-source-metadata-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          trap 'docker rm --force "$container" >/dev/null 2>&1 || true' EXIT
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
+          timeout --signal=TERM --kill-after=10s 5m docker run --rm --name "$container" \
+            --network none --read-only --cap-drop ALL --security-opt no-new-privileges \
+            --user 65532:65532 --cpus 1 --memory 512m --pids-limit 128 \
+            --tmpfs /tmp:rw,nosuid,nodev,size=268435456 \
+            --volume "$GITHUB_WORKSPACE:/control:ro" \
+            --volume "$metadata_output:/evidence" \
+            --workdir /tmp "$image" \
+            python3 -B /control/tests/native_source_metadata_drill.py --output-dir /evidence
+          jq -e '.test_only == true and .passed == true and (.cases | length) == 7 and all(.cases[]; .passed == true)' \
+            "$metadata_output/native-source-metadata.json" >/dev/null
+
+      - name: Preserve TEST ONLY native metadata evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-source-metadata-test-only
+          path: ${{ runner.temp }}/source-metadata-native/
+          if-no-files-found: warn
+          retention-days: 30
+
       - name: Set up fixed GoReleaser toolchain
         uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:

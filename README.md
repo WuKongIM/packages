@@ -107,12 +107,20 @@ downloads all seven assets by numeric asset ID, verifies their exact checksum
 closure and fixed-workflow GitHub attestations, and inspects DEB/RPM metadata
 without executing either package payload.
 
-For read-only preparation of a stable source release, the standalone
-`resolve-source-release.py` and `verify-source-attestations.py` commands accept
-`--channel stable`. Both commands default to `preview` and reject a source from
-the other channel. This verifies source identity and provenance only; the
-hosted preflight, package metadata checks, signing, and publication workflows
-remain preview-only, and stable publication remains disabled.
+The read-only source preflight accepts `source_channel: stable` for a stable
+source Release; its default remains `preview`. The resolver, attestation
+verifier, and `verify-source-package-metadata.py` all receive the same explicit
+channel. Their standalone commands likewise accept `--channel stable` and
+reject a source from the other channel. Metadata evidence binds the numeric
+Release ID, tag, source commit and exact DEB/RPM bytes; packages are never
+installed or executed by this preflight. This is source verification only:
+stable signing, storage, installation bootstrap and publication remain disabled.
+
+The credential-free TEST ONLY PR drill also exercises real native metadata
+tools in the existing digest-pinned, network-disabled toolchain. It builds tiny
+data-only stable/preview fixtures, rejects mismatched versions and RPM epochs,
+and rejects a locally generated TEST ONLY RSA-signed RPM. Its synthetic source
+identity is not GitHub provenance or a successful stable publication.
 
 See [docs/release-contract.md](docs/release-contract.md) for the release,
 retention, signing, and recovery contracts.

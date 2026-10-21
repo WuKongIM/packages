@@ -7,6 +7,14 @@ on:
         description: Numeric immutable WuKongIM source Release id
         required: true
         type: string
+      source_channel:
+        description: Expected source classification for read-only inspection only
+        required: true
+        type: choice
+        default: preview
+        options:
+          - preview
+          - stable
 
 permissions: {}
 
@@ -27,6 +35,7 @@ jobs:
     outputs:
       control_sha: ${{ steps.request.outputs.control_sha }}
       source_release_id: ${{ steps.request.outputs.source_release_id }}
+      source_channel: ${{ steps.request.outputs.source_channel }}
     steps:
       - name: Check out exact protected control
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -39,6 +48,7 @@ jobs:
         shell: bash
         env:
           SOURCE_RELEASE_ID: ${{ inputs.source_release_id }}
+          SOURCE_CHANNEL: ${{ inputs.source_channel }}
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
@@ -51,6 +61,10 @@ jobs:
             echo 'source_release_id must be a positive numeric GitHub Release id' >&2
             exit 64
           }
+          case "$SOURCE_CHANNEL" in preview|stable) ;;
+            *) echo 'source_channel must be preview or stable' >&2; exit 64 ;;
+          esac
+          echo "source_channel=$SOURCE_CHANNEL" >> "$GITHUB_OUTPUT"
           echo "control_sha=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
           echo "source_release_id=$SOURCE_RELEASE_ID" >> "$GITHUB_OUTPUT"
 
@@ -93,10 +107,12 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.source-token.outputs.token }}
           SOURCE_RELEASE_ID: ${{ needs.control.outputs.source_release_id }}
+          SOURCE_CHANNEL: ${{ needs.control.outputs.source_channel }}
           SOURCE_ASSETS: ${{ runner.temp }}/source-assets
           SOURCE_RECEIPT: ${{ runner.temp }}/source-release.json
         run: >-
           ./scripts/resolve-source-release.py
+          --channel "$SOURCE_CHANNEL"
           --release-id "$SOURCE_RELEASE_ID"
           --output-dir "$SOURCE_ASSETS"
           --token-env GH_TOKEN
@@ -105,11 +121,13 @@ jobs:
       - name: Verify fixed workflow attestations for all seven assets
         env:
           GH_TOKEN: ${{ steps.source-token.outputs.token }}
+          SOURCE_CHANNEL: ${{ needs.control.outputs.source_channel }}
           SOURCE_ASSETS: ${{ runner.temp }}/source-assets
           SOURCE_RECEIPT: ${{ runner.temp }}/source-release.json
           SOURCE_ATTESTATIONS: ${{ runner.temp }}/source-attestations
         run: >-
           ./scripts/verify-source-attestations.py
+          --channel "$SOURCE_CHANNEL"
           --receipt "$SOURCE_RECEIPT"
           --asset-dir "$SOURCE_ASSETS"
           --evidence-dir "$SOURCE_ATTESTATIONS"
@@ -123,69 +141,15 @@ jobs:
       - name: Inspect unsigned package identities without executing payloads
         shell: bash
         env:
+          SOURCE_CHANNEL: ${{ needs.control.outputs.source_channel }}
           SOURCE_ASSETS: ${{ runner.temp }}/source-assets
           SOURCE_RECEIPT: ${{ runner.temp }}/source-release.json
-        run: |
-          set -euo pipefail
-          export LC_ALL=C
-
-          assert_metadata() {
-            local label="$1"
-            local expected="$2"
-            local actual="$3"
-            if [[ "$actual" != "$expected" ]]; then
-              printf '%s mismatch: expected <%s>, got <%s>\n' \
-                "$label" "$expected" "$actual" >&2
-              exit 1
-            fi
-          }
-
-          version="$(jq -r '.version' "$SOURCE_RECEIPT")"
-          deb="$SOURCE_ASSETS/wukongim_${version}_linux_amd64.deb"
-          rpm_package="$SOURCE_ASSETS/wukongim_${version}_linux_amd64.rpm"
-          release_core="${version%%-*}"
-          prerelease="${version#*-}"
-          [[ "$release_core" != "$version" && -n "$prerelease" ]] || {
-            echo 'source package version must be a pre-release' >&2
-            exit 1
-          }
-          # Do not use Bash pattern replacement with a bare tilde: Bash expands
-          # it to $HOME and silently corrupts the expected package version.
-          expected_deb_version="${release_core}~${prerelease}"
-          expected_rpm_version="${expected_deb_version//-/_}"
-
-          deb_package="$(dpkg-deb --field "$deb" Package)"
-          deb_architecture="$(dpkg-deb --field "$deb" Architecture)"
-          deb_version="$(dpkg-deb --field "$deb" Version)"
-          rpm_name="$(rpm -qp --queryformat '%{NAME}' "$rpm_package")"
-          rpm_architecture="$(rpm -qp --queryformat '%{ARCH}' "$rpm_package")"
-          rpm_version="$(rpm -qp --queryformat '%{VERSION}' "$rpm_package")"
-          rpm_release="$(rpm -qp --queryformat '%{RELEASE}' "$rpm_package")"
-          rpm_signature_pgp="$(rpm -qp --queryformat '%{SIGPGP:pgpsig}' "$rpm_package")"
-          rpm_signature_gpg="$(rpm -qp --queryformat '%{SIGGPG:pgpsig}' "$rpm_package")"
-
-          assert_metadata 'DEB package' wukongim "$deb_package"
-          assert_metadata 'DEB architecture' amd64 "$deb_architecture"
-          assert_metadata 'DEB version' "$expected_deb_version" "$deb_version"
-          assert_metadata 'RPM package' wukongim "$rpm_name"
-          assert_metadata 'RPM architecture' x86_64 "$rpm_architecture"
-          assert_metadata 'RPM version' "$expected_rpm_version" "$rpm_version"
-          assert_metadata 'RPM release' 1 "$rpm_release"
-          assert_metadata 'RPM SIGPGP' '(none)' "$rpm_signature_pgp"
-          assert_metadata 'RPM SIGGPG' '(none)' "$rpm_signature_gpg"
-
-          jq -n \
-            --arg schema 'wukongim/source-package-metadata/v1' \
-            --arg version "$version" \
-            --arg deb_version "$deb_version" \
-            --arg rpm_version "$rpm_version" \
-            '{
-              schema: $schema,
-              package: "wukongim",
-              version: $version,
-              deb: {version: $deb_version, architecture: "amd64"},
-              rpm: {version: $rpm_version, release: "1", architecture: "x86_64", signed: false}
-            }' >"$RUNNER_TEMP/source-package-metadata.json"
+        run: >-
+          ./scripts/verify-source-package-metadata.py
+          --channel "$SOURCE_CHANNEL"
+          --receipt "$SOURCE_RECEIPT"
+          --asset-dir "$SOURCE_ASSETS"
+          >"$RUNNER_TEMP/source-package-metadata.json"
 
       - name: Upload public verification evidence
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
