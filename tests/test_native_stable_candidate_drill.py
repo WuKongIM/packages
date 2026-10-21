@@ -49,6 +49,48 @@ class NativeStableCandidateDrillTests(unittest.TestCase):
             self.assertEqual(receipt['cases'], [])
             self.assertEqual(list(output.iterdir()), [output / 'native-stable-candidate.json'])
 
+    def test_real_scratch_layout_leaves_room_for_agent_socket_names(self):
+        drill = self.load()
+        real_temporary_directory = tempfile.TemporaryDirectory
+        scratch_paths = []
+        def temporary_directory(*args, **kwargs):
+            result = real_temporary_directory(*args, **kwargs)
+            scratch_paths.append(Path(result.name))
+            return result
+        with real_temporary_directory() as output:
+            with mock.patch.object(drill.tempfile, 'TemporaryDirectory', side_effect=temporary_directory), \
+                 mock.patch.object(drill.shutil, 'which', return_value=None), \
+                 mock.patch.object(drill.os, 'geteuid', return_value=65532), \
+                 mock.patch.object(drill.sys, 'platform', 'linux'):
+                self.assertEqual(drill.main(['--output-dir', output, '--source-sha', 'a' * 40,
+                                             '--trusted-root', output]), 1)
+        self.assertEqual(len(scratch_paths), 1)
+        # GnuPG also creates browser/extra sockets. 103 bytes is the smaller
+        # macOS/Linux pathname budget, excluding the terminating NUL byte.
+        socket = scratch_paths[0] / 'private-test-keys/01-STABLE-CANDIDATE-APT/gnupg/S.gpg-agent.browser'
+        self.assertLessEqual(len(bytes(socket)), 103)
+
+    def test_source_setup_failure_retains_a_nonsecret_phase(self):
+        drill = self.load()
+        evidence = {'cases': [], 'commands': []}
+        with mock.patch.object(drill, 'fixture_source', side_effect=AssertionError('TEST ONLY secret detail')):
+            with self.assertRaises(AssertionError):
+                drill.pipeline(Path('/tmp/unused'), Path('/tmp/unused'), evidence, {})
+        self.assertEqual(evidence.get('phase'), 'source-fixture')
+        self.assertNotIn('secret detail', json.dumps(evidence))
+
+    def test_key_setup_failure_retains_a_nonsecret_phase(self):
+        drill = self.load()
+        evidence = {'cases': [], 'commands': []}
+        with tempfile.TemporaryDirectory() as temporary:
+            with mock.patch.object(drill, 'fixture_source', return_value=Path(temporary)), \
+                 mock.patch.object(drill, 'load_fixture', return_value=mock.Mock()), \
+                 mock.patch.object(drill, 'generate_control', side_effect=AssertionError('TEST ONLY secret detail')):
+                with self.assertRaises(AssertionError):
+                    drill.pipeline(Path(temporary), Path(temporary), evidence, {})
+        self.assertEqual(evidence.get('phase'), 'test-key-generation')
+        self.assertNotIn('secret detail', json.dumps(evidence))
+
     def test_first_failure_cannot_be_overwritten(self):
         drill = self.load()
         with tempfile.TemporaryDirectory() as tmp:
