@@ -423,11 +423,30 @@ def fixture_user():
 
 
 def cache_mounts(family):
-    """DNF's cachedir and persistdir are both relative to its explicit installroot."""
+    """Keep DNF's early installroot state and final CLI cache directories distinct."""
     require(family in ('apt', 'rpm'), 'invalid cache family')
     return ([('apt', '/var/lib/apt'), ('apt-cache', '/var/cache/apt')] if family == 'apt' else
             [('dnf-cache', '/tmp/client-root/tmp/dnf-cache'),
-             ('dnf-state', '/tmp/client-root/tmp/dnf-state')])
+             ('dnf-state', '/tmp/client-root/tmp/dnf-state'),
+             ('dnf-cli-cache', '/tmp/dnf-cache'), ('dnf-cli-state', '/tmp/dnf-state')])
+
+
+def cache_client_command(command, cache, family):
+    """Add only owned cache binds, preserving the native client body and options."""
+    require(command[:2] == ['docker', 'run'], 'cache mounts require an explicit Docker run')
+    result = list(command)
+    additions = []
+    for name, destination in cache_mounts(family):
+        # Replace an existing tmpfs only at this exact bind destination.
+        index = 0
+        while index < len(result) - 1:
+            if result[index] == '--tmpfs' and result[index + 1].startswith(destination + ':'):
+                del result[index:index + 2]
+            else:
+                index += 1
+        additions += ['--volume', str(cache / name) + ':' + destination + ':rw']
+    result[2:2] = additions
+    return result
 
 
 def cache_inventory(root, *, arm=False):
@@ -457,7 +476,8 @@ def cache_inventory(root, *, arm=False):
 def cache_evidence(before, after, *, require_reuse):
     def metadata(name):
         return (name.startswith('apt/lists/') and '/partial/' not in name
-                or name.startswith('dnf-cache/') and ('/repodata/' in name or name.endswith(('.solv', '.solvx'))))
+                or name.startswith(('dnf-cache/', 'dnf-cli-cache/'))
+                and ('/repodata/' in name or name.endswith(('.solv', '.solvx'))))
     present = [name for name in after if metadata(name)]
     require(present, 'persistent cache did not contain nonempty metadata')
     reads = [name for name in present if name in before and after[name]['atime_ns'] > 1
@@ -771,16 +791,10 @@ def exercise(args, evidence, owned):
                     if cache is not None:
                         cache.mkdir(exist_ok=True); cache.chmod(0o777)
                         apt = 'WK_REPOSITORY_URL=https://packages.githubim.com/apt' in command
-                        mounts = cache_mounts('apt' if apt else 'rpm')
-                        for name, destination in mounts:
+                        family = 'apt' if apt else 'rpm'
+                        for name, _ in cache_mounts(family):
                             directory = cache / name; directory.mkdir(exist_ok=True); directory.chmod(0o777)
-                            # Replace an existing tmpfs at this exact destination.
-                            index = 0
-                            while index < len(command) - 1:
-                                if command[index] == '--tmpfs' and command[index + 1].startswith(destination + ':'):
-                                    del command[index:index+2]
-                                else: index += 1
-                            additions += ['--volume', str(directory) + ':' + destination + ':rw']
+                        command = cache_client_command(command, cache, family)
                     command[2:2] = additions
                 identifier = create(command)
                 result = run_command(evidence, 'installed-client' if installed else 'download-client',
