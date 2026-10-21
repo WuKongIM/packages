@@ -65,6 +65,27 @@ def module(filename):
     return value
 
 
+def _installed_phase_events(output):
+    """Retain bounded literal observations, never infer acceptance from subprocess text."""
+    markers = {f'WK_INSTALLED_STAGE_V1:{phase}:{event}'.encode(): {'phase': phase, 'event': event}
+               for phase in ('checksum', 'signature', 'dependencies', 'cli')
+               for event in ('begin', 'complete')}
+    events = []; truncated = False; start = 0
+    longest = max(map(len, markers))
+    while (end := output.find(b'\n', start)) != -1:
+        # Ignore incomplete or arbitrary lines without copying long output lines.
+        event = markers.get(bytes(output[start:end])) if end - start <= longest else None
+        start = end + 1
+        if event is None:
+            continue
+        if len(events) == 16:
+            truncated = True
+            break
+        events.append(event)
+    return {'schema': 'wukongim/native-installed-phase-events/v1',
+            'events': events, 'truncated': truncated}
+
+
 def run_command(evidence, stage, command, *, timeout=300, maximum=MAX_LOG, env=None, cwd=None):
     """Bound public subprocess output and time while preserving its actual exit."""
     record = {'stage': stage, 'command': list(map(str, command)), 'exit_code': None,
@@ -106,6 +127,8 @@ def run_command(evidence, stage, command, *, timeout=300, maximum=MAX_LOG, env=N
         record.update(exit_code=process.returncode, elapsed_seconds=round(time.monotonic() - start, 3),
                       output_size=len(output), output_sha256=hashlib.sha256(output).hexdigest(),
                       output_tail=bytes(output[-4096:]).decode(errors='replace'))
+        if stage == 'installed-client':
+            record['installed_phase_events'] = _installed_phase_events(output)
 
 
 def apt_by_hash_path(path):

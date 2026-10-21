@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Preserve bounded installation-phase diagnostics when native client acceptance
+  fails or times out, without changing package verification or acceptance limits.
+
 - Add a TEST ONLY native preview fixture export alongside stable A/B to check
   signed archive recovery and offline composite delivery without cloud access.
   Data-only fixtures do not establish product, source or public-client acceptance.
