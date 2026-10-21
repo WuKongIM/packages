@@ -133,3 +133,10 @@ certificates and dedicated repository definitions. Their indexed bytes and
 friendly `/bootstrap/` downloads are identical. The stable `/repo` entrypoint
 is generated from those exact paths and digests; all three are closed over by
 each immutable package audit snapshot.
+
+## Offline object-storage preparation
+
+The [offline transport planner](docs/object-storage-planning.md) inventories
+existing preview audit snapshots and explicitly retained dependency generations
+without credentials or network access. Its output is a plan only; it does not
+sign, upload, activate CDN routing or enable the stable channel.

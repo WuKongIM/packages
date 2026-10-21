@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Add an offline, preview-only object-storage transport planner with explicit
+  identity anchors and cross-generation dependency retention. It does not sign,
+  upload, activate or enable stable publication.
+
 - Allow explicit read-only stable source identity and provenance checks with
   `--channel stable`; existing commands and production workflows retain their
   preview default, and stable package publication remains disabled.
