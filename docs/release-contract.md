@@ -96,6 +96,24 @@ each asset by numeric asset ID, checks API and local SHA-256 values plus the
 checksum closure, then repeats the Release, tag, and ancestry checks after the
 downloads.
 
+The standalone resolver and source-attestation verifier also support explicit
+`--channel stable` for read-only source preparation. Their default remains
+`preview`: it requires a SemVer prerelease and `prerelease: true`. Stable
+inspection requires a strict version without a prerelease suffix and
+`prerelease: false`. Both commands reject build metadata, invalid numeric
+identifiers, and inconsistent source classification. The source-resolution
+receipt retains its existing schema with the exact tag, version, and
+classification; selecting a source channel does not authorize publishing it.
+
+Stable preparation must pass `--channel stable` to both
+`scripts/resolve-source-release.py` and `scripts/verify-source-attestations.py`.
+It retains the same numeric Release ID, immutable identity, seven-asset
+checksum closure, main ancestry, exact source SHA, and fixed signer-workflow
+checks. This is not a complete stable package preflight: the hosted workflow
+and its DEB/RPM metadata mapping still support preview only. The reviewed
+stable channel, signing, storage, bootstrap and publication gates remain
+disabled until their separate implementation and provisioning are complete.
+
 After those checks succeed, the resolver seals the public source assets as
 read-only files in a read-and-traverse-only directory (`0444` files and a
 `0555` directory). This preserves immutability while allowing the separately

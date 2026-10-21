@@ -232,7 +232,7 @@ class VerifySourceAttestationsTest(unittest.TestCase):
             ("repository", "attacker/repository", "repository is not trusted"),
             ("source_sha", "0" * 39, "invalid digest"),
             ("tag", "v3.1.0", "strict pre-release"),
-            ("prerelease", False, "must describe a pre-release"),
+            ("prerelease", False, "prerelease classification conflicts"),
             ("release_revalidated", False, "must be true"),
             ("tag_revalidated", False, "must be true"),
             ("main_ancestry_revalidated", False, "must be true"),

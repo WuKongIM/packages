@@ -25,7 +25,7 @@ SEMVER_RE = re.compile(
     r"^v(0|[1-9][0-9]*)\."
     r"(0|[1-9][0-9]*)\."
     r"(0|[1-9][0-9]*)"
-    r"-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)$"
+    r"(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$"
 )
 MAX_JSON_BYTES = 8 * 1024 * 1024
 TOP_LEVEL_KEYS = {
@@ -131,15 +131,22 @@ def _require_sha(value: Any, pattern: re.Pattern[str], label: str) -> str:
     return value
 
 
-def _parse_preview_tag(tag: Any, version: Any, prerelease: Any) -> tuple[str, str]:
+def _parse_source_tag(
+    tag: Any, version: Any, prerelease: Any, channel: str
+) -> tuple[str, str]:
     if not isinstance(tag, str):
         raise VerificationError("source receipt tag must be a string")
     if "+" in tag:
-        raise VerificationError("preview source tag must not contain build metadata")
+        raise VerificationError("source tag must not contain build metadata")
     match = SEMVER_RE.fullmatch(tag)
     if match is None:
+        raise VerificationError("source tag must be strict SemVer prefixed with v")
+    tag_is_prerelease = match.group(4) is not None
+    if channel == "preview" and not tag_is_prerelease:
         raise VerificationError("preview source tag must be strict pre-release SemVer")
-    for identifier in match.group(4).split("."):
+    if channel == "stable" and tag_is_prerelease:
+        raise VerificationError("stable source tag must not be a SemVer pre-release")
+    for identifier in (match.group(4) or "").split("."):
         if identifier.isdigit() and len(identifier) > 1 and identifier.startswith("0"):
             raise VerificationError(
                 "numeric SemVer pre-release identifiers must not have leading zeroes"
@@ -147,8 +154,8 @@ def _parse_preview_tag(tag: Any, version: Any, prerelease: Any) -> tuple[str, st
     expected_version = tag[1:]
     if version != expected_version:
         raise VerificationError("source receipt version does not match its tag")
-    if prerelease is not True:
-        raise VerificationError("source receipt must describe a pre-release")
+    if prerelease is not tag_is_prerelease:
+        raise VerificationError("source receipt prerelease classification conflicts with SemVer")
     return tag, expected_version
 
 
@@ -165,7 +172,7 @@ def _expected_names(version: str) -> tuple[tuple[str, ...], str]:
     return payloads, f"{prefix}_checksums.txt"
 
 
-def _validate_receipt(receipt: dict[str, Any]) -> dict[str, Any]:
+def _validate_receipt(receipt: dict[str, Any], channel: str) -> dict[str, Any]:
     _require_exact_keys(receipt, TOP_LEVEL_KEYS, "source receipt")
     if receipt["schema"] != SOURCE_RECEIPT_SCHEMA:
         raise VerificationError("source receipt schema is not supported")
@@ -174,8 +181,8 @@ def _validate_receipt(receipt: dict[str, Any]) -> dict[str, Any]:
     release_id = receipt["release_id"]
     if not isinstance(release_id, int) or isinstance(release_id, bool) or release_id <= 0:
         raise VerificationError("source receipt release_id must be a positive integer")
-    tag, version = _parse_preview_tag(
-        receipt["tag"], receipt["version"], receipt["prerelease"]
+    tag, version = _parse_source_tag(
+        receipt["tag"], receipt["version"], receipt["prerelease"], channel
     )
     source_sha = _require_sha(receipt["source_sha"], SHA1_RE, "source_sha")
     initial_main_sha = _require_sha(
@@ -420,9 +427,12 @@ def _verify_one_attestation(
 
 
 def verify_source_attestations(
-    *, receipt_path: Path, asset_dir: Path, evidence_dir: Path
+    *, receipt_path: Path, asset_dir: Path, evidence_dir: Path, channel: str = "preview"
 ) -> dict[str, Any]:
-    receipt = _validate_receipt(_read_safe_json(receipt_path, "source receipt"))
+    """Verify source evidence for one channel without authorizing publication."""
+    if channel not in {"preview", "stable"}:
+        raise VerificationError("source channel must be preview or stable")
+    receipt = _validate_receipt(_read_safe_json(receipt_path, "source receipt"), channel)
     _validate_asset_directory(asset_dir, receipt["assets"])
     created_evidence, evidence_metadata = _prepare_evidence_directory(
         evidence_dir, asset_dir
@@ -517,6 +527,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--receipt", required=True, type=Path)
     parser.add_argument("--asset-dir", required=True, type=Path)
     parser.add_argument("--evidence-dir", required=True, type=Path)
+    parser.add_argument(
+        "--channel",
+        choices=("preview", "stable"),
+        default="preview",
+        help="expected source classification; verification does not enable publication",
+    )
     return parser
 
 
@@ -527,6 +543,7 @@ def main(argv: list[str] | None = None) -> int:
             receipt_path=args.receipt,
             asset_dir=args.asset_dir,
             evidence_dir=args.evidence_dir,
+            channel=args.channel,
         )
     except VerificationError as error:
         print(f"source attestation verification failed: {error}", file=sys.stderr)
