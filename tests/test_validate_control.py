@@ -911,12 +911,16 @@ class ValidateControlTest(unittest.TestCase):
             self.assert_rejected(root, "private key material is forbidden: site/index.html")
 
     def test_rejects_stable_publication_on_pages(self) -> None:
-        with copied_control_root() as root:
-            channels = load_manifest(root, "channels.json")
-            channels["channels"]["stable"]["enabled"] = True
-            write_manifest(root, "channels.json", channels)
-
-            self.assert_rejected(root, "stable publishing must remain disabled on GitHub Pages")
+        for field, value, pattern in (
+            ("enabled", True, "stable publishing must remain disabled on GitHub Pages"),
+            ("status", "ready", "stable.status must remain object_storage_required"),
+            ("releases", [preview_release(version="3.1.0")], "stable releases must remain empty"),
+        ):
+            with self.subTest(field=field), copied_control_root() as root:
+                channels = load_manifest(root, "channels.json")
+                channels["channels"]["stable"][field] = value
+                write_manifest(root, "channels.json", channels)
+                self.assert_rejected(root, pattern)
 
     def test_accepts_digest_pinned_signing_toolchain(self) -> None:
         with copied_control_root() as root:

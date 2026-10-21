@@ -107,6 +107,13 @@ downloads all seven assets by numeric asset ID, verifies their exact checksum
 closure and fixed-workflow GitHub attestations, and inspects DEB/RPM metadata
 without executing either package payload.
 
+For read-only preparation of a stable source release, the standalone
+`resolve-source-release.py` and `verify-source-attestations.py` commands accept
+`--channel stable`. Both commands default to `preview` and reject a source from
+the other channel. This verifies source identity and provenance only; the
+hosted preflight, package metadata checks, signing, and publication workflows
+remain preview-only, and stable publication remains disabled.
+
 See [docs/release-contract.md](docs/release-contract.md) for the release,
 retention, signing, and recovery contracts.
 

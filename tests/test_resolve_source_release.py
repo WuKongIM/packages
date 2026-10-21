@@ -33,9 +33,17 @@ TAG = "v3.1.0-rc.1"
 
 
 class FixtureState:
-    def __init__(self) -> None:
-        names = sorted(path.name for path in FIXTURES.iterdir())
-        self.asset_bytes = {name: (FIXTURES / name).read_bytes() for name in names}
+    def __init__(self, tag: str = TAG, prerelease: bool = True) -> None:
+        # The resolver treats payloads as opaque bytes; only asset identities and
+        # their checksum manifest change for a different source version.
+        self.asset_bytes = {}
+        for path in FIXTURES.iterdir():
+            name = path.name.replace(TAG[1:], tag[1:])
+            data = path.read_bytes()
+            if name.endswith("_checksums.txt"):
+                data = data.replace(TAG[1:].encode(), tag[1:].encode())
+            self.asset_bytes[name] = data
+        names = sorted(self.asset_bytes)
         self.assets = []
         self.asset_name_by_id: dict[int, str] = {}
         for offset, name in enumerate(names, start=1):
@@ -50,8 +58,8 @@ class FixtureState:
                 }
             )
             self.asset_name_by_id[asset_id] = name
-        self.tag = TAG
-        self.prerelease = True
+        self.tag = tag
+        self.prerelease = prerelease
         self.draft = False
         self.immutable = True
         self.published_at = "2026-09-01T00:00:00Z"
@@ -116,12 +124,12 @@ class FixtureHandler(BaseHTTPRequestHandler):
         if self.path == f"{api_prefix}/releases/{RELEASE_ID}":
             self._json(state.release())
             return
-        if self.path == f"{api_prefix}/git/ref/tags/{TAG}":
+        if self.path == f"{api_prefix}/git/ref/tags/{state.tag}":
             if state.lightweight_tag:
                 obj = {"type": "commit", "sha": SOURCE_SHA}
             else:
                 obj = {"type": "tag", "sha": TAG_OBJECT_SHA}
-            self._json({"ref": f"refs/tags/{TAG}", "object": obj})
+            self._json({"ref": f"refs/tags/{state.tag}", "object": obj})
             return
         if self.path == f"{api_prefix}/git/tags/{TAG_OBJECT_SHA}":
             state.tag_object_calls += 1

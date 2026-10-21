@@ -67,6 +67,7 @@ def _require_sha1(value: Any, label: str) -> str:
 
 
 def parse_version(tag: str) -> tuple[str, bool]:
+    """Classify strict source SemVer without granting channel publication."""
     if "+" in tag:
         raise ResolutionError("source tag must not contain SemVer build metadata")
     match = SEMVER_RE.fullmatch(tag)
@@ -74,7 +75,7 @@ def parse_version(tag: str) -> tuple[str, bool]:
         raise ResolutionError("source tag must be strict SemVer prefixed with v")
     prerelease = match.group(4)
     if prerelease is None:
-        raise ResolutionError("preview source tag must be a SemVer pre-release")
+        return tag[1:], False
     for identifier in prerelease.split("."):
         if identifier.isdigit() and len(identifier) > 1 and identifier.startswith("0"):
             raise ResolutionError(
@@ -197,11 +198,17 @@ class GitHubReader:
             raise ResolutionError(f"asset {asset_id} download failed: {error}") from error
 
 
-def _release_snapshot(release: dict[str, Any], release_id: int) -> dict[str, Any]:
+def _release_snapshot(
+    release: dict[str, Any], release_id: int, channel: str
+) -> dict[str, Any]:
     if release.get("id") != release_id:
         raise ResolutionError("source Release id does not match the requested numeric id")
     tag = _require_string(release.get("tag_name"), "source Release tag_name")
     version, tag_is_prerelease = parse_version(tag)
+    if channel == "preview" and not tag_is_prerelease:
+        raise ResolutionError("preview source tag must be a SemVer pre-release")
+    if channel == "stable" and tag_is_prerelease:
+        raise ResolutionError("stable source tag must not be a SemVer pre-release")
     if _require_bool(release.get("draft"), "source Release draft"):
         raise ResolutionError("source Release must already be published")
     if not _require_bool(release.get("immutable"), "source Release immutable"):
@@ -389,7 +396,11 @@ def resolve_source_release(
     api_base_url: str,
     download_base_url: str,
     token: str | None,
+    channel: str = "preview",
 ) -> dict[str, Any]:
+    """Read one source release for the requested channel, without publishing it."""
+    if channel not in {"preview", "stable"}:
+        raise ResolutionError("source channel must be preview or stable")
     if not isinstance(release_id, int) or isinstance(release_id, bool) or release_id <= 0:
         raise ResolutionError("release id must be a positive integer")
     try:
@@ -409,7 +420,7 @@ def resolve_source_release(
     reader = GitHubReader(api_base_url, download_base_url, token)
     try:
         release_path = f"repos/{SOURCE_REPOSITORY}/releases/{release_id}"
-        initial = _release_snapshot(reader.api_json(release_path), release_id)
+        initial = _release_snapshot(reader.api_json(release_path), release_id, channel)
         source_sha = _peel_tag(reader, initial["tag"])
         initial_main_sha = _verify_main_ancestry(reader, source_sha)
 
@@ -422,7 +433,7 @@ def resolve_source_release(
             output_dir / initial["checksum_name"], initial["payload_names"], downloaded
         )
 
-        final = _release_snapshot(reader.api_json(release_path), release_id)
+        final = _release_snapshot(reader.api_json(release_path), release_id, channel)
         if final != initial:
             raise ResolutionError("source Release identity or asset set changed during resolution")
         final_source_sha = _peel_tag(reader, final["tag"])
@@ -473,6 +484,12 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--release-id", required=True, type=int, help="numeric GitHub Release id")
     parser.add_argument(
+        "--channel",
+        choices=("preview", "stable"),
+        default="preview",
+        help="expected source classification; read-only inspection does not enable publication",
+    )
+    parser.add_argument(
         "--output-dir",
         required=True,
         type=Path,
@@ -507,6 +524,7 @@ def main(argv: list[str] | None = None) -> int:
             api_base_url=args.api_base_url,
             download_base_url=download_base_url,
             token=token,
+            channel=args.channel,
         )
     except ResolutionError as error:
         print(f"source Release resolution failed: {error}", file=sys.stderr)
