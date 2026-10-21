@@ -138,6 +138,7 @@ def load_fixture(name: str, filename: str):
 def invoke(evidence: dict, name: str, command: list[str], environment: dict,
            *, reject: bool = False, case: bool = True) -> subprocess.CompletedProcess:
     """Record actual exit and bounded output facts, never child output or secrets."""
+    evidence['phase'] = name
     record = {'stage': name, 'program': Path(command[0]).name, 'exit_code': None,
               'expected_rejection': reject, 'timed_out': False}
     evidence['commands'].append(record)
@@ -282,7 +283,9 @@ def only(paths) -> Path:
 
 
 def pipeline(scratch: Path, trusted: Path, evidence: dict, env: dict) -> None:
+    evidence['phase'] = 'source-fixture'
     source = fixture_source(scratch)
+    evidence['phase'] = 'key-fixture-import'
     keys = load_fixture('stable_candidate_test_keys', 'test_validate_signing_material.py')
     private = scratch / 'private-test-keys'
     factory = keys.TestKeyFactory(private)
@@ -290,6 +293,7 @@ def pipeline(scratch: Path, trusted: Path, evidence: dict, env: dict) -> None:
     unsigned, composed = scratch / 'unsigned', scratch / 'composed'
     bad_signatures = {}
     try:
+        evidence['phase'] = 'test-key-generation'
         control, generated = generate_control(scratch, factory, keys)
         shared = common(control, source)
         channels = control / 'manifests/channels.json'
@@ -476,11 +480,14 @@ def main(argv: list[str] | None = None) -> int:
                     'secret_tree_removed_before_verification': False, 'production_keys_used': False,
                     'payloads_executed': False, 'published': False, 'source_provenance_verified': False,
                     'checked_in_control_unchanged': False,
-                    'cases': [], 'commands': [], 'failure': None, 'started_at_unix': int(time.time())}
+                    'phase': 'preflight', 'cases': [], 'commands': [], 'failure': None,
+                    'started_at_unix': int(time.time())}
         scratch = None
         old_environment = dict(os.environ)
         try:
-            with tempfile.TemporaryDirectory(prefix='wk-stable-candidate-TEST-ONLY-', dir='/tmp') as tmp:
+            # Leave room for all GnuPG Unix-domain socket suffixes under the
+            # fixture factory's nested homes on both Linux and macOS.
+            with tempfile.TemporaryDirectory(prefix='wk-sc-', dir='/tmp') as tmp:
                 scratch = Path(tmp).resolve()
                 require(sys.platform.startswith('linux') and os.geteuid() != 0,
                         'native candidate requires the isolated non-root Linux container')
@@ -504,7 +511,7 @@ def main(argv: list[str] | None = None) -> int:
         except Exception as error:
             # Child output/private GPG diagnostics never enter the public receipt.
             evidence['failure'] = {'type': type(error).__name__,
-                                   'stage': evidence['commands'][-1]['stage'] if evidence['commands'] else 'preflight'}
+                                   'stage': evidence['phase']}
         finally:
             os.environ.clear(); os.environ.update(old_environment)
             evidence['scratch_removed'] = scratch is not None and not scratch.exists()
