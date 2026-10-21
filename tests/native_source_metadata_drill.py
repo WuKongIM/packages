@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -31,30 +32,75 @@ def run(command: list[str], *, environment: dict | None = None) -> str:
     return result.stdout.strip()
 
 
+def validate_binary_payloads(binary_payloads: dict[str, Path]) -> None:
+    """Bound explicit Linux amd64 executables before creating any package input."""
+    if set(binary_payloads) != {"wukongim", "wkcli"}:
+        raise RuntimeError("binary payload names must be exactly wukongim and wkcli")
+    for path in binary_payloads.values():
+        try:
+            info = path.lstat()
+            if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                    or not info.st_mode & 0o111 or not 64 <= info.st_size <= 256 * 1024 * 1024):
+                raise RuntimeError("binary payload must be a bounded nonlinked executable")
+            with path.open("rb") as stream:
+                header = stream.read(64)
+        except OSError:
+            raise RuntimeError("binary payload is unavailable") from None
+        if (header[:7] != b"\x7fELF\x02\x01\x01" or header[16:18] not in (b"\x02\x00", b"\x03\x00")
+                or header[18:20] != b"\x3e\x00"):
+            raise RuntimeError("binary payload must be a Linux amd64 ELF executable")
+
+
 def build_packages(root: Path, deb_version: str, rpm_version: str,
-                   *, epoch: int = 0) -> tuple[Path, Path]:
-    """Build data-only fixtures; neither package contains an executable payload."""
+                   *, epoch: int = 0,
+                   binary_payloads: dict[str, Path] | None = None) -> tuple[Path, Path]:
+    """Build data-only defaults, or package explicit TEST ONLY product binaries."""
+    if binary_payloads is not None:
+        validate_binary_payloads(binary_payloads)
     deb_root = root / "deb"
     (deb_root / "DEBIAN").mkdir(parents=True)
     (deb_root / "DEBIAN/control").write_text(
         f"Package: wukongim\nVersion: {deb_version}\nArchitecture: amd64\n"
         "Maintainer: TEST ONLY <test-only@invalid>\nDescription: TEST ONLY metadata fixture\n"
+        + ("Depends: systemd\n" if binary_payloads is not None else "")
     )
     data = deb_root / "usr/share/doc/wukongim/TEST-ONLY"
     data.parent.mkdir(parents=True)
     data.write_text("TEST ONLY, no product binary\n")
+    if binary_payloads is not None:
+        data.write_text("TEST ONLY compiled product fixture, not a release\n")
+        binaries = deb_root / "usr/bin"
+        binaries.mkdir(parents=True)
+        for name, path in binary_payloads.items():
+            shutil.copyfile(path, binaries / name)
+            (binaries / name).chmod(0o755)
     deb = root / "fixture.deb"
     run(["dpkg-deb", "--build", "--root-owner-group", str(deb_root), str(deb)])
     top = root / "rpmbuild"
     top.mkdir()
+    if binary_payloads is not None:
+        sources = top / "SOURCES"
+        sources.mkdir()
+        for name, path in binary_payloads.items():
+            shutil.copyfile(path, sources / name)
     spec = root / "fixture.spec"
     spec.write_text(
         f"Name: wukongim\nVersion: {rpm_version}\nRelease: 1\nEpoch: {epoch}\n"
         "Summary: TEST ONLY metadata fixture\nLicense: Apache-2.0\nBuildArch: x86_64\n"
-        "%description\nTEST ONLY, no product binary.\n"
-        "%install\nmkdir -p %{buildroot}/usr/share/doc/wukongim\n"
-        "printf 'TEST ONLY, no product binary\\n' > %{buildroot}/usr/share/doc/wukongim/TEST-ONLY\n"
-        "%files\n/usr/share/doc/wukongim/TEST-ONLY\n"
+        + ("Requires: systemd\n%global __os_install_post %{nil}\n%global debug_package %{nil}\n"
+           if binary_payloads is not None else "")
+        + ("%description\nTEST ONLY compiled product fixture, not a release.\n"
+           if binary_payloads is not None else "%description\nTEST ONLY, no product binary.\n")
+        + "%install\nmkdir -p %{buildroot}/usr/share/doc/wukongim\n"
+        + ("printf 'TEST ONLY compiled product fixture, not a release\\n' > %{buildroot}/usr/share/doc/wukongim/TEST-ONLY\n"
+           if binary_payloads is not None else
+           "printf 'TEST ONLY, no product binary\\n' > %{buildroot}/usr/share/doc/wukongim/TEST-ONLY\n")
+        + ("mkdir -p %{buildroot}/usr/bin\n"
+           "install -m 0755 %{_sourcedir}/wukongim %{buildroot}/usr/bin/wukongim\n"
+           "install -m 0755 %{_sourcedir}/wkcli %{buildroot}/usr/bin/wkcli\n"
+           if binary_payloads is not None else "")
+        + "%files\n/usr/share/doc/wukongim/TEST-ONLY\n"
+        + ("/usr/bin/wukongim\n/usr/bin/wkcli\n" if binary_payloads is not None else "")
     )
     run(["rpmbuild", "-bb", "--define", f"_topdir {top}",
          "--define", f"_tmppath {root}", "--define", "_build_id_links none", str(spec)])

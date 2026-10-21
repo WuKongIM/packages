@@ -237,3 +237,88 @@ jobs:
         if: always()
         shell: bash
         run: git diff --exit-code HEAD -- . ':!.trusted'
+
+  stable-clients:
+    name: TEST ONLY stable four clients and A/B
+    if: github.repository == 'WuKongIM/packages'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Check out exact package client control
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Check out immutable trusted repository tools
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: WuKongIM/WuKongIM
+          ref: ed7e67d8f781b4f92872e42116c11b304fe03b5c
+          path: .trusted/wukongim
+          persist-credentials: false
+
+      - name: Check out exact TEST ONLY product build source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: WuKongIM/WuKongIM
+          ref: fc18221282f289088ec9b4282fda8e0bfc67a3b8
+          path: .product/wukongim
+          persist-credentials: false
+
+      - name: Prepare fixed product Go toolchain
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: "1.25.11"
+          cache-dependency-path: .product/wukongim/go.sum
+          cache: true
+
+      - name: Prepare host verification tools and pinned images
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends gnupg gpgv rpm dpkg zstd
+          ./tests/contract.sh
+          test "$(git -C .trusted/wukongim rev-parse HEAD)" = "$(jq -r .commit manifests/trusted-toolchain.json)"
+          jq -r '.files | to_entries[] | "\(.value)  .trusted/wukongim/\(.key)"' \
+            manifests/trusted-toolchain.json | sha256sum --check --strict
+          python3 - <<'PY' > "$RUNNER_TEMP/stable-client-images.txt"
+          import importlib.util,json
+          spec=importlib.util.spec_from_file_location('clients','scripts/validate-production-package-clients.py')
+          clients=importlib.util.module_from_spec(spec);spec.loader.exec_module(clients)
+          signing=json.load(open('manifests/signing-toolchain.json'))
+          assert signing['enabled'] is True
+          print(signing['image']+'@'+signing['digest'])
+          for _,image in clients.APT_CLIENTS+clients.RPM_CLIENTS: print(image)
+          PY
+          while IFS= read -r image; do docker pull --platform linux/amd64 "$image"; done < "$RUNNER_TEMP/stable-client-images.txt"
+
+      - name: Exercise signed TEST ONLY stable clients and exact installed CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          output="$RUNNER_TEMP/stable-clients-native"
+          mkdir "$output"
+          timeout --signal=TERM --kill-after=45s 55m \
+            python3 -B tests/native_stable_clients_drill.py \
+              --output-dir "$output" --product-root "$GITHUB_WORKSPACE/.product/wukongim" \
+              --product-sha fc18221282f289088ec9b4282fda8e0bfc67a3b8 \
+              --trusted-root "$GITHUB_WORKSPACE/.trusted/wukongim"
+          jq -e '.test_only == true and .passed == true and .cleanup.verified == true and (.cases | length) == 49 and all(.cases[]; .passed == true)' \
+            "$output/native-stable-clients.json" >/dev/null
+
+      - name: Preserve public stable client evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-stable-four-clients-test-only
+          path: |
+            ${{ runner.temp }}/stable-clients-native/*.json
+            ${{ runner.temp }}/stable-clients-native/https-requests.jsonl
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Reject tracked client-control mutation
+        if: always()
+        shell: bash
+        run: git diff --exit-code HEAD -- . ':!.trusted' ':!.product'

@@ -93,3 +93,49 @@ composite planning, deterministic repetition, retained-generation validation,
 and rejection without the test opt-in. Any transport failure fails the whole drill. Its stable DEB/RPM signatures
 are real native signatures; its preview transport fixture is explicitly
 structural and is not reported as native preview signature acceptance.
+
+## Stable native clients and retained generations
+
+The package client validator has an explicit stable mode. Supply the reviewed
+v2 composite transport inputs, both reviewed stable public certificates, the
+canonical HTTPS origin, an exact release version, and `--verify-installed-cli`.
+The host must provide `gpg`, `gpgv`, `rpm`, `rpmkeys`, `dpkg-deb`, and `zstd`.
+It repeats the existing candidate signature and closure verification in the
+same process; it does not trust a caller-supplied `verified` receipt. Tool
+versions, the transport input and plan digests, the candidate, downloads and
+installed CLI results are recorded separately from GitHub provenance.
+
+Stable bootstrap inventory comes from the immutable stable snapshot, not the
+preview root manifest or status. Native APT reads stable sources and by-hash;
+native DNF reads the packaged mirrorlist with TLS, metadata and package
+signature checks enabled. There is no baseurl fallback. Each download client
+has a 300-second limit and each installed client retains its existing
+600-second limit and full server/wkcli identity, bench, query and migration
+checks. Download-only consistency tests do not pass the production stable gate.
+
+The independent Linux TEST ONLY job builds real server and wkcli binaries from
+fixed source `fc18221282f289088ec9b4282fda8e0bfc67a3b8`, using Go 1.25.11 and
+explicit test versions 3.0.0/3.0.1. Those versions are test build parameters, not
+source Release or attestation claims. A/B share disposable public keys but use
+bootstrap 1.1.1/1.1.2, avoiding conflicting independently signed bytes under one
+immutable URL. Production bootstrap controls remain unchanged. Test private
+keys are destroyed before public fixture export and host verification.
+
+The four digest-pinned Ubuntu, Debian, Rocky Linux and AlmaLinux download
+clients use an internal Docker network and an ephemeral CA for the exact
+`packages.githubim.com` name. A deterministic server switches after serving A's
+InRelease or mirrorlist; retained by-hash and immutable RPM objects remain A.
+Request logs expose the actual URLs, response digests and cache conditionals.
+Separate cases cover persistent caches and missing/corrupt retained objects,
+TLS rejection, redirect escape, interrupted responses, and exact-target/source
+identity rejection. Installed CLI containers use ordinary distro dependency
+networking and only the already authenticated local product package; that
+traffic is not part of the isolated A/B proof.
+
+The driver records and removes only its own container/network IDs. Controlled
+failure, timeout and TERM attempt cleanup and publish the independent cleanup
+result. Host loss or SIGKILL cannot guarantee a final receipt. Public artifacts
+contain bounded JSON and request logs, not private keys or package trees.
+These tests do not enable stable, create public Releases, activate storage, or
+prove global CDN atomicity. Actual public-origin verification of the exact
+published stable version remains a release requirement.
