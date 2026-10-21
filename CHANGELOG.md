@@ -4,6 +4,8 @@
 
 - Add explicit stable four-client acceptance with required installed CLI checks
   and isolated TEST ONLY A/B repository switching; stable publication remains disabled.
+- Retain stable SHA512 index aliases for native APT generation switching,
+  preserving existing signatures, archives and client hash preferences.
 
 - Add explicit stable audit sealing with fresh source/control verification and offline composite transport planning; keep stable disabled and production publication unconnected.
 

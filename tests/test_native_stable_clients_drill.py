@@ -1,11 +1,16 @@
 """Lightweight boundaries for the opt-in native stable client laboratory."""
 import importlib.util
+import http.client
+import hashlib
 import json
 import os
 from pathlib import Path
+import socket
+import ssl
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -21,6 +26,90 @@ def load():
 
 
 class NativeStableClientsTests(unittest.TestCase):
+    def test_https_normal_response_has_authenticated_tls_eof(self):
+        """Exercise the actual fixture server with strict OpenSSL EOF handling."""
+        drill = load()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            subprocess.run(['openssl', 'req', '-x509', '-newkey', 'rsa:2048', '-nodes',
+                '-keyout', str(root / 'tls.key'), '-out', str(root / 'tls.crt'),
+                '-days', '1', '-subj', '/CN=packages.githubim.com',
+                '-addext', 'subjectAltName=DNS:packages.githubim.com'],
+                check=True, capture_output=True, timeout=10)
+            # This case only needs the normal SNI context; both files remain TEST ONLY.
+            (root / 'wrong-name.crt').write_bytes((root / 'tls.crt').read_bytes())
+            (root / 'wrong-name.key').write_bytes((root / 'tls.key').read_bytes())
+            body = b'TEST ONLY complete signed-metadata transport bytes\n'
+            (root / 'body').write_bytes(body)
+            (root / 'routes.json').write_text(json.dumps({'A': {drill.INRELEASE: {'file': 'body'}}, 'B': {}}))
+            (root / 'state.json').write_text(json.dumps({'serial': 1, 'generation': 'A', 'mode': 'normal'}))
+            ready, servers, failures = threading.Event(), [], []
+            class LoopbackServer(drill.ThreadingHTTPServer):
+                def __init__(self, address, handler):
+                    super().__init__(('127.0.0.1', 0), handler)
+                    servers.append(self)
+                def serve_forever(self):
+                    ready.set()
+                    super().serve_forever(poll_interval=0.01)
+            def serve():
+                try:
+                    drill.serve(root)
+                except BaseException as error:
+                    failures.append(error)
+                    ready.set()
+            with mock.patch.object(drill, 'ThreadingHTTPServer', LoopbackServer):
+                thread = threading.Thread(target=serve, daemon=True)
+                thread.start()
+                try:
+                    self.assertTrue(ready.wait(5), 'TEST ONLY server did not become ready')
+                    self.assertEqual(failures, [])
+                    context = ssl.create_default_context(cafile=str(root / 'tls.crt'))
+                    with socket.create_connection(servers[0].server_address, timeout=5) as raw:
+                        with context.wrap_socket(raw, server_hostname='packages.githubim.com',
+                                                 suppress_ragged_eofs=False) as connection:
+                            connection.sendall(b'GET /apt/dists/stable/InRelease HTTP/1.0\r\nHost: packages.githubim.com\r\n\r\n')
+                            response = bytearray()
+                            eof_error = None
+                            try:
+                                while chunk := connection.recv(4096):
+                                    response.extend(chunk)
+                                    self.assertLess(len(response), 65536)
+                            except ssl.SSLEOFError as error:
+                                eof_error = error
+                            headers, actual = bytes(response).split(b'\r\n\r\n', 1)
+                            self.assertIn(b'200 OK', headers)
+                            self.assertIn(('Content-Length: ' + str(len(body))).encode(), headers)
+                            self.assertEqual(actual, body)
+                            self.assertIsNone(eof_error, 'strict TLS EOF after complete valid HTTP response: ' + str(eof_error))
+                            connection.unwrap()
+                    # A protocol-correct close must not weaken certificate
+                    # verification or turn the deliberate short body into success.
+                    for client_context, hostname in ((context, 'wrong-name.invalid'),
+                                                     (ssl.create_default_context(), 'packages.githubim.com')):
+                        with socket.create_connection(servers[0].server_address, timeout=5) as raw:
+                            with self.assertRaises(ssl.SSLCertVerificationError):
+                                client_context.wrap_socket(raw, server_hostname=hostname)
+                    (root / 'state.json').write_text(json.dumps({'serial': 2, 'generation': 'A', 'mode': 'disconnect'}))
+                    with socket.create_connection(servers[0].server_address, timeout=5) as raw:
+                        with context.wrap_socket(raw, server_hostname='packages.githubim.com',
+                                                 suppress_ragged_eofs=False) as connection:
+                            connection.sendall(b'GET /apt/dists/stable/InRelease HTTP/1.0\r\nHost: packages.githubim.com\r\n\r\n')
+                            response = http.client.HTTPResponse(connection)
+                            response.begin()
+                            with self.assertRaises(http.client.IncompleteRead) as rejected:
+                                response.read()
+                            self.assertEqual(rejected.exception.partial, body)
+                            self.assertEqual(rejected.exception.expected, 7)
+                            response.close()
+                            connection.unwrap()
+                    self.assertFalse((root / 'server-error').exists())
+                finally:
+                    if servers and thread.is_alive():
+                        servers[0].shutdown()
+                    thread.join(5)
+                    self.assertFalse(thread.is_alive(), 'TEST ONLY server leaked')
+                self.assertEqual(failures, [])
+
     def test_native_ci_keeps_independent_fixed_source_read_only_job(self):
         workflow = (ROOT / '.github/workflows/native-package-repository-drill.yml').read_text()
         self.assertIn('\n  stable-clients:\n', workflow)
@@ -278,6 +367,143 @@ class NativeStableClientsTests(unittest.TestCase):
             status, raw, headers = route.response('/apt/by-hash/SHA256/a', {})
             self.assertEqual(status, 200)
             self.assertEqual(route.response('/apt/by-hash/SHA256/a', {'If-None-Match': headers['ETag']})[0], 304)
+
+    def test_both_apt_hash_algorithms_retain_a_and_inject_real_faults(self):
+        drill = load()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for name, raw in (('ai', b'A release'), ('bi', b'B release'),
+                              ('ah', b'A index'), ('bh', b'B index')):
+                (root / name).write_bytes(raw)
+            for algorithm in ('SHA256', 'SHA512'):
+                digest = lambda raw: hashlib.new(algorithm.lower(), raw).hexdigest()
+                prefix = '/apt/dists/stable/main/binary-amd64/'
+                a_path = prefix + 'by-hash/' + algorithm + '/' + digest(b'A index')
+                b_path = prefix + 'by-hash/' + algorithm + '/' + digest(b'B index')
+                mutable = prefix + 'Packages.gz'
+                maps = {'A': {drill.INRELEASE: {'file': 'ai'}, a_path: {'file': 'ah'}, mutable: {'file': 'ah'}},
+                        'B': {drill.INRELEASE: {'file': 'bi'}, a_path: {'file': 'ah'},
+                              b_path: {'file': 'bh'}, mutable: {'file': 'bh'}}}
+                for serial, mode in enumerate(('apt-switch', 'missing-byhash', 'corrupt-byhash'), 1):
+                    with self.subTest(algorithm=algorithm, mode=mode):
+                        route = drill.RouteTable(root, maps)
+                        route.configure({'serial': serial, 'generation': 'A', 'mode': mode})
+                        self.assertEqual(route.response(drill.INRELEASE, {})[1], b'A release')
+                        self.assertEqual(route.generation, 'B')
+                        status, raw, _ = route.response(a_path, {})
+                        if mode == 'apt-switch':
+                            self.assertEqual((status, raw), (200, b'A index'))
+                            self.assertEqual(route.response(b_path, {})[1], b'B index')
+                        elif mode == 'missing-byhash':
+                            self.assertEqual((status, raw), (404, b''))
+                        else:
+                            self.assertEqual(status, 200)
+                            self.assertNotEqual(digest(raw), digest(b'A index'))
+                        # The mutable fallback has B bytes and cannot satisfy the
+                        # A release. An unplanned alias must remain a real 404.
+                        self.assertEqual(route.response(mutable, {})[1], b'B index')
+                        unplanned = prefix + 'by-hash/' + algorithm + '/' + digest(b'not planned')
+                        self.assertEqual(route.response(unplanned, {})[0], 404)
+
+    def test_native_apt_proof_recognizes_only_supported_immutable_paths(self):
+        drill = load()
+        prefix = '/apt/dists/stable/main/binary-amd64/'
+        for algorithm in ('SHA256', 'SHA512'):
+            digest = hashlib.new(algorithm.lower(), b'index').hexdigest()
+            self.assertTrue(drill.apt_by_hash_path(prefix + 'by-hash/' + algorithm + '/' + digest))
+        for path in (prefix + 'Packages.gz', prefix + 'Packages',
+                     prefix + 'by-hash/SHA1/' + 'a' * 40,
+                     prefix + 'by-hash/SHA512/' + 'a' * 64,
+                     prefix + 'by-hash/SHA256/' + 'a' * 64 + '?mutable=1'):
+            self.assertFalse(drill.apt_by_hash_path(path), path)
+
+    def test_by_hash_rejection_requires_the_actual_fault_response(self):
+        drill = load()
+        corrupt_sha = hashlib.sha256(b'changed authenticated index\n').hexdigest()
+        for algorithm in ('SHA256', 'SHA512'):
+            path = '/apt/dists/stable/main/binary-amd64/by-hash/' + algorithm + '/' + hashlib.new(algorithm.lower(), b'A index').hexdigest()
+            for mode, status, digest in (('missing-byhash', 404, hashlib.sha256(b'').hexdigest()),
+                                         ('corrupt-byhash', 200, corrupt_sha)):
+                diagnostic = '404 Not Found' if mode == 'missing-byhash' else 'Hash Sum mismatch'
+                valid = {'path': path, 'status': status, 'sha256': digest, 'response_write_completed': True}
+                with self.subTest(algorithm=algorithm, mode=mode):
+                    self.assertEqual(drill.verify_apt_by_hash_fault(mode, [valid], diagnostic), valid)
+                false_receipts = [[], [{'path': drill.INRELEASE, 'status': status, 'sha256': digest}],
+                    [dict(valid, path='/apt/dists/stable/main/binary-amd64/Packages.gz')],
+                    [dict(valid, status=200 if status == 404 else 404)],
+                    [dict(valid, response_write_completed=False)],
+                    [{key: value for key, value in valid.items() if key != 'response_write_completed'}]]
+                if mode == 'corrupt-byhash':
+                    false_receipts.append([dict(valid, sha256=hashlib.sha256(b'A index').hexdigest())])
+                for observed in false_receipts:
+                    with self.subTest(algorithm=algorithm, mode=mode, observed=observed):
+                        with self.assertRaisesRegex(RuntimeError, 'by-hash fault response'):
+                            drill.verify_apt_by_hash_fault(mode, observed, diagnostic)
+
+    def test_by_hash_fault_diagnostics_require_apt_status_or_integrity_failure(self):
+        drill = load()
+        path = '/apt/dists/stable/main/binary-amd64/by-hash/SHA512/' + 'a' * 128
+        integrity = ('Hash Sum mismatch', 'File has unexpected size (28 != 605). Mirror sync in progress?', 'Size mismatch')
+        for mode in ('missing-byhash', 'corrupt-byhash'):
+            receipt = {'path': path, 'status': 404 if mode == 'missing-byhash' else 200,
+                       'sha256': hashlib.sha256(drill.CORRUPT_APT_INDEX).hexdigest(), 'response_write_completed': True}
+            for text in (*integrity, *(('404 Not Found [IP: 127.0.0.1 443]',) if mode == 'missing-byhash' else ())):
+                with self.subTest(mode=mode, accepted=text):
+                    self.assertEqual(drill.verify_apt_by_hash_fault(mode, [receipt], text), receipt)
+            diagnostics = ['OpenSSL error: unexpected eof while reading', 'SSL connection failed before response',
+                           'Failed to fetch authenticated index', 'Could not resolve host', 'GPG signature failure',
+                           'checksum could not be read', 'downloaded 4040 bytes before TLS failure']
+            if mode == 'corrupt-byhash':
+                diagnostics.append('404 Not Found')
+            for text in diagnostics:
+                with self.subTest(mode=mode, rejected=text):
+                    with self.assertRaisesRegex(RuntimeError, 'APT fault diagnostic'):
+                        drill.verify_apt_by_hash_fault(mode, [receipt], text)
+
+    def test_handler_fault_receipts_require_successful_write_and_flush(self):
+        """Run the actual handler with failures at each transport write boundary."""
+        drill = load()
+        for mode in ('missing-byhash', 'corrupt-byhash'):
+            for failure in ('send_response', 'end_headers', 'write', 'flush', None):
+                with self.subTest(mode=mode, failure=failure), tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    path = '/apt/dists/stable/main/binary-amd64/by-hash/SHA512/' + 'a' * 128
+                    (root / 'body').write_bytes(b'original index')
+                    (root / 'routes.json').write_text(json.dumps({'A': {path: {'file': 'body'}}, 'B': {}}))
+                    (root / 'state.json').write_text(json.dumps({'serial': 1, 'generation': 'A', 'mode': mode}))
+                    calls = []
+                    def boundary(name):
+                        calls.append(name)
+                        if name == failure:
+                            raise BrokenPipeError('injected transport failure at ' + name)
+                    class Transport:
+                        headers = {}
+                        def send_response(self, _): boundary('send_response')
+                        def send_header(self, *_): pass
+                        def end_headers(self): boundary('end_headers')
+                    class Writer:
+                        def write(self, raw):
+                            boundary('write')
+                            return len(raw)
+                        def flush(self): boundary('flush')
+                    transport = Transport(); transport.path = path; transport.wfile = Writer()
+                    class Server:
+                        def __init__(self, address, handler):
+                            self.handler, self.count, self.socket = handler, 0, object()
+                            transport.server = self
+                        def serve_forever(self): self.handler.do_GET(transport)
+                        def server_close(self): pass
+                    with mock.patch.object(drill, 'ThreadingHTTPServer', Server), mock.patch.object(drill.ssl, 'SSLContext'):
+                        drill.serve(root)
+                    observed = [json.loads(line) for line in (root / 'requests.jsonl').read_text().splitlines()]
+                    self.assertEqual(len(observed), 1)
+                    self.assertIs(observed[0].get('response_write_completed'), failure is None)
+                    if failure is None:
+                        self.assertEqual(calls, ['send_response', 'end_headers', 'write', 'flush'])
+                    else:
+                        self.assertEqual(calls[-1], failure)
+                        with self.assertRaisesRegex(RuntimeError, 'by-hash fault response'):
+                            drill.verify_apt_by_hash_fault(mode, observed, 'Hash Sum mismatch')
 
     def test_cleanup_only_uses_recorded_ids_and_reports_inspection_errors(self):
         drill = load()

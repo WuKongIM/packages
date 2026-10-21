@@ -72,6 +72,11 @@ snapshot path. Current preview continues to own `/repo`, `/index.html`,
 not replace those shared entries, and no `/repo-stable` installer is emitted.
 Stable APT/by-hash/payloads and versioned bootstrap downloads use canonical paths.
 Conflicting bytes at the same public URI fail rather than selecting a winner.
+For the two already verified stable APT indexes, the composite planner retains
+SHA512 aliases alongside the archived SHA256 paths so native clients can use
+their default hash preference across a generation switch. Each additional alias
+copies the original authenticated archive member; signed metadata, archives and
+the preview-only planner are unchanged.
 
 The only derived object is a no-store stable RPM mirrorlist pointing to the
 complete immutable snapshot RPM base URL. Its exact UTF-8 bytes, size and digest
@@ -125,6 +130,9 @@ The four digest-pinned Ubuntu, Debian, Rocky Linux and AlmaLinux download
 clients use an internal Docker network and an ephemeral CA for the exact
 `packages.githubim.com` name. A deterministic server switches after serving A's
 InRelease or mirrorlist; retained by-hash and immutable RPM objects remain A.
+The HTTPS fixture completes bounded TLS shutdown, including `close_notify`;
+intentional truncation still fails the declared HTTP response length. APT faults
+cover both supported by-hash algorithms without forcing a client hash choice.
 Request logs expose the actual URLs, response digests and cache conditionals.
 Separate cases cover persistent caches and missing/corrupt retained objects,
 TLS rejection, redirect escape, interrupted responses, and exact-target/source

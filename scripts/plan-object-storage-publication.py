@@ -370,6 +370,17 @@ def _stable_snapshot(item: dict[str, Any], base: Path, test_only: bool) -> dict[
             objects.append({'object_key':prefix+'/'+name,**facts,
                 'cache_control':'no-store' if name.startswith('site/') and name[5:] not in immutable else IMMUTABLE_CACHE,
                 'source':{'audit_release_id':item['audit_release_id'],'channel':'stable','member':name}})
+        # Native verification above authenticates every Release hash section.
+        # Expose the SHA512 URLs preferred by APT without changing archive bytes.
+        derived_aliases=[]
+        for filename in ('Packages','Packages.gz'):
+            name='apt/dists/stable/main/binary-amd64/'+filename
+            raw=C.read_checked(root/'site'/name,'stable APT transport index',
+                               expected=files[name],maximum_bytes=C.MAX_METADATA_BYTES)
+            alias='apt/dists/stable/main/binary-amd64/by-hash/SHA512/'+hashlib.sha512(raw).hexdigest()
+            derived_aliases.append({'public_uri':'/'+alias,'object_key':'public/'+alias,
+                **files[name],'cache_control':IMMUTABLE_CACHE,
+                'source':{'audit_release_id':item['audit_release_id'],'channel':'stable','member':'site/'+name}})
     require(checked_file(archive,'stable archive',maximum_bytes=archive_facts['size'],expected_size=archive_facts['size'])==archive_facts,
             'stable archive changed during planning')
     require(P.candidate_identity(plan,receipt,test_only=test_only)==candidate,
@@ -377,7 +388,7 @@ def _stable_snapshot(item: dict[str, Any], base: Path, test_only: bool) -> dict[
     return {'identity':{'channel':'stable','audit_release_id':item['audit_release_id'],
         'seal_control_sha':item['seal_control_sha'],'candidate':candidate,
         'resolution_sha256':item['resolution_sha256']},'prefix':prefix,'objects':objects,
-        'files':files,'immutable':immutable}
+        'files':files,'immutable':immutable,'derived_aliases':derived_aliases}
 
 
 def make_composite_plan(input_path: Path, test_only: bool, output_path: Path | None = None) -> dict[str, Any]:
@@ -427,16 +438,21 @@ def make_composite_plan(input_path: Path, test_only: bool, output_path: Path | N
         snapshots.append(snapshot)
     preview,stable=snapshots[:2]
     aliases={}
+    def add_alias(value: dict[str, Any]) -> None:
+        path=value['public_uri'][1:]
+        if path in aliases:
+            require(all(aliases[path][key]==value[key] for key in ('object_key','sha256','size','cache_control')),
+                    'immutable URI conflict across snapshots: /'+path)
+        else: aliases[path]=value
     for snapshot in snapshots:
         for path in sorted(snapshot['immutable']):
             facts=snapshot['files'][path]
             value={'public_uri':'/'+path,'object_key':'public/'+path,**facts,'cache_control':IMMUTABLE_CACHE,
                 'source':{'audit_release_id':snapshot['identity']['audit_release_id'],
                           'channel':snapshot['identity']['channel'],'member':'site/'+path}}
-            if path in aliases:
-                require(all(aliases[path][key]==value[key] for key in ('object_key','sha256','size','cache_control')),
-                        'immutable URI conflict across snapshots: /'+path)
-            else: aliases[path]=value
+            add_alias(value)
+        for value in snapshot.get('derived_aliases',[]):
+            add_alias(value)
     entrypoints=[]
     for snapshot in (preview,stable):
         for path,facts in sorted(snapshot['files'].items()):
