@@ -91,6 +91,40 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
 
+      - name: Sign and independently verify real TEST ONLY local file inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          jq -e '.enabled == true' manifests/signing-toolchain.json >/dev/null
+          image="$(jq -r '.image + "@" + .digest' manifests/signing-toolchain.json)"
+          signing_output="$RUNNER_TEMP/local-signing-native"
+          mkdir "$signing_output"
+          chmod 0777 "$signing_output"
+          container="wk-local-signing-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          trap 'docker rm --force "$container" >/dev/null 2>&1 || true' EXIT
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
+          timeout --signal=TERM --kill-after=10s 8m docker run --rm --name "$container" \
+            --platform linux/amd64 --network none --read-only --cap-drop ALL \
+            --security-opt no-new-privileges --user 65532:65532 \
+            --cpus 1 --memory 512m --pids-limit 128 \
+            --tmpfs /tmp:rw,nosuid,nodev,size=268435456 \
+            --volume "$GITHUB_WORKSPACE:/control:ro" \
+            --volume "$signing_output:/evidence" \
+            --workdir /tmp "$image" \
+            python3 -B /control/tests/native_local_signing_drill.py --output-dir /evidence
+          jq -e '.test_only == true and .passed == true and .secret_tree_removed_before_verification == true and (.cases | length) == 10 and all(.cases[]; .passed == true)' \
+            "$signing_output/native-local-signing.json" >/dev/null
+
+      - name: Preserve TEST ONLY native local signing evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-local-signing-test-only
+          path: ${{ runner.temp }}/local-signing-native/native-local-signing.json
+          if-no-files-found: warn
+          retention-days: 30
+
       - name: Set up fixed GoReleaser toolchain
         uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:

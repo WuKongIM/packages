@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Accept encrypted current-subkey and passphrase files for local family signing,
+  retaining the existing CI environment inputs and verification, with native
+  TEST ONLY signing regression coverage. Document Mac local stable-key custody;
+  stable publication remains disabled.
+
 - Add an offline, preview-only object-storage transport planner with explicit
   identity anchors and cross-generation dependency retention. It does not sign,
   upload, activate or enable stable publication.

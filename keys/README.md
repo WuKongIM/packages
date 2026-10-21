@@ -38,10 +38,27 @@ production certificate must already include its next subkey. Private primary
 keys, private subkeys, passphrases, revocation certificates, and test keys
 remain forbidden here.
 
-Production APT and RPM secret subkeys and passphrases may exist only as the
-fixed secrets in their corresponding protected signing Environment. They must
-not be copied to repository-level or organization-level secrets, or into the
-other package-family Environment.
+Preview CI current signing-subkey exports and their passphrases may exist only
+as the fixed secrets in their corresponding protected signing Environment.
+They must not be copied to repository-level or organization-level secrets, or
+into the other package-family Environment. This restriction on CI exports does
+not move operator-retained primary/next keys or backups into GitHub. Stable
+private keys use the accepted local Mac custody model, with encrypted backups
+on the Mac or NAS, and never enter GitHub-hosted CI; see the
+[release contract](../docs/release-contract.md). This is an online-workstation
+model, not an offline-signing claim.
+
+For local signing, `scripts/sign-package-family.py` accepts exactly one of
+`--secret-subkey-base64-file`, `--secret-subkey-base64-stdin`, or the existing
+`--secret-subkey-base64-env`, and exactly one of `--passphrase-file` or
+`--passphrase-env`. Files pass the same validator as CI inputs: secret files
+must be ordinary single-link files with no group/other permissions (use mode
+0600), and the base64 input must contain only the encrypted current sign-only
+subkey export. A full primary/next backup is not a signing input. Keep these
+files outside the repository, public output tree, and artifact directories;
+the tool does not retrieve credentials, generate keys, or publish its output.
+The existing public-certificate, exact signer, SHA-256, and atomic-output checks
+apply to every input method.
 
 The publisher copies these exact certificate bytes to the stable public paths
 `/keys/apt-preview.asc` and `/keys/rpm-preview.asc` and records their SHA-256,
