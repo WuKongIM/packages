@@ -238,6 +238,78 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
 
+      - name: Prepare verified native SDK object fixtures
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="$(jq -r '.image + "@" + .digest' manifests/signing-toolchain.json)"
+          fixture_output="$RUNNER_TEMP/native-delivery-fixture"
+          sdk_work="$RUNNER_TEMP/native-sdk-work"
+          sdk_evidence="$RUNNER_TEMP/native-sdk-evidence"
+          mkdir "$sdk_work" "$sdk_evidence"
+          chmod 0777 "$sdk_work" "$sdk_evidence"
+          container="wk-native-sdk-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          trap 'docker rm --force "$container" >/dev/null 2>&1 || true' EXIT
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
+          timeout --signal=TERM --kill-after=10s 15m docker run --rm --name "$container" \
+            --platform linux/amd64 --init --network none --read-only --cap-drop ALL \
+            --security-opt no-new-privileges --user 65532:65532 \
+            --cpus 1 --memory 512m --pids-limit 128 \
+            --tmpfs /tmp:rw,nosuid,nodev,size=536870912 \
+            --volume "$GITHUB_WORKSPACE:/control:ro" \
+            --volume "$fixture_output:$fixture_output:ro" \
+            --volume "$sdk_work:$sdk_work" --volume "$sdk_evidence:$sdk_evidence" \
+            --workdir /tmp "$image" \
+            python3 -B /control/tests/provider_sdk/native_object_delivery_sdk_drill.py prepare \
+            --public-dir "$fixture_output" --work-dir "$sdk_work" \
+            --expected-export-source "$GITHUB_SHA" --source-sha "$GITHUB_SHA" \
+            --output "$sdk_evidence/native-preparation.json"
+          jq -e --arg source "$GITHUB_SHA" '.passed == true and .source_sha == $source and .state == "native_prepared" and (.cases | length) == 2' \
+            "$sdk_evidence/native-preparation.json" >/dev/null
+
+      - name: Verify all native objects through the locked SDK HTTP fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdk_work="$RUNNER_TEMP/native-sdk-work"
+          sdk_evidence="$RUNNER_TEMP/native-sdk-evidence"
+          python3 -m venv "$RUNNER_TEMP/native-sdk-venv"
+          timeout 240 "$RUNNER_TEMP/native-sdk-venv/bin/python" -m pip install --require-hashes -r requirements-object-storage-provider.lock
+          bundle_sha="$(jq -er '.bundle_sha256' "$sdk_evidence/native-preparation.json")"
+          timeout 300 "$RUNNER_TEMP/native-sdk-venv/bin/python" -B tests/provider_sdk/native_object_delivery_sdk_drill.py sdk \
+            --bundle "$sdk_work/bundle.json" --bundle-sha256 "$bundle_sha" \
+            --source-sha "$GITHUB_SHA" --output "$sdk_evidence/native-sdk-result.json"
+          jq -e --arg source "$GITHUB_SHA" '.test_only == true and .source_sha == $source and .passed == true and .skips == 0 and (.cases | length) == 20 and all(.cases[]; .passed == true) and .state == "fixture_complete" and .stage == "sdk_fixture_complete" and .scratch_removed == true and all(.verification[]; . == false)' \
+            "$sdk_evidence/native-sdk-result.json" >/dev/null
+
+      - name: Remove owned native SDK fixture work
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdk_work="$RUNNER_TEMP/native-sdk-work"
+          container="wk-native-sdk-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          docker rm --force "$container" >/dev/null 2>&1 || true
+          remaining="$(docker container ls --all --filter "name=^/${container}$" --format '{{.Names}}')"
+          test -z "$remaining"
+          rm -rf -- "$sdk_work" "$RUNNER_TEMP/native-sdk-venv"
+          mkdir -p "$RUNNER_TEMP/native-sdk-evidence"
+          test ! -e "$sdk_work"
+          printf '%s\n' '{"owned_work_removed":true,"owned_container_removed":true}' > "$RUNNER_TEMP/native-sdk-evidence/cleanup.json"
+
+      - name: Preserve bounded native SDK fixture receipts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-object-delivery-sdk-test-only
+          path: |
+            ${{ runner.temp }}/native-sdk-evidence/native-preparation.json
+            ${{ runner.temp }}/native-sdk-evidence/native-sdk-result.json
+            ${{ runner.temp }}/native-sdk-evidence/cleanup.json
+          if-no-files-found: error
+          retention-days: 7
+
       - name: Set up fixed GoReleaser toolchain
         uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:

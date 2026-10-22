@@ -214,4 +214,133 @@ class FreshPreviewWire(unittest.TestCase):
                 with self.assertRaises(ValueError):self.verify(previous=first)
 
 
+class NativeSdkWorkflowContract(unittest.TestCase):
+    def test_native_sdk_reuses_public_exports_with_bounded_two_phase_cleanup(self):
+        text=(ROOT/'.github/workflows/native-package-repository-drill.yml').read_text()
+        start=text.index('      - name: Prepare verified native SDK object fixtures')
+        end=text.index('      - name: Set up fixed GoReleaser toolchain',start)
+        block=text[start:end]
+        self.assertLess(text.index('native_object_delivery_fixture_drill.py'),start)
+        for required in ('native_object_delivery_sdk_drill.py prepare','native_object_delivery_sdk_drill.py sdk',
+                         '--init','--network none','--read-only','--user 65532:65532','--cpus 1 --memory 512m --pids-limit 128',
+                         'size=536870912','15m docker run','timeout 240','--require-hashes','timeout 300',
+                         '--expected-export-source "$GITHUB_SHA"','--bundle-sha256','--source-sha "$GITHUB_SHA"',
+                         'native-delivery-fixture','native-sdk-result.json','if: always()',
+                         'if-no-files-found: error','docker rm --force','rm -rf -- "$sdk_work"'):
+            self.assertIn(required,block)
+        for forbidden in ('export_delivery_generations','secrets.','id-token:','actions: write','continue-on-error:'):
+            self.assertNotIn(forbidden,block)
+        self.assertIn('timeout-minutes: 60',text)
+
+    def test_native_sdk_cleanup_rejects_docker_observation_failure(self):
+        import os
+        import subprocess
+        text=(ROOT/'.github/workflows/native-package-repository-drill.yml').read_text()
+        start=text.index('      - name: Remove owned native SDK fixture work')
+        end=text.index('      - name:',start+10)
+        block=text[start:end];body=block.split('        run: |\n',1)[1]
+        script='\n'.join(line[10:] for line in body.splitlines() if line.startswith('          '))
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);binary=root/'bin';binary.mkdir();docker=binary/'docker'
+            docker.write_text('#!/bin/sh\nexit 41\n');docker.chmod(0o755)
+            env={**os.environ,'PATH':str(binary)+':'+os.environ['PATH'],'RUNNER_TEMP':str(root),
+                 'GITHUB_RUN_ID':'fixture','GITHUB_RUN_ATTEMPT':'1'}
+            result=subprocess.run(['bash','-c',script],env=env,capture_output=True,timeout=10)
+            self.assertNotEqual(result.returncode,0)
+            self.assertFalse((root/'native-sdk-evidence/cleanup.json').exists())
+            docker.write_text('#!/bin/sh\nexit 0\n')
+            result=subprocess.run(['bash','-c',script],env=env,capture_output=True,timeout=10)
+            self.assertEqual(result.returncode,0,result.stderr)
+            self.assertEqual(json.loads((root/'native-sdk-evidence/cleanup.json').read_text()),
+                             {'owned_work_removed':True,'owned_container_removed':True})
+
+    def test_native_sdk_guard_cannot_be_swallowed_by_refusal_or_provider_error(self):
+        import sys
+        import gc
+        import warnings
+        spec=importlib.util.spec_from_file_location('native_sdk_drill',ROOT/'tests/provider_sdk/native_object_delivery_sdk_drill.py')
+        driver=importlib.util.module_from_spec(spec);spec.loader.exec_module(driver)
+        for mode in ('clean','refused','converted','primary_error'):
+            with self.subTest(mode=mode),tempfile.TemporaryDirectory() as temp:
+                root=Path(temp);work=root/'native-sdk-work';work.mkdir();bundle=work/'bundle.json';bundle.write_text('{}');output=root/'receipt.json'
+                def attempted_connection():
+                    with socket.socket() as probe:
+                        probe.settimeout(1)
+                        probe.connect(('127.0.0.1',9))
+                def cases(args,report):
+                    if mode in ('refused','primary_error'):
+                        driver.refused(attempted_connection)
+                    elif mode=='converted':
+                        def wrapped():
+                            try:attempted_connection()
+                            except Exception:raise ValueError('SDK converted refusal') from None
+                        driver.refused(wrapped)
+                    if mode=='primary_error':raise KeyError('original stage error')
+                    report['cases']=[{'case':name,'passed':True} for name in driver.CASES[:19]]
+                argv=['driver','sdk','--source-sha',HEAD,'--bundle',str(bundle),'--bundle-sha256','0'*64,'--output',str(output)]
+                with warnings.catch_warnings(record=True) as observed:
+                    warnings.simplefilter('always',ResourceWarning)
+                    with mock.patch.object(sys,'argv',argv),mock.patch.object(driver,'sdk_cases',side_effect=cases):code=driver.main()
+                    gc.collect()
+                self.assertEqual([str(item.message) for item in observed if issubclass(item.category,ResourceWarning)],[])
+                report=json.loads(output.read_bytes());self.assertEqual(code,0 if mode=='clean' else 1)
+                self.assertEqual(report['network_guard'],{'self_check_attempts':1,'unexpected_attempts':0 if mode=='clean' else 1,'passed':mode=='clean'})
+                if mode=='primary_error':self.assertEqual(report['error_type'],'KeyError')
+                self.assertTrue(report['scratch_removed'])
+
+    def test_native_sdk_cleanup_failure_preserves_original_error_and_finite_receipt(self):
+        import sys
+        spec=importlib.util.spec_from_file_location('native_sdk_drill',ROOT/'tests/provider_sdk/native_object_delivery_sdk_drill.py')
+        driver=importlib.util.module_from_spec(spec);spec.loader.exec_module(driver)
+        for original,cleanup in ((True,'raise'),(False,'raise'),(True,'noop')):
+            with self.subTest(original=original,cleanup=cleanup),tempfile.TemporaryDirectory() as temp:
+                root=Path(temp);work=root/'native-sdk-work';work.mkdir();bundle=work/'bundle.json';bundle.write_text('{}');output=root/'receipt.json'
+                def cases(args,report):
+                    report['object_put_attempts']=7
+                    if original:raise KeyError('original stage error')
+                    report['cases']=[{'case':name,'passed':True} for name in driver.CASES[:19]]
+                argv=['driver','sdk','--source-sha',HEAD,'--bundle',str(bundle),'--bundle-sha256','0'*64,'--output',str(output)]
+                outer=None
+                with mock.patch.object(sys,'argv',argv),mock.patch.object(driver,'sdk_cases',side_effect=cases),mock.patch.object(driver.shutil,'rmtree',side_effect=PermissionError('cleanup failed') if cleanup=='raise' else None):
+                    try:code=driver.main()
+                    except Exception as error:outer=type(error).__name__
+                self.assertIsNone(outer);self.assertEqual(code,1);self.assertTrue(output.is_file())
+                report=json.loads(output.read_bytes());self.assertEqual(report['state'],'incomplete');self.assertFalse(report['passed'])
+                self.assertEqual(report['object_put_attempts'],7);self.assertFalse(report['scratch_removed'])
+                self.assertEqual(report['cleanup']['error_type'],'PermissionError' if cleanup=='raise' else 'CleanupIncomplete')
+                if original:self.assertEqual(report['error_type'],'KeyError')
+                self.assertLess(output.stat().st_size,8*1024*1024)
+
+    def test_native_sdk_oversize_evidence_still_emits_incomplete_receipt(self):
+        import sys
+        spec=importlib.util.spec_from_file_location('native_sdk_drill',ROOT/'tests/provider_sdk/native_object_delivery_sdk_drill.py')
+        driver=importlib.util.module_from_spec(spec);spec.loader.exec_module(driver)
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);work=root/'native-sdk-work';work.mkdir();bundle=work/'bundle.json';bundle.write_text('{}');output=root/'receipt.json'
+            def cases(args,report):
+                report['excessive_evidence']='x'*(8*1024*1024)
+                report['object_put_attempts']=7
+                raise KeyError('original stage error')
+            argv=['driver','sdk','--source-sha',HEAD,'--bundle',str(bundle),'--bundle-sha256','0'*64,'--output',str(output)]
+            outer=None
+            with mock.patch.object(sys,'argv',argv),mock.patch.object(driver,'sdk_cases',side_effect=cases):
+                try:code=driver.main()
+                except Exception as error:outer=type(error).__name__
+            self.assertIsNone(outer);self.assertEqual(code,1);report=json.loads(output.read_bytes())
+            self.assertFalse(report['passed']);self.assertEqual(report['state'],'incomplete')
+            self.assertEqual(report['error_type'],'KeyError');self.assertEqual(report['receipt_error'],'ReceiptLimit')
+            self.assertEqual(report['object_put_attempts'],7);self.assertLess(output.stat().st_size,8*1024*1024)
+
+    def test_native_sdk_driver_is_explicit_test_only_and_ci_requires_all_cases(self):
+        text=(ROOT/'.github/workflows/native-package-repository-drill.yml').read_text()
+        self.assertIn('(.cases | length) == 20',text)
+        self.assertIn('.state == "fixture_complete"',text)
+        self.assertIn('.stage == "sdk_fixture_complete"',text)
+        self.assertIn('.scratch_removed == true',text)
+        spec=importlib.util.spec_from_file_location('native_sdk_drill',ROOT/'tests/provider_sdk/native_object_delivery_sdk_drill.py')
+        driver=importlib.util.module_from_spec(spec);spec.loader.exec_module(driver)
+        self.assertEqual(len(driver.CASES),20)
+        self.assertEqual(len(set(driver.CASES)),20)
+
+
 if __name__=='__main__':unittest.main()

@@ -171,6 +171,60 @@ class Wire(BaseAdapter):
         return response
 
 
+class RefreshWire(Wire):
+    """Observed aggregate shape: one exact URL per row, repeated task ID."""
+    def __init__(self, mode='aggregate', fault=None):
+        super().__init__(); self.mode=mode; self.fault=fault; self.rows=[]; self.submissions=0
+
+    def send(self, request, **kwargs):
+        q=parse_qs(urlsplit(request.url).query,keep_blank_values=True)
+        if request.body:
+            q.update(parse_qs(request.body.decode() if isinstance(request.body,bytes) else request.body))
+        action=q.get('Action',[''])[0]
+        if action not in ('RefreshObjectCaches','DescribeRefreshTaskById'):
+            return super().send(request,**kwargs)
+        self.requests.append((request,kwargs,action,q)); result={'RequestId':'fixture-aggregate-request'}
+        if action=='RefreshObjectCaches':
+            self.submissions+=1; ids=[]
+            for url in q['ObjectPath'][0].split('\n'):
+                number=len(self.rows)
+                task=str(33643947491 if self.mode=='aggregate' else (601 if number<25 else 501 if number<75 else 701) if self.mode=='overlap' else 501+number//2 if self.mode=='pairs' else 501+number)
+                if task not in ids:ids.append(task)
+                self.rows.append(dict(TaskId=task,ObjectPath=url,ObjectType='file',Status='Complete',Process='100%'))
+            if self.fault=='submit_timeout' and self.submissions==2:raise requests.ReadTimeout(TOKEN)
+            if self.fault=='submit_ids':ids=['0']
+            if self.fault=='duplicate_ids':ids+=ids
+            result['RefreshTaskId']=','.join(ids)
+        else:
+            self.polls+=1; group=q['TaskId'][0].split(',')
+            selected=[{'501':'521','521':'501'}.get(task,task) for task in group] if self.fault=='swap_groups' else group
+            rows=copy.deepcopy([row for row in self.rows if row['TaskId'] in selected])
+            if self.fault=='missing':rows=rows[:-1]
+            elif self.fault=='duplicate':rows+=rows[:1]
+            elif self.fault=='foreign_id':rows[0]['TaskId']='999999'
+            elif self.fault=='foreign_url':rows[0]['ObjectPath']='https://packages.githubim.com/foreign'
+            elif self.fault=='unused_id':rows=[row for row in rows if row['TaskId']!=group[-1]]
+            elif self.fault=='directory':rows[0]['ObjectType']='directory'
+            elif self.fault=='newline_shape':rows[0]['ObjectPath']+='\nhttps://packages.githubim.com/foreign'
+            elif self.fault=='mapping_drift':
+                if self.polls==1:rows[0]['Status']='Refreshing'
+                else:rows[0]['TaskId'],rows[-1]['TaskId']=rows[-1]['TaskId'],rows[0]['TaskId']
+            elif self.fault=='query_timeout':raise requests.ReadTimeout(TOKEN)
+            result.update(Tasks=rows,TotalCount=len(rows)+(1 if self.fault=='total' else 0))
+            if self.fault=='missing_total':del result['TotalCount']
+            if self.fault=='boolean_total':result['TotalCount']=True
+            if self.fault=='string_total':result['TotalCount']=str(len(rows))
+            if self.fault=='dict_tasks':result['Tasks']={}
+            if self.fault=='nonobject_row':result['Tasks']=['bad']
+            if self.fault=='other_group_id':result['Tasks'][0]['TaskId']='521'
+            if self.fault=='cumulative_rows':
+                result['Tasks']=[{**row,'TaskId':group[i%len(group)]} for i,row in enumerate(self.rows)]
+                result['TotalCount']=len(result['Tasks'])
+        response=requests.Response(); response.status_code=200; response.headers['Content-Type']='application/json'
+        response.request=request; response.url=request.url; response.raw=io.BytesIO(json.dumps(result).encode()); response._content=False
+        return response
+
+
 class ProviderContract(unittest.TestCase):
     def setUp(self):
         self.socket_guard=mock.patch.object(socket.socket,'connect',side_effect=AssertionError('provider network forbidden'))
@@ -399,10 +453,95 @@ class ProviderContract(unittest.TestCase):
         self.w.refresh_fault='progress';self.w.polls=0
         self.assertEqual(self.client.refresh(['https://packages.githubim.com/repo'],max_polls=2,poll_interval=0)['state'],'tasks_complete')
 
-    def test_refresh_foreign_or_directory_urls_rejected_without_write(self):
-        for urls in (['https://other.invalid/repo'],['https://packages.githubim.com/'],['https://packages.githubim.com/repo?x=1'],['https://packages.githubim.com/repo']*2):
+    def test_refresh_foreign_or_ambiguous_file_urls_rejected_without_write(self):
+        # Root/trailing slash File support is covered by the observed aggregate test.
+        for urls in (['https://other.invalid/repo'],['https://packages.githubim.com/repo?x=1'],['https://packages.githubim.com/repo']*2):
             with self.assertRaises(self.p.ProviderError):self.client.refresh(urls,max_polls=1,poll_interval=0)
         self.assertFalse(self.writes())
+
+    def refresh_client(self, mode='aggregate', fault=None):
+        wire=RefreshWire(mode,fault)
+        client=self.p.Provider(resource=RESOURCE,access_key_id='FIXTURE-AK',access_key_secret=SECRET,security_token=TOKEN,http_adapter=wire)
+        self.addCleanup(client.close);return client,wire
+
+    def test_refresh_observed_four_file_urls_share_one_task_including_root(self):
+        client,wire=self.refresh_client()
+        urls=['https://packages.githubim.com'+path for path in ('/','/zh/','/en/','/api/search')]
+        result=client.refresh(urls,max_polls=1,poll_interval=0)
+        self.assertEqual(result['state'],'tasks_complete');self.assertEqual(result['task_ids'],['33643947491'])
+        self.assertEqual([r[3]['ObjectType'] for r in wire.requests if r[2]=='RefreshObjectCaches'],[['File']])
+        self.assertEqual([row['ObjectPath'] for row in wire.rows],urls)
+        for key in self.p.FALSE_FIELDS:self.assertFalse(result[key])
+
+    def test_refresh_all_native_urls_submit_before_aggregate_query_without_omission(self):
+        client,wire=self.refresh_client()
+        urls=['https://packages.githubim.com'+row['public_uri'] for row in native_routes_fixture()['generations']['A']['delivery.json']['routes']]
+        result=client.refresh(urls,max_polls=1,poll_interval=0)
+        submits=[r for r in wire.requests if r[2]=='RefreshObjectCaches']
+        self.assertEqual([len(r[3]['ObjectPath'][0].split('\n')) for r in submits],[50,50,50,28])
+        self.assertEqual([url for r in submits for url in r[3]['ObjectPath'][0].split('\n')],urls)
+        self.assertEqual([r[2] for r in wire.requests if r[2] in ('RefreshObjectCaches','DescribeRefreshTaskById')],['RefreshObjectCaches']*4+['DescribeRefreshTaskById'])
+        self.assertEqual(result['task_ids'],['33643947491'])
+
+    def test_refresh_aggregate_pairs_and_legacy_independent_ids_keep_query_limit(self):
+        urls=['https://packages.githubim.com/p'+str(i) for i in range(52)]
+        for mode,count,batches in (('pairs',26,[10,10,6]),('unique',52,[10,10,10,10,10,2])):
+            with self.subTest(mode=mode):
+                client,wire=self.refresh_client(mode)
+                result=client.refresh(urls,max_polls=1,poll_interval=0)
+                self.assertEqual(result['task_ids'],[str(501+i) for i in range(count)])
+                self.assertEqual([len(r[3]['TaskId'][0].split(',')) for r in wire.requests if r[2]=='DescribeRefreshTaskById'],batches)
+
+    def test_refresh_full_set_bounds_and_all_urls_preflight_before_any_submit(self):
+        client,wire=self.refresh_client();prefix='https://packages.githubim.com'
+        for urls in ([],[prefix+'/p'+str(i) for i in range(1001)],
+                     [prefix+'/ok']*2,[prefix+'/p'+str(i) for i in range(50)]+[prefix+'/bad?'],*([prefix+'/ok',prefix+path] for path in ('//','/a//','/a/../','/a/./','/a?x=1','/a?','/a#f','/a#','/a\n','/a\r','/a\t','/ a','/%2f'))):
+            with self.subTest(urls=urls[:2]),self.assertRaises(self.p.ProviderError):client.refresh(urls,max_polls=1,poll_interval=0)
+        self.assertFalse([r for r in wire.requests if r[2]=='RefreshObjectCaches'])
+        urls=[prefix+'/p'+str(i) for i in range(1000)]
+        self.assertEqual(client.refresh(urls,max_polls=1,poll_interval=0)['state'],'tasks_complete')
+        self.assertEqual(wire.submissions,20)
+
+    def test_refresh_aggregate_coverage_totalcount_and_foreign_rows_fail_closed(self):
+        urls=['https://packages.githubim.com/p'+str(i) for i in range(4)]
+        for fault in ('missing','duplicate','foreign_id','foreign_url','unused_id','directory','newline_shape','total','missing_total','boolean_total','string_total','dict_tasks','nonobject_row','mapping_drift'):
+            with self.subTest(fault=fault):
+                client,wire=self.refresh_client('pairs',fault)
+                with self.assertRaises(self.p.ProviderError):client.refresh(urls,max_polls=2,poll_interval=0)
+                self.assertEqual(wire.submissions,1);self.assertLessEqual(wire.polls,2)
+
+    def test_refresh_rejects_ids_from_another_query_group(self):
+        client,wire=self.refresh_client('pairs','swap_groups')
+        urls=['https://packages.githubim.com/p'+str(i) for i in range(52)]
+        with self.assertRaises(self.p.ProviderError):client.refresh(urls,max_polls=1,poll_interval=0)
+        self.assertEqual(wire.submissions,2);self.assertEqual(wire.polls,1)
+
+    def test_refresh_cross_batch_partial_id_overlap_preserves_first_seen_order(self):
+        client,wire=self.refresh_client('overlap')
+        urls=['https://packages.githubim.com/p'+str(i) for i in range(100)]
+        result=client.refresh(urls,max_polls=1,poll_interval=0)
+        self.assertEqual(result['task_ids'],['601','501','701'])
+        self.assertEqual([r[3]['TaskId'][0] for r in wire.requests if r[2]=='DescribeRefreshTaskById'],['601,501,701'])
+        self.assertEqual(wire.submissions,2)
+
+    def test_refresh_preserves_poll_bounds_and_rejects_cumulative_rows_early(self):
+        client,wire=self.refresh_client()
+        for kwargs in ({'max_polls':11},{'poll_interval':6}):
+            with self.subTest(kwargs=kwargs),self.assertRaises(self.p.ProviderError):
+                client.refresh(['https://packages.githubim.com/p'],**kwargs)
+        self.assertFalse([row for row in wire.requests if row[2]=='RefreshObjectCaches'])
+        client,wire=self.refresh_client('unique','cumulative_rows')
+        urls=['https://packages.githubim.com/p'+str(i) for i in range(51)]
+        with self.assertRaises(self.p.ProviderError):client.refresh(urls,max_polls=1,poll_interval=0)
+        self.assertEqual(wire.submissions,2);self.assertEqual(wire.polls,2)
+
+    def test_refresh_unknown_submit_and_query_never_repeat_sideeffects(self):
+        urls=['https://packages.githubim.com/p'+str(i) for i in range(51)]
+        for fault,count in (('submit_timeout',2),('query_timeout',2),('submit_ids',1),('duplicate_ids',1)):
+            with self.subTest(fault=fault):
+                client,wire=self.refresh_client('aggregate',fault)
+                with self.assertRaises(self.p.ProviderError):client.refresh(urls,max_polls=2,poll_interval=0)
+                self.assertEqual(wire.submissions,count)
 
 
     def test_native_route_fixture_has_exact_public_provenance_and_object_facts(self):
@@ -577,6 +716,116 @@ class ProviderContract(unittest.TestCase):
                 values=[route('/p'+str(i)) for i in range(51)] if fault=='cap' else rows
                 with self.assertRaises(self.p.ProviderError):self.client.apply_rewrites(values,before=before,managed_ids=[])
                 self.assertFalse(self.writes())
+
+
+    def test_native_sdk_failure_receipt_retains_observed_attempts_without_secrets(self):
+        spec=importlib.util.spec_from_file_location('native_sdk_drill',ROOT/'tests/provider_sdk/native_object_delivery_sdk_drill.py')
+        driver=importlib.util.module_from_spec(spec);spec.loader.exec_module(driver)
+        self.client.put_create_only(KEY,self.path,FACTS)
+        self.w.batch_fault='timeout';result=self.client.apply_rewrites([route()],before=self.client.read_configuration(),managed_ids=[])
+        self.assertEqual(result['state'],'incomplete')
+        report={'state':'incomplete'};driver.record_attempts(report,[self.w])
+        self.assertEqual(report['object_put_attempts'],1)
+        self.assertEqual([row['action'] for row in report['sdk_transport_observations']],['object','BatchSetCdnDomainConfig'])
+        self.assertNotIn(SECRET,json.dumps(report));self.assertNotIn(TOKEN,json.dumps(report))
+        self.assertEqual(report['state'],'incomplete')
+
+    def test_native_sdk_evidence_keeps_actual_object_bytes_eof_and_source_identity(self):
+        spec=importlib.util.spec_from_file_location('native_sdk_drill',ROOT/'tests/provider_sdk/native_object_delivery_sdk_drill.py')
+        driver=importlib.util.module_from_spec(spec);spec.loader.exec_module(driver)
+        for fault in (None,'truncated','interrupted','cache'):
+            with self.subTest(fault=fault):
+                wire=Wire();wire.get_fault=fault;adapter=driver.ObservedAdapter(wire)
+                client=self.p.Provider(resource=RESOURCE,access_key_id='FIXTURE-AK',access_key_secret=SECRET,security_token=TOKEN,http_adapter=adapter)
+                self.addCleanup(client.close)
+                detail={'kind':'object','generation':'A','object':{'object_key':KEY,**FACTS,'source':{'audit_release_id':4242,'member':'site/example.rpm'}}}
+                action=lambda:driver.observe_operation(adapter,detail,lambda:client.put_create_only(KEY,self.path,FACTS))
+                if fault:
+                    with self.assertRaises(self.p.ProviderError):action()
+                else:action()
+                report={};driver.record_attempts(report,[adapter]);operation=report['operation_receipts'][0]
+                self.assertEqual(operation['object'],detail['object'])
+                self.assertEqual(operation['state'],'incomplete' if fault else 'complete')
+                put=next(row for row in report['sdk_exchange_observations'] if row['method']=='PUT')
+                get=next(row for row in report['sdk_exchange_observations'] if row['method']=='GET' and row['object_key']==KEY)
+                self.assertEqual(put['request_body']['sha256'],FACTS['sha256'])
+                self.assertEqual(put['request']['forbid_overwrite'],'true')
+                self.assertEqual(get['response']['cache_control'],'wrong' if fault=='cache' else FACTS['cache_control'])
+                if fault in ('interrupted','cache'):self.assertFalse(get['stream']['eof']);self.assertEqual(get['stream']['bytes_read'],0)
+                else:
+                    expected=DATA[:-1] if fault else DATA
+                    self.assertTrue(get['stream']['eof']);self.assertEqual(get['stream']['bytes_read'],len(expected))
+                    self.assertEqual(get['stream']['sha256'],hashlib.sha256(expected).hexdigest())
+                if not fault:self.assertEqual({key:operation['result']['readback'][key] for key in FACTS},FACTS)
+                self.assertNotIn(SECRET,json.dumps(report));self.assertNotIn(TOKEN,json.dumps(report))
+                self.assertLess(len(json.dumps(report)),8*1024*1024)
+
+    def test_native_sdk_observation_does_not_infer_eof_or_lose_timeout_attempt(self):
+        spec=importlib.util.spec_from_file_location('native_sdk_drill',ROOT/'tests/provider_sdk/native_object_delivery_sdk_drill.py')
+        driver=importlib.util.module_from_spec(spec);spec.loader.exec_module(driver)
+        wire=Wire();wire.objects[KEY]=(DATA,FACTS['cache_control']);adapter=driver.ObservedAdapter(wire)
+        request=requests.Request('GET','https://fixture-package-bucket.oss-cn-hangzhou.aliyuncs.com/'+KEY).prepare()
+        response=adapter.send(request);self.assertEqual(response.raw.read(0),b'');response.close()
+        report={};driver.record_attempts(report,[adapter]);stream=report['sdk_exchange_observations'][0]['stream']
+        self.assertFalse(stream['eof']);self.assertEqual(stream['bytes_read'],0)
+        wire=Wire();wire.put_fault='timeout_after';adapter=driver.ObservedAdapter(wire)
+        client=self.p.Provider(resource=RESOURCE,access_key_id='FIXTURE-AK',access_key_secret=SECRET,security_token=TOKEN,http_adapter=adapter);self.addCleanup(client.close)
+        result=client.put_create_only(KEY,self.path,FACTS);self.assertEqual(result['outcome'],'unknown_readback_verified')
+        report={};driver.record_attempts(report,[adapter]);put=next(row for row in report['sdk_exchange_observations'] if row['method']=='PUT')
+        self.assertEqual(put['error_type'],'ReadTimeout');self.assertNotIn('response',put)
+        self.assertEqual(put['request_body']['sha256'],FACTS['sha256']);self.assertEqual(report['object_put_attempts'],1)
+
+    def test_native_sdk_evidence_keeps_actual_config_and_refresh_responses_on_failure(self):
+        spec=importlib.util.spec_from_file_location('native_sdk_drill',ROOT/'tests/provider_sdk/native_object_delivery_sdk_drill.py')
+        driver=importlib.util.module_from_spec(spec);spec.loader.exec_module(driver)
+        urls=['https://packages.githubim.com'+path for path in ('/','/zh/','/en/','/api/search')]
+        for fault,count in (('missing',3),('duplicate',5)):
+            with self.subTest(fault=fault):
+                wire=RefreshWire(fault=fault);adapter=driver.ObservedAdapter(wire)
+                client=self.p.Provider(resource=RESOURCE,access_key_id='FIXTURE-AK',access_key_secret=SECRET,security_token=TOKEN,http_adapter=adapter);self.addCleanup(client.close)
+                with self.assertRaises(self.p.ProviderError):
+                    driver.observe_operation(adapter,{'kind':'refresh','urls':urls},lambda:client.refresh(urls,max_polls=1,poll_interval=0))
+                report={};driver.record_attempts(report,[adapter]);exchanges=report['sdk_exchange_observations']
+                submitted=next(row for row in exchanges if row['action']=='RefreshObjectCaches')
+                response=next(row for row in exchanges if row['action']=='DescribeRefreshTaskById')['response']
+                self.assertEqual(submitted['request']['ObjectPath'],urls)
+                self.assertEqual(response['TotalCount'],count);self.assertEqual(len(response['Tasks']),count)
+                self.assertEqual(len(wire.rows),4);self.assertEqual(report['operation_receipts'][0]['state'],'incomplete')
+                self.assertNotIn(SECRET,json.dumps(report));self.assertNotIn(TOKEN,json.dumps(report))
+        wire=Wire();wire.batch_fault='timeout';adapter=driver.ObservedAdapter(wire)
+        client=self.p.Provider(resource=RESOURCE,access_key_id='FIXTURE-AK',access_key_secret=SECRET,security_token=TOKEN,http_adapter=adapter);self.addCleanup(client.close)
+        before=client.read_configuration();result=driver.observe_operation(adapter,{'kind':'config','before':before},lambda:client.apply_rewrites([route()],before=before,managed_ids=[]))
+        report={};driver.record_attempts(report,[adapter]);self.assertEqual(result['state'],'incomplete')
+        snapshots=[row['response']['DomainConfigs']['DomainConfig'] for row in report['sdk_exchange_observations'] if row['action']=='DescribeCdnDomainConfigs']
+        self.assertEqual(len(snapshots[0]),4);self.assertEqual(len(snapshots[-1]),5)
+        batch=next(row for row in report['sdk_exchange_observations'] if row['action']=='BatchSetCdnDomainConfig')
+        self.assertEqual(batch['error_type'],'ReadTimeout');self.assertNotIn('response',batch)
+        self.assertEqual(report['operation_receipts'][0]['state'],'incomplete')
+
+    def test_native_sdk_driver_preserves_full_exact_file_refresh_coverage(self):
+        spec=importlib.util.spec_from_file_location('native_sdk_drill',ROOT/'tests/provider_sdk/native_object_delivery_sdk_drill.py')
+        driver=importlib.util.module_from_spec(spec);spec.loader.exec_module(driver)
+        rows=native_routes_fixture()['generations']['A']['delivery.json']['routes']
+        result=driver.refresh_scope(rows)
+        self.assertEqual(result['urls'],['https://packages.githubim.com'+r['public_uri'] for r in rows])
+        self.assertEqual(len(result['urls']),178);self.assertEqual(result['object_type'],'File')
+        self.assertFalse(result['coverage_verified']);self.assertIn('https://packages.githubim.com/',result['urls'])
+        with self.assertRaises(ValueError):driver.refresh_scope(rows+[rows[0]])
+        self.assertFalse(self.writes())
+
+    def test_native_sdk_driver_receipt_never_upgrades_fixture_success_to_publication(self):
+        spec=importlib.util.spec_from_file_location('native_sdk_drill',ROOT/'tests/provider_sdk/native_object_delivery_sdk_drill.py')
+        driver=importlib.util.module_from_spec(spec);spec.loader.exec_module(driver)
+        report={'test_only':True,'passed':True,'cases':[{'case':name,'passed':True} for name in driver.CASES],
+                'skips':0,'state':'fixture_complete','stage':'sdk_fixture_complete','scratch_removed':True,
+                'verification':{key:False for key in driver.FALSE_FIELDS}}
+        self.assertEqual(len(driver.CASES),20);driver.validate_report(report)
+        for change in ({'cases':[]},{'cases':report['cases'][:-1]},{'cases':report['cases']+[report['cases'][0]]},
+                       {'skips':1},{'state':'complete'},{'scratch_removed':False},{'test_only':False}):
+            with self.assertRaises(ValueError):driver.validate_report({**report,**change})
+        for key in driver.FALSE_FIELDS:
+            with self.assertRaises(ValueError):driver.validate_report({**report,'verification':{**report['verification'],key:True}})
+        self.assertFalse(self.writes())
 
 
 if __name__=='__main__':

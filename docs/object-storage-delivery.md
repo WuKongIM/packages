@@ -230,10 +230,20 @@ outcomes. It refuses unmanaged rewrites, deletion, unknown functions/groups or
 observed drift; it neither implements a transaction nor guarantees atomic POP
 changes. The complete raw configuration observation is available to its caller.
 
-Refresh primitives accept exact canonical file URLs and query only returned task
-IDs (at most ten per query); exact URL/type/ID and Complete status are required.
-They do not prove public origin/cache/TLS readiness. RefreshTaskById requires
-read permission on Resource `*`; do not misdescribe it as domain scoped.
+Refresh accepts at most 1,000 unique, exact canonical File URLs, including `/`
+and a single trailing slash. It rejects whitespace, control characters, query
+strings, fragments, traversal and empty path segments before submitting anything.
+It submits at most 50 URLs per call, then queries at most 10 returned IDs per call.
+Different submissions may share IDs; first-seen ID order is preserved. Every
+query must report an integer TotalCount equal to its rows and exactly its requested
+ID set. Across a complete poll, every requested URL must occur once, with a stable
+URL-to-ID mapping and file type. No Directory operation is inferred. Only all
+Complete rows satisfy the task contract. At most 20 submissions and 100 queries
+per poll are possible; max_polls is bounded at 10 and poll_interval at 5 seconds. poll_interval is pacing, not a
+total operation deadline. Callers must impose a deadline. Submission/query errors
+are not retried and may leave effects; success proves neither public origin,
+cache/TLS readiness nor live route equivalence. RefreshTaskById requires read
+permission on Resource `*`; it is not domain scoped.
 
 Fresh input authentication recomputes the original v1/v2 plan, authenticates
 historical controls, reads exact immutable audit/tag/assets, and runs the
@@ -293,3 +303,52 @@ GPG agents, and checks both receipts. It
 uploads only public JSON evidence. Existing native candidate 31 and four-client
 49-case commands and deadlines remain separate and unchanged. The production
 producers, validators, channels and keys are unchanged.
+
+
+## TEST ONLY native SDK fixture
+
+`tests/provider_sdk/native_object_delivery_sdk_drill.py` reuses the same native
+job's public M1 exports. Its `prepare` phase reruns native signature/metadata
+verification and the unchanged v2 planner/materializer, preserving A/B's 153
+objects and 178 routes. It binds original input/plan bytes, public source files,
+the separate synthetic current-control observation, disabled resource intent,
+and explicit dummy SDK resource. It generates no signing keys.
+
+The `sdk` phase uses the locked official SDK and an instance HTTP fixture with
+network connects refused. All 306 A/B object operations perform create-only PUT
+and complete GET verification (152 exact shared conflicts, 154 unique keys).
+Both 17-rule configurations and every exact refresh URL are checked. Aggregate
+responses use the observed one-URL-per-row/repeated-TaskId shape. Failure cases
+retain attempted effects; expected refusal is never a publication success.
+
+The 20-case receipt says `fixture_complete` only after owned scratch removal.
+Production, source authentication, public-client, cloud, live routing and
+activation fields remain false; the actual fresh TEST ONLY and activation
+entrypoints still refuse. These data-only packages do not prove installed CLI
+acceptance. Existing 29/31/49 native suites keep their original commands.
+
+The native preparation keeps the M1 container's init, network isolation,
+1 CPU/512 MiB/128 PID/512 MiB tmpfs and 15-minute limit. A separate host SDK phase
+installs the existing hash lock within 240 seconds and runs within 300 seconds;
+it has no claimed container cgroup limit. Fixed input/file counts and 64 MiB
+fixture/8 MiB receipt limits bound its work. Always-run cleanup removes owned
+work and the venv; CI archives only the finite preparation, SDK and cleanup JSON.
+
+
+The SDK receipt retains each object's expected source/input/plan binding, actual
+PUT outcome/status and consumed request-byte facts, and complete GET result plus
+observed byte count, SHA-256, cache headers and EOF. Closing a stream, an empty
+`read(0)`, or an interruption cannot establish EOF. Configuration observations
+include before/after bodies and batch results. Refresh evidence preserves exact
+submitted URLs and the actual SDK-consumed Tasks/TotalCount rows, including
+missing/duplicate rows and unknown outcomes; fixture backend state is never a
+substitute. Only explicit public fields are retained, without signed URLs,
+authorization headers, tokens, payload bytes or arbitrary error messages.
+
+A one-attempt network-guard self-check is separate from the SDK stage. Every
+unexpected connect attempt is counted independently of exceptions and makes the
+run fail, even if an expected-refusal test or SDK wrapper absorbs the exception.
+Stage errors and cleanup errors are separate receipt fields; cleanup failure
+preserves earlier attempts, emits an incomplete receipt and returns nonzero.
+If evidence exceeds 8 MiB, a bounded incomplete receipt records the omitted
+size/digest and error rather than reporting success.
