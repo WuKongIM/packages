@@ -246,15 +246,19 @@ jobs:
           fixture_output="$RUNNER_TEMP/native-delivery-fixture"
           sdk_work="$RUNNER_TEMP/native-sdk-work"
           sdk_evidence="$RUNNER_TEMP/native-sdk-evidence"
-          mkdir "$sdk_work" "$sdk_evidence"
-          chmod 0777 "$sdk_work" "$sdk_evidence"
+          # Preserve private native scratch across the container-to-host handoff.
+          sdk_uid="$(id -u)"
+          sdk_gid="$(id -g)"
+          [[ "$sdk_uid" =~ ^[1-9][0-9]*$ ]] || exit 1
+          [[ "$sdk_gid" =~ ^[1-9][0-9]*$ ]] || exit 1
+          mkdir -m 0700 "$sdk_work" "$sdk_evidence"
           container="wk-native-sdk-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           trap 'docker rm --force "$container" >/dev/null 2>&1 || true' EXIT
           trap 'exit 130' INT
           trap 'exit 143' TERM
           timeout --signal=TERM --kill-after=10s 15m docker run --rm --name "$container" \
             --platform linux/amd64 --init --network none --read-only --cap-drop ALL \
-            --security-opt no-new-privileges --user 65532:65532 \
+            --security-opt no-new-privileges --user "$sdk_uid:$sdk_gid" \
             --cpus 1 --memory 512m --pids-limit 128 \
             --tmpfs /tmp:rw,nosuid,nodev,size=536870912 \
             --volume "$GITHUB_WORKSPACE:/control:ro" \

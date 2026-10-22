@@ -328,7 +328,14 @@ entrypoints still refuse. These data-only packages do not prove installed CLI
 acceptance. Existing 29/31/49 native suites keep their original commands.
 
 The native preparation keeps the M1 container's init, network isolation,
-1 CPU/512 MiB/128 PID/512 MiB tmpfs and 15-minute limit. A separate host SDK phase
+1 CPU/512 MiB/128 PID/512 MiB tmpfs and 15-minute limit. This new prepare step
+uses the host runner's explicit nonzero UID/GID, matching the following SDK and
+cleanup steps. The original fixed UID 65532 plan failed on Linux: resolved audit
+directories remain mode 0700, and another host UID can neither consume those
+inputs nor remove the owned output tree. Identity alignment preserves those
+private modes; it does not use root, chown or widen native input permissions.
+Both owned handoff directories start at mode 0700. Existing native workflow
+steps retain their original user. A separate host SDK phase
 installs the existing hash lock within 240 seconds and runs within 300 seconds;
 it has no claimed container cgroup limit. Fixed input/file counts and 64 MiB
 fixture/8 MiB receipt limits bound its work. Always-run cleanup removes owned
