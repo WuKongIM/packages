@@ -8,6 +8,8 @@
 - Verify complete native delivery fixtures through the official SDK without cloud
   access, and validate exact File refresh coverage across aggregated task IDs.
   Keep bounded public SDK responses and preserve failures through cleanup.
+  Match the native preparation user to the Linux runner so private inputs remain
+  readable and owned scratch can be removed after the SDK check.
   Production authentication, public-client acceptance and activation remain unverified.
 
 - Compile larger finite native route tables into bounded offline CDN candidates

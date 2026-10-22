@@ -222,7 +222,7 @@ class NativeSdkWorkflowContract(unittest.TestCase):
         block=text[start:end]
         self.assertLess(text.index('native_object_delivery_fixture_drill.py'),start)
         for required in ('native_object_delivery_sdk_drill.py prepare','native_object_delivery_sdk_drill.py sdk',
-                         '--init','--network none','--read-only','--user 65532:65532','--cpus 1 --memory 512m --pids-limit 128',
+                         '--init','--network none','--read-only','--user "$sdk_uid:$sdk_gid"','--cpus 1 --memory 512m --pids-limit 128',
                          'size=536870912','15m docker run','timeout 240','--require-hashes','timeout 300',
                          '--expected-export-source "$GITHUB_SHA"','--bundle-sha256','--source-sha "$GITHUB_SHA"',
                          'native-delivery-fixture','native-sdk-result.json','if: always()',
@@ -231,6 +231,44 @@ class NativeSdkWorkflowContract(unittest.TestCase):
         for forbidden in ('export_delivery_generations','secrets.','id-token:','actions: write','continue-on-error:'):
             self.assertNotIn(forbidden,block)
         self.assertIn('timeout-minutes: 60',text)
+
+    def test_native_sdk_prepare_uses_the_host_nonroot_identity_without_widening_scratch(self):
+        result, invocation, permissions = self.native_sdk_prepare_identity('1001', '1002')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(invocation[invocation.index('--user')+1], '1001:1002')
+        self.assertEqual(permissions, {'native-sdk-work': 0o700, 'native-sdk-evidence': 0o700})
+        self.assertNotIn('sudo', invocation)
+
+    def test_native_sdk_prepare_refuses_invalid_or_root_identity_before_docker(self):
+        for uid,gid in (('0','1001'),('1001','0'),('','1001'),('-1','1001'),('1001','bad'),('1001','')):
+            with self.subTest(uid=uid,gid=gid):
+                result, invocation, _ = self.native_sdk_prepare_identity(uid,gid)
+                self.assertNotEqual(result.returncode,0)
+                self.assertIsNone(invocation)
+
+    def native_sdk_prepare_identity(self,uid,gid):
+        """Run the real prepare shell with an inert Docker boundary, never a daemon."""
+        import os
+        import stat
+        import subprocess
+        import sys
+        text=(ROOT/'.github/workflows/native-package-repository-drill.yml').read_text()
+        start=text.index('      - name: Prepare verified native SDK object fixtures')
+        end=text.index('      - name:',start+10)
+        body=text[start:end].split('        run: |\n',1)[1]
+        script='\n'.join(line[10:] for line in body.splitlines() if line.startswith('          '))
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);binary=root/'bin';binary.mkdir();log=root/'docker.json'
+            identity=binary/'id';identity.write_text('#!/bin/sh\ncase "$1" in -u) printf "%s\\n" "$TEST_UID";; -g) printf "%s\\n" "$TEST_GID";; *) exit 42;; esac\n');identity.chmod(0o755)
+            timeout=binary/'timeout';timeout.write_text('#!/bin/sh\nshift 3\nexec "$@"\n');timeout.chmod(0o755)
+            docker=binary/'docker';docker.write_text('#!'+sys.executable+'\nimport json,os,sys\nfrom pathlib import Path\nif sys.argv[1:3]==["rm","--force"]: raise SystemExit(0)\nPath(os.environ["TEST_DOCKER_LOG"]).write_text(json.dumps(sys.argv[1:]))\nout=Path(sys.argv[sys.argv.index("--output")+1]);out.write_text(json.dumps({"passed":True,"source_sha":os.environ["GITHUB_SHA"],"state":"native_prepared","cases":[{},{}]}))\n');docker.chmod(0o755)
+            env={**os.environ,'PATH':str(binary)+':'+os.environ['PATH'],'RUNNER_TEMP':str(root),
+                 'GITHUB_WORKSPACE':str(ROOT),'GITHUB_RUN_ID':'fixture','GITHUB_RUN_ATTEMPT':'1','GITHUB_SHA':HEAD,
+                 'TEST_UID':uid,'TEST_GID':gid,'TEST_DOCKER_LOG':str(log)}
+            result=subprocess.run(['bash','-c',script],env=env,capture_output=True,text=True,timeout=10,cwd=ROOT)
+            invocation=json.loads(log.read_bytes()) if log.exists() else None
+            permissions={name:stat.S_IMODE((root/name).stat().st_mode) for name in ('native-sdk-work','native-sdk-evidence') if (root/name).exists()}
+            return result,invocation,permissions
 
     def test_native_sdk_cleanup_rejects_docker_observation_failure(self):
         import os
