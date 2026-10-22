@@ -401,30 +401,56 @@ class Provider:
         return receipt
 
     def refresh(self, urls, *, max_polls=3, poll_interval=1):
-        """Refresh exact file URLs and accept only this request's exact complete tasks."""
-        require(isinstance(urls,list) and 0<len(urls)<=50 and len(set(urls))==len(urls),'bounded unique URLs required')
+        """Verify an exact File URL set, including repeated aggregate task IDs.
+
+        Submit the entire bounded set before polling: later batches can share
+        earlier IDs. Exceptions after submission never imply rollback. The
+        caller supplies the total deadline; poll_interval only paces polls.
+        """
+        require(isinstance(urls,list) and 0<len(urls)<=1000
+                and all(isinstance(url,str) for url in urls)
+                and len(set(urls))==len(urls),'bounded unique URLs required')
         require(type(max_polls) is int and 1<=max_polls<=10 and 0<=poll_interval<=5,'bounded polling required')
         for url in urls:
+            require(not any(character.isspace() or ord(character)<32 or ord(character)==127 for character in url)
+                    and '?' not in url and '#' not in url,'exact canonical file URL required')
             parsed=urlsplit(url)
-            require(url.startswith('https://'+self.resource['domain']+'/') and parsed.netloc==self.resource['domain']
-                    and not parsed.query and not parsed.fragment and parsed.path!='/' and not parsed.path.endswith('/'),'exact canonical file URL required')
-            safe_path(parsed.path,True)
+            require(url=='https://'+self.resource['domain']+parsed.path
+                    and parsed.netloc==self.resource['domain'] and '//' not in parsed.path,
+                    'exact canonical file URL required')
+            # A trailing slash names an exact File URL; never infer Directory.
+            path=parsed.path[:-1] if parsed.path!='/' and parsed.path.endswith('/') else parsed.path
+            safe_path(path,True)
         self.observe_resource()
-        raw=self._call(RefreshObjectCachesRequest,ObjectPath='\n'.join(urls),ObjectType='File').get('RefreshTaskId','')
-        ids=raw.split(',');require(len(ids)==len(urls) and len(set(ids))==len(ids) and all(x.isdecimal() and int(x)>0 for x in ids),'refresh task IDs incomplete')
+        ids=[]
+        for start in range(0,len(urls),50):
+            group=urls[start:start+50]
+            raw=self._call(RefreshObjectCachesRequest,ObjectPath='\n'.join(group),ObjectType='File').get('RefreshTaskId','')
+            require(isinstance(raw,str),'refresh task IDs incomplete')
+            returned=raw.split(',')
+            require(0<len(returned)<=len(group) and len(set(returned))==len(returned)
+                    and all(re.fullmatch(r'[1-9][0-9]{0,31}',value) for value in returned),'refresh task IDs incomplete')
+            ids.extend(value for value in returned if value not in ids)
         bindings=None
         for attempt in range(max_polls):
             rows=[]
             for start in range(0,len(ids),10):
                 group=ids[start:start+10]
-                response=self._call(DescribeRefreshTaskByIdRequest,TaskId=','.join(group));batch=response.get('Tasks',[])
-                require(len(batch)==len(group) and {str(x.get('TaskId')) for x in batch}==set(group),'foreign/missing refresh task')
+                response=self._call(DescribeRefreshTaskByIdRequest,TaskId=','.join(group));batch=response.get('Tasks')
+                require(isinstance(batch,list) and len(group)<=len(batch)<=len(urls)
+                        and type(response.get('TotalCount')) is int and response['TotalCount']==len(batch)
+                        and all(isinstance(row,dict) for row in batch)
+                        and {str(row.get('TaskId')) for row in batch}==set(group),'foreign/missing refresh task')
+                require(len(rows)+len(batch)<=len(urls),'refresh rows exceed requested URL bound')
                 rows.extend(batch)
-            mapping={str(x['TaskId']):x.get('ObjectPath') for x in rows}
-            require(len(rows)==len(ids) and set(mapping.values())==set(urls) and (bindings is None or mapping==bindings),'refresh URL identity differs')
+            paths=[row.get('ObjectPath') for row in rows]
+            require(all(isinstance(path,str) for path in paths) and len(paths)==len(set(paths))
+                    and set(paths)==set(urls),'refresh URL identity differs')
+            mapping={row['ObjectPath']:str(row['TaskId']) for row in rows}
+            require(bindings is None or mapping==bindings,'refresh URL identity differs')
             bindings=mapping
-            require(all(x.get('ObjectType')=='file' and x.get('Status') in ('Complete','Refreshing') for x in rows),'refresh failed or ambiguous')
-            if all(x['Status']=='Complete' for x in rows):return {'state':'tasks_complete','task_ids':ids,**FALSE_FIELDS}
+            require(all(row.get('ObjectType')=='file' and row.get('Status') in ('Complete','Refreshing') for row in rows),'refresh failed or ambiguous')
+            if all(row['Status']=='Complete' for row in rows):return {'state':'tasks_complete','task_ids':ids,**FALSE_FIELDS}
             if attempt+1<max_polls:time.sleep(poll_interval)
         raise ProviderError('refresh deadline exhausted')
 

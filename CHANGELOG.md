@@ -5,6 +5,11 @@
 - Verify RPM signature status independently of package paths, so valid packages
   in directories containing words such as `bad` are not incorrectly rejected.
 
+- Verify complete native delivery fixtures through the official SDK without cloud
+  access, and validate exact File refresh coverage across aggregated task IDs.
+  Keep bounded public SDK responses and preserve failures through cleanup.
+  Production authentication, public-client acceptance and activation remain unverified.
+
 - Compile larger finite native route tables into bounded offline CDN candidates
   while preserving exact paths and legacy literal rules. Live routing and
   production activation remain unverified and disabled.
