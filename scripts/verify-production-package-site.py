@@ -405,11 +405,21 @@ def rpm_candidate_signature_verifies(
             [_tool("rpmkeys"), "--dbpath", str(database), "--verbose", "--checksig", str(package)],
             f"RPM candidate signature verification {candidate}",
         )
-        checked_text = (checked.stdout + b"\n" + checked.stderr).decode("utf-8", "replace").lower()
+        # rpmkeys prints the package path before its status rows. Path words and
+        # hexadecimal key IDs must not be interpreted as verification failures.
+        header = os.fsencode(package) + b":\n"
+        if not checked.stdout.startswith(header):
+            return False
+        statuses = checked.stdout[len(header):].decode("utf-8", "replace")
+        signatures = re.findall(
+            r"^[ \t]+Header V4 RSA/SHA256 Signature, key ID ([0-9a-f]{8,16}): OK$",
+            statuses, re.IGNORECASE | re.MULTILINE,
+        )
+        diagnostics = statuses + "\n" + checked.stderr.decode("utf-8", "replace")
         return (
-            checked.returncode == 0 and "signature" in checked_text
-            and "noke" not in checked_text and "not ok" not in checked_text
-            and "bad" not in checked_text
+            checked.returncode == 0 and len(signatures) == 1
+            and candidate.lower().endswith(signatures[0].lower())
+            and re.search(r":\s*(?:NOKEY|NOT OK|BAD)\b", diagnostics, re.IGNORECASE) is None
         )
 
 

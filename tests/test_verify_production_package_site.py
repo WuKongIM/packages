@@ -967,6 +967,56 @@ class VerifyProductionPackageSiteTest(unittest.TestCase):
         with self.assertRaisesRegex(verifier.VerificationError, "hashed full issuer"):
             inspect(v5_unhashed_claim)
 
+    def candidate_status(self, package: Path, status: bytes, *, candidate: str = fixtures.RPM_SUBKEY,
+                         returncode: int = 0, stderr: bytes = b"",
+                         header: bytes | None = None) -> bool:
+        output = (str(package).encode() + b":\n" if header is None else header) + status
+        results = [subprocess.CompletedProcess([], 0, b"", b""),
+                   subprocess.CompletedProcess([], 0, b"", b""),
+                   subprocess.CompletedProcess([], returncode, output, stderr)]
+        with mock.patch.object(verifier, "_tool", side_effect=lambda value: value), \
+             mock.patch.object(verifier, "run_command", side_effect=results):
+            return verifier.rpm_candidate_signature_verifies(package, b"TEST ONLY public cert", candidate)
+
+    def test_rpm_valid_signature_is_independent_of_path_words(self) -> None:
+        status = (f"    Header V4 RSA/SHA256 Signature, key ID {fixtures.RPM_SUBKEY[-8:].lower()}: OK\n"
+                  "    Payload SHA256 digest: OK\n").encode()
+        for directory in ("good", "bad", "NOKEY", "NOT OK", "signature"):
+            with self.subTest(directory=directory):
+                self.assertTrue(self.candidate_status(Path("/tmp") / directory / "fixture.rpm", status))
+
+    def test_rpm_valid_key_id_may_contain_bad_hexadecimal_digits(self) -> None:
+        candidate = "A" * 32 + "5BAD1234"
+        status = b"    Header V4 RSA/SHA256 Signature, key ID 5bad1234: OK\n"
+        self.assertTrue(self.candidate_status(Path("fixture.rpm"), status, candidate=candidate))
+
+    def test_rpm_signature_word_in_filename_does_not_prove_a_signature(self) -> None:
+        self.assertFalse(self.candidate_status(Path("signature.rpm"), b"    Payload SHA256 digest: OK\n"))
+
+    def test_rpm_signature_status_requires_exact_package_header(self) -> None:
+        status = (f"    Header V4 RSA/SHA256 Signature, key ID {fixtures.RPM_SUBKEY[-8:]}: OK\n").encode()
+        for header in (b"", b"other.rpm:\n"):
+            with self.subTest(header=header):
+                self.assertFalse(self.candidate_status(Path("fixture.rpm"), status, header=header))
+
+    def test_rpm_signature_status_rejects_command_and_crypto_failures(self) -> None:
+        status = (f"    Header V4 RSA/SHA256 Signature, key ID {fixtures.RPM_SUBKEY[-8:]}: OK\n").encode()
+        self.assertFalse(self.candidate_status(Path("fixture.rpm"), status, returncode=1))
+        for failure in (b"NOKEY", b"NOT OK", b"BAD"):
+            diagnostic = b"    Payload SHA256 digest: " + failure + b"\n"
+            for stream in ("stdout", "stderr"):
+                with self.subTest(failure=failure, stream=stream):
+                    self.assertFalse(self.candidate_status(
+                        Path("fixture.rpm"), status + (diagnostic if stream == "stdout" else b""),
+                        stderr=diagnostic if stream == "stderr" else b""))
+
+    def test_rpm_signature_status_requires_one_exact_candidate_sha256_row(self) -> None:
+        status = (f"    Header V4 RSA/SHA256 Signature, key ID {fixtures.RPM_SUBKEY[-8:]}: OK\n").encode()
+        for invalid in (b"", status * 2, status.replace(b"SHA256", b"SHA1"),
+                        status.replace(fixtures.RPM_SUBKEY[-8:].encode(), b"00000000")):
+            with self.subTest(status=invalid):
+                self.assertFalse(self.candidate_status(Path("fixture.rpm"), invalid))
+
     def test_rpm_hashed_claim_must_equal_candidate_only_crypto_success(self) -> None:
         candidates = {fixtures.RPM_SUBKEY, RPM_HISTORICAL}
         exports = {value: value.encode() for value in candidates}
