@@ -82,7 +82,16 @@ reads after the independently bound prior request/journal/preparation checks.
 It grants no wider scope.
 
 A later matching object is `observed_now: exact`; it never rewrites an original
-unknown request into success. Reconciliation performs no PUT, configuration
+unknown request into success. `original_unknown_outcomes` counts each original
+PUT unless its unique object attempt has a completed `object_observed` record
+bound to the prepared key, byte/hash/cache facts and full readback, with outcome
+`created` or `already_exists`. HTTP status/headers alone, missing completion and
+`unknown_readback_verified` remain unknown. Duplicate attempts, request IDs or
+completions and inconsistent object facts are rejected before Provider reads;
+one successful record cannot erase a different unknown attempt. Raw transport
+observations remain unchanged in the prior journal.
+
+Reconciliation performs no PUT, configuration
 change, refresh, rollback or automatic resume and cannot report publication
 completion. A missing or mismatched read remains unknown.
 

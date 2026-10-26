@@ -1,6 +1,7 @@
 """Staging execution over existing GitHub and official SDK HTTP fixtures only."""
 import hashlib
 import importlib.util
+import io
 import json
 from pathlib import Path
 import socket
@@ -177,6 +178,99 @@ class StagingExecutionContract(unittest.TestCase):
                     journal_path=Path(prior['journal_path']), journal_sha256=expected,
                     output_dir=self.github.root / ('reject-' + fault))
             self.assertEqual(len(self.wire.requests), count)
+
+    def _reconcile_header_failure(self, mode):
+        send = self.wire.send
+        injected = []
+
+        def fault_after_effect(request, **kwargs):
+            response = send(request, **kwargs)
+            if request.method == 'PUT' and not injected:
+                injected.append(True)
+                if mode == 'http503':
+                    response.status_code = 503
+                    response.raw = io.BytesIO(b'<Error><Code>InternalError</Code></Error>')
+                else:
+                    read_timeout = self.sdk.requests.ReadTimeout
+
+                    class InterruptedBody(io.BytesIO):
+                        def read(self, *args, **kwargs):
+                            raise read_timeout('fixture response body interrupted')
+
+                    response.raw = InterruptedBody()
+            return response
+
+        self.wire.send = fault_after_effect
+        prior = self.execution._stage_immutable(self.request, provider=self.provider)
+        self.assertEqual(prior['objects'][0]['put_outcome'],
+            'unknown' if mode == 'http503' else 'unknown_readback_verified')
+        events = [json.loads(line) for line in Path(prior['journal_path']).read_bytes().splitlines()]
+        put = next(x for x in events if x.get('event') == 'request_attempt' and x['method'] == 'PUT')
+        result = next(x for x in events if x.get('event') == 'request_result' and x['request_id'] == put['request_id'])
+        self.assertEqual(result['status'], 503 if mode == 'http503' else 200)
+        self.assertEqual(result['outcome'], 'response_received')
+        before = len(self.wire.requests)
+        observed = self.execution._reconcile_staging(self.request, provider=self.provider,
+            journal_path=Path(prior['journal_path']), journal_sha256=prior['journal_sha256'],
+            output_dir=self.github.root / 'reconciled')
+        self.assertEqual(observed['objects'][0]['observed_now'], 'exact')
+        self.assertFalse(any(x[0].method == 'PUT' for x in self.wire.requests[before:]))
+        self.assertEqual(observed['original_unknown_outcomes'], 1,
+            'HTTP headers and later exact GET cannot resolve the original unknown PUT')
+
+    def test_reconcile_http503_headers_preserve_original_unknown_put(self):
+        self._reconcile_header_failure('http503')
+
+    def test_reconcile_http200_interrupted_body_preserves_original_unknown_put(self):
+        self._reconcile_header_failure('interrupted_body')
+
+    def test_reconcile_known_created_and_already_existing_puts_are_not_unknown(self):
+        for number, outcome in enumerate(('created', 'already_exists')):
+            with self.subTest(outcome=outcome):
+                self.request['output_dir'] = str(self.github.root / ('execution-' + str(number)))
+                prior = self.execution._stage_immutable(self.request, provider=self.provider)
+                self.assertEqual(prior['status'], 'staged_readback_verified')
+                self.assertEqual({x['put_outcome'] for x in prior['objects']}, {outcome})
+                before = len(self.wire.requests)
+                observed = self.execution._reconcile_staging(self.request, provider=self.provider,
+                    journal_path=Path(prior['journal_path']), journal_sha256=prior['journal_sha256'],
+                    output_dir=self.github.root / ('reconciled-' + str(number)))
+                self.assertEqual(observed['original_unknown_outcomes'], 0)
+                self.assertTrue(all(x['observed_now'] == 'exact' for x in observed['objects']))
+                self.assertFalse(any(x[0].method == 'PUT' for x in self.wire.requests[before:]))
+
+    def test_reconcile_rejects_ambiguous_or_unbound_completion_before_reads(self):
+        prior = self.execution._stage_immutable(self.request, provider=self.provider)
+        original = [json.loads(line) for line in Path(prior['journal_path']).read_bytes().splitlines()]
+        for fault in ('duplicate_put', 'duplicate_attempt', 'duplicate_completion',
+                      'facts', 'key', 'request_id'):
+            with self.subTest(fault=fault):
+                events = json.loads(json.dumps(original))
+                attempt = next(i for i, x in enumerate(events) if x.get('event') == 'object_attempt')
+                put = next(i for i, x in enumerate(events) if x.get('event') == 'request_attempt' and x['method'] == 'PUT')
+                observed = next(i for i, x in enumerate(events) if x.get('event') == 'object_observed')
+                if fault == 'duplicate_put':
+                    extra = dict(events[put], request_id=max(x.get('request_id', 0) for x in events) + 1)
+                    events.insert(put + 1, extra)
+                elif fault == 'duplicate_attempt':
+                    events.insert(attempt + 1, events[attempt])
+                elif fault == 'duplicate_completion':
+                    events.append(events[observed])
+                elif fault == 'facts':
+                    events[observed]['facts']['sha256'] = '0' * 64
+                elif fault == 'key':
+                    events[observed]['object_key'] = prior['objects'][1]['object_key']
+                else:
+                    events[put]['request_id'] = events[put - 1]['request_id']
+                raw = b''.join(json.dumps(x, sort_keys=True).encode() + b'\n' for x in events)
+                journal = self.github.root / ('ambiguous-' + fault + '.jsonl')
+                journal.write_bytes(raw)
+                before = len(self.wire.requests)
+                with self.assertRaises(ValueError):
+                    self.execution._reconcile_staging(self.request, provider=self.provider,
+                        journal_path=journal, journal_sha256=hashlib.sha256(raw).hexdigest(),
+                        output_dir=self.github.root / ('reconciled-' + fault))
+                self.assertEqual(len(self.wire.requests), before)
 
 
     def test_main_input_and_audit_metadata_drift_stop_each_next_put(self):

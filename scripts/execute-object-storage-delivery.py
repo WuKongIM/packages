@@ -343,18 +343,38 @@ def _reconcile_staging(request, *, provider, journal_path, journal_sha256, outpu
     prepared = json.loads(prepared_raw, object_pairs_hook=fresh.C.reject_duplicate_pairs)
     allowed = {x['object_key']: {k: x[k] for k in ('size', 'sha256', 'cache_control')} for x in prepared['objects']}
     objects = {}
-    attempts, results = {}, {}
+    attempts, puts, completions = {}, {}, {}
+    active = None
     for event in events[1:]:
         if event.get('event') == 'object_attempt':
             key, facts = event['object_key'], event['facts']
             require(key in allowed and facts == allowed[key], 'prior object outside exact preparation')
+            require(active is None and key not in objects, 'ambiguous prior object attempt')
             objects[key] = facts
+            active = key
         elif event.get('event') == 'request_attempt':
-            attempts[event['request_id']] = event
-        elif event.get('event') == 'request_result':
-            results[event['request_id']] = event
-    unknown = sum(1 for number, item in attempts.items() if item['method'] == 'PUT'
-        and results.get(number, {}).get('outcome') != 'response_received')
+            number = event['request_id']
+            require(type(number) is int and number > 0 and number not in attempts, 'ambiguous prior request attempt')
+            attempts[number] = event
+            if event['method'] == 'PUT':
+                require(active is not None and event.get('object_key') == active and active not in puts
+                        and event.get('host') == request['resource']['bucket'] + '.oss-'
+                            + request['resource']['region'] + '.aliyuncs.com'
+                        and unquote(event.get('path', '')) == '/' + active and event.get('action') == '',
+                        'prior PUT outside unique bound object attempt')
+                puts[active] = number
+        elif event.get('event') == 'object_observed':
+            key, facts = event.get('object_key'), event.get('facts')
+            readback = event.get('readback', {})
+            require(key == active and key in puts and key not in completions and facts == objects[key]
+                    and event.get('write_attempted') is True and event.get('readback_verified') is True
+                    and isinstance(readback, dict) and readback.get('status') == 200
+                    and {k: readback.get(k) for k in ('size', 'sha256', 'cache_control')} == facts,
+                    'prior completion differs from unique bound object attempt')
+            completions[key] = event.get('put_outcome')
+            active = None
+    # Headers and a later exact GET do not resolve the original SDK operation.
+    unknown = sum(1 for key in puts if completions.get(key) not in ('created', 'already_exists'))
     budget = RunBudget(request['limits'], read_only=True)
     provider.bind_execution_controls(budget=budget)
     fresh_anchor_status = 'verified'
