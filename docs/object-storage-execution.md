@@ -149,6 +149,32 @@ Reconciliation performs no PUT, configuration
 change, refresh, rollback or automatic resume and cannot report publication
 completion. A missing or mismatched read remains unknown.
 
+The private CDN journal uses `run_start_v2`; the legacy staging parser rejects
+that discriminator. It adds exact configuration/refresh scopes while preserving
+the default staging format and its unknown-PUT accounting. The shared parser is
+also used by owned summaries, so unknown counting cannot diverge from reconciliation.
+Production `run_delivery`/`activate` and the owned staging worker remain unchanged
+and cannot initiate this private CDN path.
+The journal remains attached to the same RunBudget instance, not a replacement
+with equal limit values. Original deadlines, counters and evidence credit cannot
+be renewed by rebinding Provider or the transport. Responses are closed even when
+recording their headers fails; the original request remains unknown.
+Transport acquisition failures are recorded once. A failure recording known
+headers is not a second transport failure. SDK exceptions carrying a Response
+and urllib HTTPError bodies are closed on failure, including journal/owner
+rejection. A successfully returned wrapper transfers body ownership to the
+caller's existing context manager, which closes it even when a read guard fails.
+
+`_reconcile_cdn_effects` first validates the exact prior request, intent,
+preparation and journal before any Provider reads. It uses a new finite read-only
+budget and records the original effect deadline without reviving it. Complete
+current configuration and allowlisted task-ID/URL/status observations are current
+state only. Original unknown counts remain split into PUT/configuration/refresh
+requests; no matching current value changes those counts. A submission whose
+response supplied no valid task IDs stays explicitly unobservable. Only recorded
+positive IDs are queried, in groups of at most ten and within the original finite
+URL universe. Reconciliation never searches task history or retries a submission.
+
 ## Repeatable local validation
 
 Install the existing hash-locked SDK dependencies in a separate virtualenv, then

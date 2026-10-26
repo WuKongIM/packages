@@ -300,10 +300,10 @@ def _journal_summary(output, request, maximum):
     execution = module('execute-object-storage-delivery.py')
     fresh = module('verify-object-storage-delivery-inputs.py')
     prepared_raw = fresh.D._read(output/'staging/prepared/delivery.json', 'owned prepared inventory')
-    objects, unknown, tail, header = execution._bound_staging_journal(request, raw, prepared_raw)
+    journal = execution._bound_effect_journal(request, raw, prepared_raw)
     return {'journal_verified': True, 'journal_path': str(path),
-        'journal_sha256': hashlib.sha256(raw).hexdigest(), 'partial_tail_bytes': len(tail),
-        'original_unknown_outcomes': unknown}
+        'journal_sha256': hashlib.sha256(raw).hexdigest(), 'partial_tail_bytes': len(journal['partial_tail']),
+        'original_unknown_outcomes': journal['unknown']}
 
 
 

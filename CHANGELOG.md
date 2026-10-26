@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Retain bounded private CDN configuration/refresh attempt evidence and exact
+  read-only reconciliation, preserving unknown outcomes after interrupted
+  responses and retaining the original execution budget throughout. Production
+  activation and stable publication remain disabled.
+
 - Bound internal Linux staging and its helpers with one execution deadline,
   owned-process cancellation and verified cleanup. Preserve uncertain upload
   outcomes after forced termination; production publication remains disabled.

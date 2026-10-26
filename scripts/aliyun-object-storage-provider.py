@@ -52,6 +52,14 @@ def digest(value):
     return hashlib.sha256(json.dumps(value,sort_keys=True,separators=(',',':')).encode()).hexdigest()
 
 
+def _unique_pairs(pairs):
+    value = {}
+    for key, item in pairs:
+        require(key not in value, 'duplicate provider JSON field')
+        value[key] = item
+    return value
+
+
 def require_private_sdk_logging():
     """Reject before SDK signing can log credentials; never mutate global logging.
 
@@ -160,7 +168,7 @@ class _Session(requests.Session):
         try:
             response=super().send(request,**kwargs)
             if budget is not None:
-                budget.after_sdk(ticket,response.status_code);ticket=None
+                budget.after_sdk(ticket,response.status_code)
             require(not 300<=response.status_code<400, 'redirect refused')
             require(not response.headers.get('Content-Encoding'), 'encoded provider response refused')
             if not streaming or bool({'versioning','bucketInfo'} & set(query)) or response.status_code>=400:
@@ -173,6 +181,8 @@ class _Session(requests.Session):
                     if budget is not None:budget.consume_read(len(chunk))
                     raw.extend(chunk);require(len(raw)<=MAX_RESPONSE and time.monotonic()-started<=30,'provider response exceeds bound')
                 response.close();raw=bytes(raw)
+                if budget is not None:
+                    budget.consumed_sdk(ticket,response.status_code,len(raw),hashlib.sha256(raw).hexdigest())
                 if 'versioning' in query and response.status_code==200:
                     require(b'<!' not in raw, 'versioning XML declarations refused')
                     node=ET.fromstring(raw)
@@ -190,10 +200,17 @@ class _Session(requests.Session):
                          else json.dumps({'Code':code,'Message':'provider operation failed','RequestId':'redacted'}).encode())
                 response._content=raw;response._content_consumed=True
             return response
-        except Exception:
+        except Exception as error:
             # Do not let either SDK log an exception containing a signed URL/token.
-            if budget is not None:budget.after_sdk(ticket,None)
-            if response is not None:response.close()
+            try:
+                # A returned response is distinct from a failed transport. A
+                # journal error after headers must not create another outcome.
+                if budget is not None and response is None:budget.after_sdk(ticket,None)
+            finally:
+                # A secondary journal failure cannot bypass response ownership.
+                if response is not None:response.close()
+                elif isinstance(error,requests.RequestException) and error.response is not None:
+                    error.response.close()
             raise requests.RequestException('bounded provider transport failed') from None
 
 
@@ -223,9 +240,11 @@ class Provider:
             auto_retry=False,max_retry_time=0,connect_timeout=5,timeout=10,verify=True,proxy={'http':None,'https':None})
         self.rpc.session.close();self.rpc.session=self.session
         self.execution_budget=None
+        self._credential_markers=(access_key_id,access_key_secret,security_token)
 
     def bind_execution_controls(self, *, budget):
         """Attach per-instance bounds; these controls never grant publication authority."""
+        if getattr(getattr(budget,'journal',None),'cdn_mode',False):budget.check()
         self.execution_budget=budget
         self.session.execution_budget=budget
 
@@ -238,8 +257,11 @@ class Provider:
         request.set_endpoint('sts.aliyuncs.com' if cls is GetCallerIdentityRequest else 'cdn.aliyuncs.com')
         for key,value in values.items():getattr(request,'set_'+key)(value)
         try:
-            result=json.loads(self.rpc.do_action_with_exception(request))
-            require(isinstance(result,dict),'provider response must be an object');return result
+            result=json.loads(self.rpc.do_action_with_exception(request),object_pairs_hook=_unique_pairs)
+            require(isinstance(result,dict),'provider response must be an object')
+            if self.execution_budget is not None and cls in (BatchSetCdnDomainConfigRequest,RefreshObjectCachesRequest):
+                self.execution_budget.parsed_cdn_response()
+            return result
         except Exception:
             raise ProviderError('provider RPC failed') from None
 
@@ -412,18 +434,41 @@ class Provider:
         require(fresh==before,'CDN configuration drifted')
         receipt={'state':'incomplete','write_attempted':False,'before_sha256':before['sha256'],
                  'after_sha256':None,'batches_attempted':0,**FALSE_FIELDS}
-        returned_ids=[]
+        returned_ids=[];pending=[]
+
+        def observed(after):
+            """Keep complete C1 independently of each consumed request acknowledgement."""
+            raw=json.dumps(after,sort_keys=True,separators=(',',':'))
+            require(not any(value in raw for value in self._credential_markers),'configuration contains credential echo')
+            receipt['configuration_observed_now']=after
+            if self.execution_budget is not None:
+                self.execution_budget.observed_cdn_configuration(after)
+                for item in list(pending):
+                    step,ids=item
+                    if self.execution_budget.cdn_configuration_matches(step,ids,after):
+                        self.execution_budget.acknowledge_cdn_step(step,{'config_ids':ids})
+                        pending.remove(item)
         try:
             for start in range(0,len(functions),20):
                 batch=functions[start:start+20];receipt['write_attempted']=True;receipt['batches_attempted']+=1
-                response=self._call(BatchSetCdnDomainConfigRequest,DomainNames=self.resource['domain'],Functions=json.dumps(batch,separators=(',',':')))
-                rows=response.get('DomainConfigList',{}).get('DomainConfigModel',[])
-                require(len(rows)==len(batch) and len({str(x.get('ConfigId')) for x in rows})==len(batch)
-                        and all(str(x.get('ConfigId','')).isdecimal() and int(x['ConfigId'])>0
-                                and x.get('DomainName')==self.resource['domain'] and x.get('FunctionName')==FUNCTION for x in rows),
-                        'CDN returned missing/duplicate/failed configuration IDs')
-                returned_ids.extend(str(x['ConfigId']) for x in rows)
-            after=self.read_configuration();receipt['after_sha256']=after['sha256']
+                payload=dict(Action='BatchSetCdnDomainConfig',DomainNames=self.resource['domain'],Functions=json.dumps(batch,separators=(',',':')))
+                step=(self.execution_budget.begin_cdn_step(kind='configuration',ordinal=start//20,
+                    payload=payload,before_sha256=before['sha256']) if self.execution_budget is not None else None)
+                try:
+                    response=self._call(BatchSetCdnDomainConfigRequest,DomainNames=payload['DomainNames'],Functions=payload['Functions'])
+                    rows=response.get('DomainConfigList',{}).get('DomainConfigModel',[])
+                    require(set(response)<={'RequestId','DomainConfigList'} and isinstance(rows,list)
+                            and len(rows)==len(batch) and all(isinstance(x,dict) for x in rows)
+                            and len({str(x.get('ConfigId')) for x in rows})==len(batch)
+                            and all(set(x)=={'ConfigId','DomainName','FunctionName'}
+                                    and type(x.get('ConfigId')) in (int,str) and str(x['ConfigId']).isdecimal() and int(x['ConfigId'])>0
+                                    and x.get('DomainName')==self.resource['domain'] and x.get('FunctionName')==FUNCTION for x in rows),
+                            'CDN returned missing/duplicate/failed configuration IDs')
+                    ids=[str(x['ConfigId']) for x in rows];returned_ids.extend(ids)
+                    if step is not None:pending.append((step,ids))
+                finally:
+                    if self.execution_budget is not None:self.execution_budget.end_cdn_step(step)
+            after=self.read_configuration();receipt['after_sha256']=after['sha256'];observed(after)
             actual=[x for x in after['configs'] if x['FunctionName']==FUNCTION]
             require(len(set(returned_ids))==len(functions) and set(returned_ids)=={str(x['ConfigId']) for x in actual},
                     'returned configuration IDs differ from readback')
@@ -435,7 +480,8 @@ class Provider:
             self._configuration_ready(after);receipt['state']='readback_verified'
         except Exception:
             receipt['error']='configuration operation incomplete'
-            try:receipt['after_sha256']=self.read_configuration()['sha256']
+            try:
+                after=self.read_configuration();receipt['after_sha256']=after['sha256'];observed(after)
             except Exception:pass
         return receipt
 
@@ -464,24 +510,23 @@ class Provider:
         ids=[]
         for start in range(0,len(urls),50):
             group=urls[start:start+50]
-            raw=self._call(RefreshObjectCachesRequest,ObjectPath='\n'.join(group),ObjectType='File').get('RefreshTaskId','')
-            require(isinstance(raw,str),'refresh task IDs incomplete')
-            returned=raw.split(',')
-            require(0<len(returned)<=len(group) and len(set(returned))==len(returned)
-                    and all(re.fullmatch(r'[1-9][0-9]{0,31}',value) for value in returned),'refresh task IDs incomplete')
-            ids.extend(value for value in returned if value not in ids)
+            payload=dict(Action='RefreshObjectCaches',ObjectPath='\n'.join(group),ObjectType='File')
+            step=(self.execution_budget.begin_cdn_step(kind='refresh',ordinal=start//50,payload=payload)
+                  if self.execution_budget is not None else None)
+            try:
+                response=self._call(RefreshObjectCachesRequest,ObjectPath=payload['ObjectPath'],ObjectType='File')
+                raw=response.get('RefreshTaskId','')
+                require(set(response)<={'RequestId','RefreshTaskId'} and isinstance(raw,str),'refresh task IDs incomplete')
+                returned=raw.split(',')
+                require(0<len(returned)<=len(group) and len(set(returned))==len(returned)
+                        and all(re.fullmatch(r'[1-9][0-9]{0,31}',value) for value in returned),'refresh task IDs incomplete')
+                if self.execution_budget is not None:self.execution_budget.acknowledge_cdn_step(step,{'task_ids':returned})
+                ids.extend(value for value in returned if value not in ids)
+            finally:
+                if self.execution_budget is not None:self.execution_budget.end_cdn_step(step)
         bindings=None
         for attempt in range(max_polls):
-            rows=[]
-            for start in range(0,len(ids),10):
-                group=ids[start:start+10]
-                response=self._call(DescribeRefreshTaskByIdRequest,TaskId=','.join(group));batch=response.get('Tasks')
-                require(isinstance(batch,list) and len(group)<=len(batch)<=len(urls)
-                        and type(response.get('TotalCount')) is int and response['TotalCount']==len(batch)
-                        and all(isinstance(row,dict) for row in batch)
-                        and {str(row.get('TaskId')) for row in batch}==set(group),'foreign/missing refresh task')
-                require(len(rows)+len(batch)<=len(urls),'refresh rows exceed requested URL bound')
-                rows.extend(batch)
+            rows=self._read_refresh_tasks(ids,urls)
             paths=[row.get('ObjectPath') for row in rows]
             require(all(isinstance(path,str) for path in paths) and len(paths)==len(set(paths))
                     and set(paths)==set(urls),'refresh URL identity differs')
@@ -492,6 +537,28 @@ class Provider:
             if all(row['Status']=='Complete' for row in rows):return {'state':'tasks_complete','task_ids':ids,**FALSE_FIELDS}
             if attempt+1<max_polls:time.sleep(poll_interval)
         raise ProviderError('refresh deadline exhausted')
+
+    def _read_refresh_tasks(self, ids, urls):
+        """Read only recorded positive IDs and rows in an exact finite URL universe."""
+        require(isinstance(ids,list) and 0<len(ids)<=1000 and len(set(ids))==len(ids)
+                and all(isinstance(x,str) and re.fullmatch(r'[1-9][0-9]{0,31}',x) for x in ids)
+                and isinstance(urls,list) and 0<len(urls)<=1000 and len(set(urls))==len(urls),
+                'bounded recorded refresh scope required')
+        rows=[]
+        for start in range(0,len(ids),10):
+            group=ids[start:start+10]
+            response=self._call(DescribeRefreshTaskByIdRequest,TaskId=','.join(group));batch=response.get('Tasks')
+            require(isinstance(batch,list) and len(group)<=len(batch)<=len(urls)
+                    and type(response.get('TotalCount')) is int and response['TotalCount']==len(batch)
+                    and all(isinstance(row,dict) for row in batch)
+                    and {str(row.get('TaskId')) for row in batch}==set(group),'foreign/missing refresh task')
+            require(len(rows)+len(batch)<=len(urls),'refresh rows exceed requested URL bound')
+            rows.extend(batch)
+        paths=[row.get('ObjectPath') for row in rows]
+        require(all(isinstance(path,str) and path in urls for path in paths) and len(set(paths))==len(paths)
+                and all(row.get('ObjectType')=='file' and row.get('Status') in ('Complete','Refreshing') for row in rows),
+                'recorded refresh rows differ from exact scope')
+        return rows
 
     def activate(self, *args, **kwargs):
         """Refuse publication until independently reviewed authority and live wire proof exist."""

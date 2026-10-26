@@ -56,6 +56,693 @@ class StagingExecutionContract(unittest.TestCase):
                 'max_routes': 1000, 'max_put_bytes': 2 * 1024**3, 'max_get_bytes': 8 * 1024**3,
                 'max_evidence_bytes': 8 * 1024**2}}
 
+    def _cdn_effect_fixture(self, *, refresh=False, routes=None):
+        """New evidence version is private data, never production authority."""
+        import copy
+        self.provider.bind_execution_controls(budget=None)
+        before = self.provider.read_configuration()
+        routes = routes or [self.sdk.route()]
+        urls = ['https://packages.githubim.com'+x['public_uri'] for x in routes]
+        request = copy.deepcopy(self.request)
+        request['operation'] = 'cdn_effects'
+        request['cdn_intent'] = {'routes': routes, 'configuration_before': before,
+            'functions': module('effect_compiler', ROOT / 'scripts/aliyun-object-storage-provider.py').compile_rewrites(routes),
+            'refresh_urls': urls}
+        budget = self.execution.RunBudget(request['limits'])
+        prepared_raw = self.execution.canonical({'objects': [], 'routes': routes})
+        prior = self.github.root / ('refresh-prior' if refresh else 'config-prior')
+        (prior / 'prepared').mkdir(parents=True, exist_ok=True)
+        (prior / 'prepared/delivery.json').write_bytes(prepared_raw)
+        request['output_dir'] = str(prior)
+        journal = self.execution.EffectJournal(self.github.root / ('refresh-effects.jsonl' if refresh else 'config-effects.jsonl'),
+            request, hashlib.sha256(prepared_raw).hexdigest(), {'fixture_anchor': 'fixed'}, budget)
+        self.addCleanup(journal.close)
+        budget.journal = journal
+        self.provider.bind_execution_controls(budget=budget)
+        return request, before, routes, urls, budget, journal, prepared_raw
+
+    def test_cdn_effect_journal_configuration_uses_signed_sdk_and_consumed_ack(self):
+        request, before, routes, urls, budget, journal, prepared = self._cdn_effect_fixture()
+        result = self.provider.apply_rewrites(routes, before=before, managed_ids=[])
+        writes = [x for x in self.wire.requests if x[2] == 'BatchSetCdnDomainConfig']
+        print(json.dumps({'cdn_effect_fixture': 'configuration', 'mutating_wire_calls': len(writes),
+            'socket_attempts': len(self.connect_attempts), 'state': result['state']}))
+        self.assertEqual(result['state'], 'readback_verified')
+        self.assertEqual(len(writes), 1)
+        journal.close()
+        events = [json.loads(line) for line in journal.path.read_bytes().splitlines()]
+        self.assertEqual(events[0]['event'], 'run_start_v2')
+        self.assertEqual(len([x for x in events if x['event'] == 'cdn_ack']), 1)
+        self.assertNotIn(self.sdk.TOKEN, journal.path.read_text())
+        self.assertNotIn(self.sdk.SECRET, journal.path.read_text())
+
+    def test_cdn_effect_journal_refresh_uses_signed_sdk_and_consumed_ack(self):
+        request, before, routes, urls, budget, journal, prepared = self._cdn_effect_fixture(refresh=True)
+        try:
+            result = self.provider.refresh(urls, poll_interval=0)
+        except Exception:
+            result = {'state': 'incomplete'}
+        writes = [x for x in self.wire.requests if x[2] == 'RefreshObjectCaches']
+        print(json.dumps({'cdn_effect_fixture': 'refresh', 'mutating_wire_calls': len(writes),
+            'socket_attempts': len(self.connect_attempts), 'state': result['state']}))
+        self.assertEqual(result['state'], 'tasks_complete')
+        self.assertEqual(len(writes), 1)
+        journal.close()
+        events = [json.loads(line) for line in journal.path.read_bytes().splitlines()]
+        self.assertEqual(events[0]['event'], 'run_start_v2')
+        self.assertEqual(len([x for x in events if x['event'] == 'cdn_ack']), 1)
+        self.assertNotIn(self.sdk.TOKEN, journal.path.read_text())
+        self.assertNotIn(self.sdk.SECRET, journal.path.read_text())
+
+    def _effect_summary(self, request, journal, prepared, *, raw=None):
+        journal.close()
+        return self.execution._bound_effect_journal(request,
+            journal.path.read_bytes() if raw is None else raw, prepared)
+
+    def test_cdn_effect_journal_default_staging_still_refuses_post(self):
+        request, before, routes, urls, budget, journal, prepared = self._cdn_effect_fixture()
+        budget.journal = self.execution.EffectJournal(self.github.root / 'staging-default.jsonl',
+            self.request, hashlib.sha256(prepared).hexdigest(), {}, budget)
+        self.addCleanup(budget.journal.close)
+        self.assertEqual(self.provider.apply_rewrites(routes, before=before, managed_ids=[])['state'], 'incomplete')
+        self.assertFalse(any(x[2] == 'BatchSetCdnDomainConfig' for x in self.wire.requests))
+
+    def test_cdn_effect_journal_unknown_attempt_fsynced_before_signed_wire(self):
+        request, before, routes, urls, budget, journal, prepared = self._cdn_effect_fixture()
+        send = self.wire.send
+        def observe(actual, **kwargs):
+            from urllib.parse import parse_qs, urlsplit
+            fields = parse_qs(urlsplit(actual.url).query)
+            fields.update(parse_qs(actual.body.decode() if isinstance(actual.body, bytes) else actual.body or ''))
+            if fields.get('Action') == ['BatchSetCdnDomainConfig']:
+                events = [json.loads(x) for x in journal.path.read_bytes().splitlines()]
+                attempt = events[-1]
+                self.assertEqual(attempt['event'], 'request_attempt')
+                self.assertEqual(attempt['outcome'], 'unknown')
+                raw = actual.method.encode()+b'\n'+actual.url.encode()+b'\n'+(actual.body if isinstance(actual.body, bytes) else (actual.body or '').encode())
+                self.assertEqual(attempt['serialized_request_sha256'], hashlib.sha256(raw).hexdigest())
+            return send(actual, **kwargs)
+        self.wire.send = observe
+        self.assertEqual(self.provider.apply_rewrites(routes, before=before, managed_ids=[])['state'], 'readback_verified')
+        summary = self._effect_summary(request, journal, prepared)
+        self.assertEqual(summary['unknown_by_kind'], {'put': 0, 'configuration': 0, 'refresh': 0})
+
+    def test_cdn_effect_journal_signed_payload_conflicts_stop_before_wire(self):
+        from urllib.parse import parse_qs, urlencode, urlsplit
+        for fault in ('domain', 'functions', 'duplicate', 'action', 'delete'):
+            with self.subTest(fault=fault):
+                request, before, routes, urls, budget, journal, prepared = self._cdn_effect_fixture()
+                original = budget.before_sdk
+                def change(actual):
+                    fields = parse_qs(urlsplit(actual.url).query)
+                    body = actual.body.decode() if isinstance(actual.body, bytes) else actual.body or ''
+                    values = parse_qs(body)
+                    action = values.get('Action', fields.get('Action', ['']))[0]
+                    if action == 'BatchSetCdnDomainConfig':
+                        merged = {**fields, **values}
+                        if fault == 'domain': merged['DomainNames'] = ['foreign.example']
+                        elif fault == 'functions': merged['Functions'] = ['[]']
+                        elif fault == 'duplicate': merged['DomainNames'] *= 2
+                        elif fault == 'action': merged['Action'] = ['RefreshObjectCaches']
+                        else: merged['Action'] = ['DeleteSpecificConfig']
+                        actual.url = 'https://cdn.aliyuncs.com/'
+                        actual.body = urlencode(merged, doseq=True)
+                    return original(actual)
+                budget.before_sdk = change
+                count = len([x for x in self.wire.requests if x[2] == 'BatchSetCdnDomainConfig'])
+                self.assertEqual(self.provider.apply_rewrites(routes, before=before, managed_ids=[])['state'], 'incomplete')
+                self.assertEqual(len([x for x in self.wire.requests if x[2] == 'BatchSetCdnDomainConfig']), count)
+                journal.close();journal.path.unlink()
+
+    def test_cdn_effect_journal_headers_body_faults_remain_unknown(self):
+        for fault in ('interrupted', 'malformed', 'nonobject', 'duplicate_json', '503', 'extra_secret'):
+            with self.subTest(fault=fault):
+                request, before, routes, urls, budget, journal, prepared = self._cdn_effect_fixture()
+                send = self.wire.send
+                def change(actual, **kwargs):
+                    response = send(actual, **kwargs)
+                    if self.wire.requests[-1][2] == 'BatchSetCdnDomainConfig':
+                        if fault == 'interrupted':
+                            class Broken(io.BytesIO):
+                                def read(self, *args, **kwargs): raise OSError(self.sdk.SECRET)
+                            response.raw = Broken(b'ignored')
+                        elif fault == '503': response.status_code = 503
+                        else:
+                            raw = b'{' if fault == 'malformed' else b'[]' if fault == 'nonobject' else b'{"DomainConfigList":{},"DomainConfigList":{}}' if fault == 'duplicate_json' else json.dumps({'DomainConfigList': {'DomainConfigModel': []}, 'Secret': self.sdk.TOKEN}).encode()
+                            response.raw = io.BytesIO(raw)
+                    return response
+                self.wire.send = change
+                self.assertEqual(self.provider.apply_rewrites(routes, before=before, managed_ids=[])['state'], 'incomplete')
+                summary = self._effect_summary(request, journal, prepared)
+                self.assertEqual(summary['unknown_by_kind']['configuration'], 1)
+                events = [json.loads(x) for x in journal.path.read_bytes().splitlines()]
+                self.assertFalse(any(x['event'] == 'cdn_ack' for x in events))
+                self.assertNotIn(self.sdk.TOKEN, journal.path.read_text())
+                self.assertNotIn(self.sdk.SECRET, journal.path.read_text())
+                self.wire.send = send;journal.path.unlink()
+                self.wire.configs = [x for x in self.wire.configs if x['FunctionName'] != 'back_to_origin_url_rewrite']
+
+    def test_cdn_effect_journal_invalid_config_ids_do_not_resolve_original(self):
+        for fault in ('zero', 'missing', 'duplicate', 'partial', 'wrongid', 'timeout'):
+            with self.subTest(fault=fault):
+                request, before, routes, urls, budget, journal, prepared = self._cdn_effect_fixture()
+                if fault == 'partial':
+                    journal.close();journal.path.unlink()
+                    request, before, routes, urls, budget, journal, prepared = self._cdn_effect_fixture(routes=[self.sdk.route('/one'), self.sdk.route('/two')])
+                self.wire.batch_fault = fault
+                self.assertEqual(self.provider.apply_rewrites(routes, before=before, managed_ids=[])['state'], 'incomplete')
+                summary = self._effect_summary(request, journal, prepared)
+                self.assertEqual(summary['unknown_by_kind']['configuration'], 1)
+                journal.path.unlink();self.wire.batch_fault = None
+                self.wire.configs = [x for x in self.wire.configs if x['FunctionName'] != 'back_to_origin_url_rewrite']
+
+    def test_cdn_effect_journal_fsync_failures_before_and_after_effect(self):
+        for event in ('request_attempt', 'cdn_ack'):
+            with self.subTest(event=event):
+                request, before, routes, urls, budget, journal, prepared = self._cdn_effect_fixture()
+                record = journal.record
+                def broken(value):
+                    if value['event'] == event and (event != 'request_attempt' or value.get('action') == 'BatchSetCdnDomainConfig'):
+                        with mock.patch.object(self.execution.os, 'fsync', side_effect=OSError('fixture fsync')):
+                            return record(value)
+                    return record(value)
+                journal.record = broken
+                before_writes = len([x for x in self.wire.requests if x[2] == 'BatchSetCdnDomainConfig'])
+                self.assertEqual(self.provider.apply_rewrites(routes, before=before, managed_ids=[])['state'], 'incomplete')
+                count = len([x for x in self.wire.requests if x[2] == 'BatchSetCdnDomainConfig'])-before_writes
+                self.assertEqual(count, 0 if event == 'request_attempt' else 1)
+                summary = self._effect_summary(request, journal, prepared)
+                self.assertEqual(summary['unknown_by_kind']['configuration'], 0 if event == 'request_attempt' else 1)
+                journal.path.unlink();self.wire.configs = [x for x in self.wire.configs if x['FunctionName'] != 'back_to_origin_url_rewrite']
+
+    def test_cdn_effect_journal_parser_rejects_ambiguous_events_and_old_parser(self):
+        request, before, routes, urls, budget, journal, prepared = self._cdn_effect_fixture()
+        self.assertEqual(self.provider.apply_rewrites(routes, before=before, managed_ids=[])['state'], 'readback_verified')
+        journal.close();raw = journal.path.read_bytes();events = [json.loads(x) for x in raw.splitlines()]
+        with self.assertRaises(self.execution.ExecutionError):self.execution._bound_staging_journal(request, raw, prepared)
+        for fault in ('unknown_event', 'duplicate_attempt', 'duplicate_ack', 'wrong_payload', 'wrong_header', 'wrong_intent', 'boolean_ticket'):
+            import copy
+            damaged = copy.deepcopy(events)
+            if fault == 'unknown_event':damaged.append({'event': 'not_registered'})
+            elif fault == 'duplicate_attempt':damaged.append(next(x for x in damaged if x['event'] == 'request_attempt'))
+            elif fault == 'duplicate_ack':damaged.append(next(x for x in damaged if x['event'] == 'cdn_ack'))
+            elif fault == 'wrong_payload':next(x for x in damaged if x['event'] == 'cdn_step')['payload_sha256'] = '0'*64
+            elif fault == 'wrong_header':damaged[0]['plan_sha256'] = '0'*64
+            elif fault == 'boolean_ticket':next(x for x in damaged if x['event'] == 'request_result')['request_id'] = True
+            else:damaged[0]['intent_sha256'] = '0'*64
+            with self.subTest(fault=fault), self.assertRaises((self.execution.ExecutionError, ValueError, KeyError)):
+                self.execution._bound_effect_journal(request, b''.join(self.execution.canonical(x) for x in damaged), prepared)
+        summary = self.execution._bound_effect_journal(request, raw+b'{"event":', prepared)
+        self.assertTrue(summary['partial_tail'])
+        self.assertEqual(summary['unknown_by_kind']['configuration'], 0)
+
+    def test_cdn_effect_journal_refresh_shared_ids_and_unknown_later_batch(self):
+        routes = [self.sdk.route('/r'+str(i), 'public/r'+str(i)) for i in range(51)]
+        for fault in (None, 'submit_timeout', 'submit_ids'):
+            with self.subTest(fault=fault):
+                wire = self.sdk.RefreshWire(mode='aggregate', fault=fault)
+                self.provider.session.mount('https://', wire)
+                request, before, routes, urls, budget, journal, prepared = self._cdn_effect_fixture(refresh=True, routes=routes)
+                try:result = self.provider.refresh(urls, poll_interval=0)
+                except Exception:result = {'state': 'incomplete'}
+                summary = self._effect_summary(request, journal, prepared)
+                self.assertEqual(result['state'], 'tasks_complete' if fault is None else 'incomplete')
+                self.assertEqual(wire.submissions, 2 if fault != 'submit_ids' else 1)
+                self.assertEqual(summary['unknown_by_kind']['refresh'], 0 if fault is None else 1)
+                if fault == 'submit_timeout':self.assertEqual(len(summary['acknowledged_task_ids']), 1)
+                if fault is None:self.assertEqual(len(summary['acknowledged_task_ids']), 1)
+                self.assertNotIn(self.sdk.TOKEN, journal.path.read_text());journal.path.unlink()
+
+    def test_cdn_effect_journal_original_unknown_not_cleared_by_readonly_reconcile(self):
+        request, before, routes, urls, budget, journal, prepared = self._cdn_effect_fixture()
+        self.wire.batch_fault = 'timeout'
+        self.assertEqual(self.provider.apply_rewrites(routes, before=before, managed_ids=[])['state'], 'incomplete')
+        journal.close();self.wire.batch_fault = None
+        count = len(self.wire.requests)
+        result = self.execution._reconcile_cdn_effects(request, provider=self.provider,
+            journal_path=journal.path, journal_sha256=hashlib.sha256(journal.path.read_bytes()).hexdigest(),
+            output_dir=self.github.root / 'cdn-reconcile')
+        self.assertEqual(result['original_unknown_by_kind']['configuration'], 1)
+        self.assertIn('configuration_observed_now', result)
+        self.assertFalse(any(x[2] in ('BatchSetCdnDomainConfig','RefreshObjectCaches') for x in self.wire.requests[count:]))
+        self.assertFalse(result['publication_verified'])
+
+    def test_cdn_effect_journal_missing_refresh_id_never_queries_history(self):
+        wire = self.sdk.RefreshWire(mode='aggregate', fault='submit_timeout')
+        self.provider.session.mount('https://', wire)
+        routes = [self.sdk.route('/r'+str(i), 'public/r'+str(i)) for i in range(51)]
+        request, before, routes, urls, budget, journal, prepared = self._cdn_effect_fixture(refresh=True, routes=routes)
+        with self.assertRaises(Exception):self.provider.refresh(urls, poll_interval=0)
+        journal.close();wire.fault = None;count = len(wire.requests)
+        result = self.execution._reconcile_cdn_effects(request, provider=self.provider,
+            journal_path=journal.path, journal_sha256=hashlib.sha256(journal.path.read_bytes()).hexdigest(),
+            output_dir=self.github.root / 'refresh-reconcile')
+        self.assertEqual(result['original_unknown_by_kind']['refresh'], 1)
+        self.assertEqual(len(result['unobservable_refresh_submissions']), 1)
+        for actual, kwargs, action, fields in wire.requests[count:]:
+            self.assertNotIn(action, ('BatchSetCdnDomainConfig','RefreshObjectCaches'))
+            if action == 'DescribeRefreshTaskById':self.assertEqual(fields['TaskId'], ['33643947491'])
+
+    def test_cdn_effect_journal_binding_drift_rejected_before_provider_reads(self):
+        request, before, routes, urls, budget, journal, prepared = self._cdn_effect_fixture()
+        journal.close()
+        for field in ('plan_sha256','inputs_sha256','resource'):
+            import copy
+            changed = copy.deepcopy(request)
+            if field == 'resource':changed[field]['bucket'] = 'other-bucket'
+            else:changed[field] = '0'*64
+            count = len(self.wire.requests)
+            with self.subTest(field=field), self.assertRaises(self.execution.ExecutionError):
+                self.execution._reconcile_cdn_effects(changed, provider=self.provider,
+                    journal_path=journal.path, journal_sha256=hashlib.sha256(journal.path.read_bytes()).hexdigest(),
+                    output_dir=self.github.root / ('invalid-'+field))
+            self.assertEqual(len(self.wire.requests), count)
+
+    def test_cdn_effect_journal_deadline_read_cap_and_readonly_stop_post(self):
+        for fault in ('deadline','read_cap','request_cap','readonly'):
+            with self.subTest(fault=fault):
+                request, before, routes, urls, budget, journal, prepared = self._cdn_effect_fixture()
+                if fault == 'deadline':budget.deadline = budget.clock()-1
+                elif fault == 'read_cap':budget.get_bytes = budget.limits['max_get_bytes']
+                elif fault == 'request_cap':budget.requests = budget.limits['max_requests']
+                else:budget.read_only = True
+                try:result = self.provider.apply_rewrites(routes, before=before, managed_ids=[])
+                except Exception:result = {'state': 'incomplete'}
+                self.assertEqual(result['state'], 'incomplete')
+                self.assertFalse(any(x[2] == 'BatchSetCdnDomainConfig' for x in self.wire.requests))
+                journal.close();journal.path.unlink()
+
+    def test_cdn_effect_journal_scopes_cannot_overlap_or_reuse(self):
+        request, before, routes, urls, budget, journal, prepared = self._cdn_effect_fixture()
+        kwargs = dict(kind='configuration', ordinal=0, payload={'Action':'BatchSetCdnDomainConfig',
+            'DomainNames':'packages.githubim.com','Functions':json.dumps(request['cdn_intent']['functions'],separators=(',',':'))},
+            before_sha256=before['sha256'], target_sha256=self.execution.digest(request['cdn_intent']['functions']))
+        step = budget.begin_cdn_step(**kwargs)
+        with self.assertRaises(self.execution.ExecutionError):budget.begin_cdn_step(**kwargs)
+        budget.end_cdn_step(step)
+        with self.assertRaises(self.execution.ExecutionError):budget.begin_cdn_step(**kwargs)
+        self.assertFalse(any(x[2] in ('BatchSetCdnDomainConfig','RefreshObjectCaches') for x in self.wire.requests))
+
+    def test_cdn_effect_journal_first_batch_ack_survives_unknown_later_batch(self):
+        routes = [self.sdk.route('/r'+str(i)) for i in range(21)]
+        request, before, routes, urls, budget, journal, prepared = self._cdn_effect_fixture(routes=routes)
+        send = self.wire.send; batches = []
+        def fault(actual, **kwargs):
+            from urllib.parse import parse_qs, urlsplit
+            fields = parse_qs(urlsplit(actual.url).query)
+            fields.update(parse_qs(actual.body.decode() if isinstance(actual.body, bytes) else actual.body or ''))
+            if fields.get('Action') == ['BatchSetCdnDomainConfig']:
+                batches.append(True)
+                if len(batches) == 2:self.wire.batch_fault = 'timeout'
+            return send(actual, **kwargs)
+        self.wire.send = fault
+        result = self.provider.apply_rewrites(routes, before=before, managed_ids=[])
+        self.assertEqual(result['state'], 'incomplete')
+        summary = self._effect_summary(request, journal, prepared)
+        self.assertEqual(summary['unknown_by_kind']['configuration'], 1)
+        self.assertEqual(len(summary['acknowledged_configuration_requests']), 1)
+        self.assertEqual(len(batches), 2)
+
+    def test_cdn_effect_journal_ack_is_distinct_from_unrelated_configuration_drift(self):
+        request, before, routes, urls, budget, journal, prepared = self._cdn_effect_fixture()
+        send = self.wire.send
+        def drift(actual, **kwargs):
+            response = send(actual, **kwargs)
+            if self.wire.requests[-1][2] == 'BatchSetCdnDomainConfig':self.wire.detail['VisibleDrift'] = 'changed'
+            return response
+        self.wire.send = drift
+        result = self.provider.apply_rewrites(routes, before=before, managed_ids=[])
+        self.assertEqual(result['state'], 'incomplete')
+        self.assertEqual(result['configuration_observed_now']['detail']['VisibleDrift'], 'changed')
+        summary = self._effect_summary(request, journal, prepared)
+        self.assertEqual(summary['unknown_by_kind']['configuration'], 0)
+        self.assertIn('configuration_observed_now', summary)
+
+    def test_cdn_effect_journal_configuration_argument_order_is_observed_not_semantic_drift(self):
+        request, before, routes, urls, budget, journal, prepared = self._cdn_effect_fixture()
+        send = self.wire.send
+        def reorder(actual, **kwargs):
+            response = send(actual, **kwargs)
+            if self.wire.requests[-1][2] == 'BatchSetCdnDomainConfig':
+                for row in self.wire.configs:
+                    if row['FunctionName'] == 'back_to_origin_url_rewrite':row['FunctionArgs']['FunctionArg'].reverse()
+            return response
+        self.wire.send = reorder
+        self.assertEqual(self.provider.apply_rewrites(routes, before=before, managed_ids=[])['state'], 'readback_verified')
+        self.assertEqual(self._effect_summary(request, journal, prepared)['unknown_by_kind']['configuration'], 0)
+
+    def test_cdn_effect_journal_C1_credential_echo_never_enters_receipt(self):
+        request, before, routes, urls, budget, journal, prepared = self._cdn_effect_fixture()
+        send = self.wire.send
+        def echo(actual, **kwargs):
+            response = send(actual, **kwargs)
+            if self.wire.requests[-1][2] == 'BatchSetCdnDomainConfig':self.wire.detail['UnexpectedEcho'] = self.sdk.TOKEN
+            return response
+        self.wire.send = echo
+        result = self.provider.apply_rewrites(routes, before=before, managed_ids=[])
+        self.assertEqual(result['state'], 'incomplete')
+        self.assertNotIn(self.sdk.TOKEN, json.dumps(result))
+        self.assertNotIn(self.sdk.TOKEN, journal.path.read_text())
+        self.assertEqual(self._effect_summary(request, journal, prepared)['unknown_by_kind']['configuration'], 1)
+
+    def test_cdn_effect_journal_preparation_and_budget_are_checked_before_file_open(self):
+        for fault in ('budget', 'preparation_bytes', 'routes'):
+            with self.subTest(fault=fault):
+                request, before, routes, urls, budget, journal, prepared = self._cdn_effect_fixture()
+                journal.close();journal.path.unlink();created = None
+                if fault == 'budget':budget.limits['max_requests'] += 1
+                elif fault == 'preparation_bytes':(Path(request['output_dir']) / 'prepared/delivery.json').write_bytes(prepared+b' ')
+                else:
+                    prepared = self.execution.canonical({'objects': [], 'routes': [self.sdk.route('/foreign')]})
+                    (Path(request['output_dir']) / 'prepared/delivery.json').write_bytes(prepared)
+                try:
+                    with self.assertRaises(self.execution.ExecutionError):
+                        created = self.execution.EffectJournal(journal.path, request,
+                            hashlib.sha256(prepared).hexdigest(), {}, budget)
+                    self.assertFalse(journal.path.exists())
+                finally:
+                    if created is not None:created.close()
+                    journal.path.unlink(missing_ok=True)
+
+    def test_cdn_effect_journal_initial_fsync_failure_reclaims_descriptor(self):
+        request, before, routes, urls, budget, journal, prepared = self._cdn_effect_fixture()
+        journal.close();journal.path.unlink();opened = [];original = self.execution.os.open
+        def observe(path, *args, **kwargs):
+            fd = original(path, *args, **kwargs)
+            if Path(path) == journal.path:opened.append(fd)
+            return fd
+        def close_owned():
+            for fd in opened:
+                try:self.execution.os.close(fd)
+                except OSError:pass
+        self.addCleanup(close_owned)
+        with mock.patch.object(self.execution.os, 'open', side_effect=observe), mock.patch.object(self.execution.os, 'fsync', side_effect=OSError('fixture initial fsync')):
+            with self.assertRaises(OSError):self.execution.EffectJournal(journal.path, request,
+                hashlib.sha256(prepared).hexdigest(), {}, budget)
+        self.assertEqual(len(opened), 1)
+        with self.assertRaises(OSError):self.execution.os.fstat(opened[0])
+
+    def _owner_state(self, owner, journal):
+        return (owner.deadline, owner.requests, owner.get_bytes, owner.put_bytes,
+            journal.bytes_written, journal.next_id, hashlib.sha256(journal.path.read_bytes()).hexdigest())
+
+    def test_cdn_budget_owner_fresh_same_limits_cannot_transplant_original_journal(self):
+        for operation in ('configuration', 'refresh'):
+            for fault in ('healthy', 'expired', 'request_credit', 'read_credit', 'cancelled', 'evidence_credit'):
+                with self.subTest(operation=operation, fault=fault):
+                    request, before, routes, urls, owner, journal, prepared = self._cdn_effect_fixture()
+                    if fault == 'expired':owner.clock = lambda: owner.deadline+1
+                    elif fault == 'request_credit':owner.requests = owner.limits['max_requests']
+                    elif fault == 'read_credit':owner.get_bytes = owner.limits['max_get_bytes']
+                    elif fault == 'cancelled':owner.cancelled = True
+                    elif fault == 'evidence_credit':journal.bytes_written = owner.limits['max_evidence_bytes']-2048
+                    fresh = self.execution.RunBudget(request['limits']);fresh.journal = journal
+                    original = self._owner_state(owner, journal);count = len(self.wire.requests)
+                    try:
+                        try:
+                            self.provider.bind_execution_controls(budget=fresh)
+                            if operation == 'configuration':self.provider.apply_rewrites(routes, before=before, managed_ids=[])
+                            else:self.provider.refresh(urls, poll_interval=0)
+                        except Exception:pass
+                        calls = self.wire.requests[count:]
+                        print(json.dumps({'owner_fixture': fault, 'operation': operation, 'new_wire_calls': len(calls),
+                            'new_mutating_wire_calls': sum(x[2] in ('BatchSetCdnDomainConfig','RefreshObjectCaches') for x in calls),
+                            'socket_attempts': len(self.connect_attempts)}))
+                        self.assertEqual(len(calls), 0)
+                        self.assertEqual(self._owner_state(owner, journal), original)
+                        self.assertEqual((fresh.requests, fresh.get_bytes, fresh.put_bytes), (0,0,0))
+                    finally:
+                        journal.close();journal.path.unlink()
+                        self.wire.configs = [x for x in self.wire.configs if x['FunctionName'] != 'back_to_origin_url_rewrite']
+
+    def test_cdn_budget_owner_transport_checks_even_if_binding_method_is_bypassed(self):
+        for mode in ('session_only','both_fields'):
+            with self.subTest(mode=mode):
+                request, before, routes, urls, owner, journal, prepared = self._cdn_effect_fixture()
+                fresh = self.execution.RunBudget(request['limits']);fresh.journal = journal
+                self.provider.session.execution_budget = fresh
+                if mode == 'both_fields':self.provider.execution_budget = fresh
+                original = self._owner_state(owner, journal);count = len(self.wire.requests)
+                try:
+                    try:self.provider.apply_rewrites(routes, before=before, managed_ids=[])
+                    except Exception:pass
+                    self.assertEqual(len(self.wire.requests[count:]), 0)
+                    self.assertEqual(self._owner_state(owner, journal), original)
+                finally:
+                    journal.close();journal.path.unlink()
+                    self.wire.configs = [x for x in self.wire.configs if x['FunctionName'] != 'back_to_origin_url_rewrite']
+
+    def test_cdn_budget_owner_changed_after_signed_attempt_stops_before_wire(self):
+        from urllib.parse import parse_qs, urlsplit
+        request, before, routes, urls, owner, journal, prepared = self._cdn_effect_fixture()
+        other = self.execution.RunBudget(request['limits'])
+        foreign = self.execution.EffectJournal(self.github.root / 'foreign-owner.jsonl', request,
+            hashlib.sha256(prepared).hexdigest(), {}, other)
+        self.addCleanup(foreign.close);other.journal = foreign
+        foreign_bytes = foreign.path.read_bytes();signed = owner.before_sdk; switched = []
+        def change(actual):
+            ticket = signed(actual)
+            fields = parse_qs(urlsplit(actual.url).query)
+            fields.update(parse_qs(actual.body.decode() if isinstance(actual.body, bytes) else actual.body or ''))
+            if fields.get('Action') == ['BatchSetCdnDomainConfig']:
+                switched.append((len(self.wire.requests), owner.requests, owner.deadline))
+                owner.journal = foreign
+            return ticket
+        owner.before_sdk = change
+        result = self.provider.apply_rewrites(routes, before=before, managed_ids=[])
+        self.assertEqual(result['state'], 'incomplete');self.assertEqual(len(switched), 1)
+        self.assertEqual(len(self.wire.requests[switched[0][0]:]), 0)
+        self.assertEqual((owner.requests, owner.deadline), switched[0][1:])
+        self.assertEqual(foreign.path.read_bytes(), foreign_bytes)
+        summary = self._effect_summary(request, journal, prepared)
+        self.assertEqual(summary['unknown_by_kind']['configuration'], 1)
+
+    def test_cdn_budget_owner_completion_helpers_refuse_before_delegate(self):
+        request, before, routes, urls, owner, journal, prepared = self._cdn_effect_fixture()
+        payload = {'Action':'BatchSetCdnDomainConfig', 'DomainNames':'packages.githubim.com',
+            'Functions':json.dumps(request['cdn_intent']['functions'],separators=(',',':'))}
+        step = owner.begin_cdn_step(kind='configuration', ordinal=0, payload=payload)
+        fresh = self.execution.RunBudget(request['limits']);fresh.journal = journal
+        cases = (
+            ('begin_cdn_step', (), {'kind':'configuration','ordinal':0,'payload':payload}, 'begin_cdn_step'),
+            ('end_cdn_step', (step,), {}, 'end_cdn_step'),
+            ('after_sdk', (1,200), {}, 'after_send'),
+            ('consumed_sdk', (1,200,1,'a'*64), {}, 'consumed'),
+            ('parsed_cdn_response', (), {}, 'parsed_response'),
+            ('acknowledge_cdn_step', (step,{'config_ids':['101']}), {}, 'acknowledge'),
+            ('observed_cdn_configuration', (before,), {}, 'observe_configuration'))
+        original = self._owner_state(owner, journal)
+        for method, args, kwargs, target in cases:
+            with self.subTest(method=method), mock.patch.object(journal, target) as delegated:
+                with self.assertRaises(self.execution.ExecutionError):getattr(fresh, method)(*args, **kwargs)
+                delegated.assert_not_called()
+                self.assertEqual(self._owner_state(owner, journal), original)
+        with self.assertRaises(self.execution.ExecutionError):fresh.cdn_configuration_matches(step, ['101'], before)
+        owner.end_cdn_step(step)
+
+    def test_cdn_budget_owner_urllib_refuses_before_opener(self):
+        import urllib.request
+        request, before, routes, urls, owner, journal, prepared = self._cdn_effect_fixture()
+        fresh = self.execution.RunBudget(request['limits']);fresh.journal = journal
+        from types import SimpleNamespace
+        opened = mock.Mock(return_value=SimpleNamespace(status=200))
+        original = self._owner_state(owner, journal)
+        with self.assertRaises(self.execution.ExecutionError):fresh.open(opened,
+            urllib.request.Request('https://api.github.com/repos/WuKongIM/packages'), timeout=2)
+        opened.assert_not_called();self.assertEqual(self._owner_state(owner, journal), original)
+
+    def test_cdn_budget_owner_late_same_owner_headers_and_scope_cleanup_are_retained(self):
+        for fault in ('expired','cancelled'):
+            with self.subTest(fault=fault):
+                request, before, routes, urls, owner, journal, prepared = self._cdn_effect_fixture()
+                send = self.wire.send; switched = []
+                def expire(actual, **kwargs):
+                    response = send(actual, **kwargs)
+                    if self.wire.requests[-1][2] == 'BatchSetCdnDomainConfig':
+                        switched.append(len(self.wire.requests))
+                        if fault == 'expired':owner.clock = lambda: owner.deadline+1
+                        else:owner.cancelled = True
+                    return response
+                self.wire.send = expire
+                self.assertEqual(self.provider.apply_rewrites(routes, before=before, managed_ids=[])['state'], 'incomplete')
+                self.assertEqual(len(switched),1);self.assertEqual(len(self.wire.requests),switched[0])
+                journal.close();events = [json.loads(x) for x in journal.path.read_bytes().splitlines()]
+                attempt = next(x for x in events if x['event']=='request_attempt' and 'step_id' in x)
+                self.assertTrue(any(x['event']=='request_result' and x['request_id']==attempt['request_id'] and x['status']==200 for x in events))
+                self.assertTrue(any(x['event']=='cdn_step_end' for x in events))
+                self.assertFalse(any(x['event'] in ('response_consumed','response_parsed','cdn_ack') for x in events))
+                journal.path.unlink();self.wire.send = send
+                self.wire.configs = [x for x in self.wire.configs if x['FunctionName'] != 'back_to_origin_url_rewrite']
+
+    def test_cdn_budget_owner_header_failure_still_closes_actual_sdk_response(self):
+        request, before, routes, urls, owner, journal, prepared = self._cdn_effect_fixture()
+        send = self.wire.send;record = journal.record; captured = [];target = []
+        owner.after_sdk = mock.Mock(wraps=owner.after_sdk)
+        def response(actual, **kwargs):
+            value = send(actual, **kwargs)
+            if self.wire.requests[-1][2] == 'BatchSetCdnDomainConfig':
+                captured.append(value.raw);target.append(journal.steps[journal.active_step]['ticket'])
+            return value
+        def fail_header(value):
+            if value['event']=='request_result' and value['request_id'] in target:
+                with mock.patch.object(self.execution.os,'fsync',side_effect=OSError('fixture header fsync')):return record(value)
+            return record(value)
+        self.wire.send = response;journal.record = fail_header
+        self.assertEqual(self.provider.apply_rewrites(routes, before=before, managed_ids=[])['state'], 'incomplete')
+        self.assertEqual(len(captured),1)
+        for raw in captured:self.addCleanup(raw.close)
+        self.assertTrue(captured[0].closed)
+        self.assertEqual([call.args[1] for call in owner.after_sdk.call_args_list if call.args[0] in target],[200])
+        self.assertEqual(self._effect_summary(request, journal, prepared)['unknown_by_kind']['configuration'],1)
+
+    def test_cdn_budget_owner_legacy_ports_and_none_unbinding_remain_compatible(self):
+        from types import SimpleNamespace
+        budget = self.execution.RunBudget(self.request['limits'])
+        legacy = SimpleNamespace(cdn_mode=False,after_send=mock.Mock())
+        budget.journal = legacy
+        budget.check();budget.after_sdk(1,200);legacy.after_send.assert_called_once_with(1,200)
+        virtual = SimpleNamespace()
+        self.provider.bind_execution_controls(budget=virtual)
+        self.assertIs(self.provider.execution_budget,virtual);self.assertIs(self.provider.session.execution_budget,virtual)
+        self.provider.bind_execution_controls(budget=None)
+        self.assertIsNone(self.provider.execution_budget);self.assertIsNone(self.provider.session.execution_budget)
+
+    def test_cdn_response_ownership_sdk_transport_error_with_and_without_response(self):
+        for mode in ('attached_response','no_response'):
+            with self.subTest(mode=mode):
+                request, before, routes, urls, owner, journal, prepared = self._cdn_effect_fixture()
+                send = self.wire.send;captured = [];target = []
+                owner.after_sdk = mock.Mock(wraps=owner.after_sdk)
+                def transport(actual, **kwargs):
+                    response = send(actual, **kwargs)
+                    if self.wire.requests[-1][2] == 'BatchSetCdnDomainConfig':
+                        target.append(journal.steps[journal.active_step]['ticket'])
+                        captured.append(response.raw);self.addCleanup(response.raw.close)
+                        if mode == 'attached_response':
+                            response.status_code = 503
+                            raise self.sdk.requests.HTTPError('fixture transport response',response=response,request=actual)
+                        response.close()
+                        raise self.sdk.requests.ReadTimeout('fixture no response')
+                    return response
+                self.wire.send = transport
+                try:
+                    self.assertEqual(self.provider.apply_rewrites(routes,before=before,managed_ids=[])['state'],'incomplete')
+                    self.assertEqual(len(captured),1);self.assertTrue(captured[0].closed)
+                    self.assertEqual([call.args[1] for call in owner.after_sdk.call_args_list if call.args[0] in target],[None])
+                    self.assertEqual(self._effect_summary(request,journal,prepared)['unknown_by_kind']['configuration'],1)
+                finally:
+                    journal.close();journal.path.unlink();self.wire.send = send
+                    self.wire.configs = [x for x in self.wire.configs if x['FunctionName'] != 'back_to_origin_url_rewrite']
+
+    def test_cdn_response_ownership_streamed_sdk_owner_change_closes_once(self):
+        request, before, routes, urls, owner, journal, prepared = self._cdn_effect_fixture()
+        other = self.execution.RunBudget(request['limits'])
+        foreign = self.execution.EffectJournal(self.github.root / 'stream-foreign.jsonl',request,
+            hashlib.sha256(prepared).hexdigest(),{},other)
+        self.addCleanup(foreign.close);other.journal = foreign
+        foreign_bytes = foreign.path.read_bytes();send = self.wire.send;captured = [];target = []
+        self.wire.objects[self.sdk.KEY] = (self.sdk.DATA,self.sdk.FACTS['cache_control'])
+        owner.after_sdk = mock.Mock(wraps=owner.after_sdk)
+        def transport(actual, **kwargs):
+            response = send(actual, **kwargs)
+            if actual.method == 'GET' and not self.wire.requests[-1][2]:
+                captured.append(response.raw);self.addCleanup(response.raw.close)
+                target.append(journal.next_id);owner.journal = foreign
+            return response
+        self.wire.send = transport;count = len(self.wire.requests)
+        with self.assertRaises(Exception):self.provider.read_object(self.sdk.KEY,self.sdk.FACTS)
+        self.assertEqual(len(self.wire.requests)-count,1)
+        self.assertEqual(len(captured),1);self.assertTrue(captured[0].closed)
+        self.assertEqual([call.args[1] for call in owner.after_sdk.call_args_list if call.args[0] in target],[200])
+        self.assertEqual(foreign.path.read_bytes(),foreign_bytes)
+
+    def test_cdn_response_ownership_urllib_returned_response_closes_on_log_failure(self):
+        import urllib.request
+        from types import SimpleNamespace
+        for fault in ('owner_change','journal_failure'):
+            with self.subTest(fault=fault):
+                request, before, routes, urls, owner, journal, prepared = self._cdn_effect_fixture()
+                other = self.execution.RunBudget(request['limits'])
+                foreign = self.execution.EffectJournal(self.github.root / ('returned-'+fault+'.jsonl'),request,
+                    hashlib.sha256(prepared).hexdigest(),{},other)
+                other.journal = foreign;foreign_bytes = foreign.path.read_bytes()
+                raw = io.BytesIO(b'fixture response');self.addCleanup(raw.close)
+                calls = [];record = journal.record
+                owner.after_sdk = mock.Mock(wraps=owner.after_sdk)
+                def opened(*args, **kwargs):
+                    calls.append(True)
+                    if fault == 'owner_change':owner.journal = foreign
+                    return SimpleNamespace(status=200,close=raw.close,read=raw.read)
+                def fail_log(value):
+                    if value['event'] == 'request_result':
+                        with mock.patch.object(self.execution.os,'fsync',side_effect=OSError('fixture result fsync')):return record(value)
+                    return record(value)
+                if fault == 'journal_failure':journal.record = fail_log
+                try:
+                    with self.assertRaises(self.execution.ExecutionError if fault=='owner_change' else OSError):owner.open(opened,
+                        urllib.request.Request('https://'+self.sdk.RESOURCE['bucket']+'.oss-cn-hangzhou.aliyuncs.com/public/repo'),timeout=2)
+                    self.assertEqual(len(calls),1);self.assertTrue(raw.closed)
+                    self.assertEqual(len(owner.after_sdk.call_args_list),1)
+                    self.assertEqual(foreign.path.read_bytes(),foreign_bytes)
+                finally:
+                    journal.close();journal.path.unlink();foreign.close()
+
+    def test_cdn_response_ownership_urllib_http_error_fp_closes_on_all_exits(self):
+        import urllib.error
+        import urllib.request
+        for fault in ('transport_only','owner_change','journal_failure'):
+            with self.subTest(fault=fault):
+                request, before, routes, urls, owner, journal, prepared = self._cdn_effect_fixture()
+                other = self.execution.RunBudget(request['limits'])
+                foreign = self.execution.EffectJournal(self.github.root / ('http-error-'+fault+'.jsonl'),request,
+                    hashlib.sha256(prepared).hexdigest(),{},other)
+                other.journal = foreign;foreign_bytes = foreign.path.read_bytes()
+                raw = io.BytesIO(b'fixture error');self.addCleanup(raw.close);record = journal.record;calls = []
+                address = 'https://'+self.sdk.RESOURCE['bucket']+'.oss-cn-hangzhou.aliyuncs.com/public/repo'
+                error = urllib.error.HTTPError(address,503,'fixture',{},raw)
+                owner.after_sdk = mock.Mock(wraps=owner.after_sdk)
+                def opened(*args, **kwargs):
+                    calls.append(True)
+                    if fault=='owner_change':owner.journal = foreign
+                    raise error
+                def fail_log(value):
+                    if value['event']=='request_result':
+                        with mock.patch.object(self.execution.os,'fsync',side_effect=OSError('fixture error fsync')):return record(value)
+                    return record(value)
+                if fault=='journal_failure':journal.record = fail_log
+                expected = self.execution.ExecutionError if fault=='owner_change' else OSError if fault=='journal_failure' else urllib.error.HTTPError
+                try:
+                    with self.assertRaises(expected):owner.open(opened,urllib.request.Request(address),timeout=2)
+                    self.assertEqual(len(calls),1);self.assertTrue(raw.closed)
+                    self.assertEqual([call.args[1] for call in owner.after_sdk.call_args_list],[None])
+                    self.assertEqual(foreign.path.read_bytes(),foreign_bytes)
+                finally:
+                    error.close();journal.close();journal.path.unlink();foreign.close()
+
+    def test_cdn_response_ownership_returned_wrapper_context_closes_after_guard(self):
+        import urllib.request
+        from types import SimpleNamespace
+        for phase in ('before_read','during_read'):
+            with self.subTest(phase=phase):
+                request, before, routes, urls, owner, journal, prepared = self._cdn_effect_fixture()
+                other = self.execution.RunBudget(request['limits'])
+                foreign = self.execution.EffectJournal(self.github.root / ('wrapper-'+phase+'.jsonl'),request,
+                    hashlib.sha256(prepared).hexdigest(),{},other)
+                other.journal = foreign;foreign_bytes = foreign.path.read_bytes()
+                raw = io.BytesIO(b'fixture response');self.addCleanup(raw.close);reads = []
+                def read(size):
+                    reads.append(True);value = raw.read(size);owner.journal = foreign;return value
+                def opened(*args, **kwargs):return SimpleNamespace(status=200,close=raw.close,read=read)
+                try:
+                    with self.assertRaises(self.execution.ExecutionError):
+                        with owner.open(opened,urllib.request.Request('https://'+self.sdk.RESOURCE['bucket']+'.oss-cn-hangzhou.aliyuncs.com/public/repo'),timeout=2) as response:
+                            if phase=='before_read':owner.journal = foreign
+                            response.read(2)
+                    self.assertTrue(raw.closed);self.assertEqual(len(reads),0 if phase=='before_read' else 1)
+                    self.assertEqual(owner.get_bytes,0);self.assertEqual(foreign.path.read_bytes(),foreign_bytes)
+                finally:
+                    journal.close();journal.path.unlink();foreign.close()
+
     def test_verified_materialized_inventory_uses_real_sdk_put_and_complete_get(self):
         result = self.execution._stage_immutable(self.request, provider=self.provider)
         self.assertEqual(result['status'], 'staged_readback_verified')

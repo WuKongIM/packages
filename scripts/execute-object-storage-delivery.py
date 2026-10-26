@@ -12,7 +12,8 @@ import json
 import math
 import os
 import time
-from urllib.parse import parse_qs, unquote, urlsplit
+from urllib.error import HTTPError
+from urllib.parse import parse_qs, parse_qsl, unquote, urlsplit
 from pathlib import Path
 import re
 
@@ -36,6 +37,132 @@ def canonical(value):
 
 def digest(value):
     return hashlib.sha256(canonical(value)).hexdigest()
+
+
+CDN_ACTIONS = {'configuration': 'BatchSetCdnDomainConfig', 'refresh': 'RefreshObjectCaches'}
+SDK_SIGNING_FIELDS = {'AccessKeyId', 'SecurityToken', 'SignatureMethod', 'SignatureVersion',
+    'SignatureNonce', 'Timestamp', 'Signature', 'SignatureType', 'Format', 'Version', 'RegionId'}
+
+
+def _cdn_intent(request):
+    """Validate private evidence scope; the public executor still refuses this operation."""
+    require(request.get('operation') == 'cdn_effects', 'private CDN evidence request required')
+    base_request = {key:value for key,value in request.items() if key != 'cdn_intent'}
+    base_request['operation'] = 'stage_immutable'
+    _request(base_request)
+    intent = copy.deepcopy(request.get('cdn_intent'))
+    require(isinstance(intent, dict) and set(intent) ==
+            {'routes', 'configuration_before', 'functions', 'refresh_urls'}, 'exact CDN intent required')
+    routes, functions, urls, before = (intent[k] for k in
+        ('routes', 'functions', 'refresh_urls', 'configuration_before'))
+    require(isinstance(routes, list) and 0 < len(routes) <= 1000
+            and isinstance(functions, list) and 0 < len(functions) <= 50
+            and isinstance(urls, list) and 0 < len(urls) <= 1000,
+            'bounded CDN intent required')
+    require(isinstance(before, dict) and set(before) ==
+            {'resource_sha256', 'domain', 'detail', 'configs', 'sha256'}, 'complete C0 required')
+    provider_resource_digest = hashlib.sha256(canonical(request['resource'])[:-1]).hexdigest()
+    require(before['domain'] == request['resource']['domain']
+            and before['resource_sha256'] == provider_resource_digest
+            and before['sha256'] == hashlib.sha256(canonical({k:v for k,v in before.items() if k != 'sha256'})[:-1]).hexdigest(),
+            'C0 intent binding differs')
+    require(all(isinstance(x, dict) and isinstance(x.get('public_uri'), str) for x in routes)
+            and len({x['public_uri'] for x in routes}) == len(routes)
+            and urls == ['https://' + request['resource']['domain'] + x['public_uri'] for x in routes],
+            'refresh intent differs from exact route table')
+    require(len(set(urls)) == len(urls), 'duplicate refresh intent')
+    for function in functions:
+        require(isinstance(function, dict) and set(function) == {'functionName','functionArgs'}
+                and function['functionName'] == 'back_to_origin_url_rewrite'
+                and isinstance(function['functionArgs'], list)
+                and [x.get('argName') for x in function['functionArgs']] ==
+                    ['source_url','target_url','flag','sequence']
+                and all(set(x) == {'argName','argValue'} and isinstance(x['argValue'], str)
+                        for x in function['functionArgs']), 'closed compiled function intent required')
+    return intent
+
+
+def _cdn_functions(intent):
+    """Preserve only the existing source's exact ConfigId when updating a function."""
+    functions = copy.deepcopy(intent['functions'])
+    old = {}
+    for row in intent['configuration_before']['configs']:
+        if row.get('FunctionName') == 'back_to_origin_url_rewrite':
+            args = {x['ArgName']:x['ArgValue'] for x in row['FunctionArgs']['FunctionArg']}
+            require(args['source_url'] not in old, 'duplicate C0 source')
+            old[args['source_url']] = str(row['ConfigId'])
+    for row in functions:
+        source = row['functionArgs'][0]['argValue']
+        if source in old:row['configId'] = old.pop(source)
+    require(not old, 'CDN intent requires deletion or rechunk')
+    return functions
+
+
+def _cdn_scope(request, kind, ordinal):
+    """Derive each exact business payload from the digest-bound finite intent."""
+    intent = _cdn_intent(request)
+    require(kind in CDN_ACTIONS and type(ordinal) is int and ordinal >= 0, 'invalid CDN step')
+    functions = _cdn_functions(intent)
+    values, width = (functions, 20) if kind == 'configuration' else (intent['refresh_urls'], 50)
+    batch = values[ordinal*width:(ordinal+1)*width]
+    require(batch, 'CDN ordinal outside bound intent')
+    payload = ({'Action':CDN_ACTIONS[kind], 'DomainNames':request['resource']['domain'],
+                'Functions':json.dumps(batch, separators=(',',':'))} if kind == 'configuration' else
+               {'Action':CDN_ACTIONS[kind], 'ObjectPath':'\n'.join(batch), 'ObjectType':'File'})
+    return {'kind':kind, 'ordinal':ordinal, 'domain':request['resource']['domain'],
+        'payload_sha256':digest(payload), 'before_sha256':intent['configuration_before']['sha256'],
+        'target_sha256':digest(functions if kind == 'configuration' else intent['refresh_urls'])}, payload
+
+
+def _cdn_ack_facts(request, kind, ordinal, facts):
+    """Accept only finite positive IDs; task IDs may legitimately span submissions."""
+    scope, payload = _cdn_scope(request, kind, ordinal)
+    key = 'config_ids' if kind == 'configuration' else 'task_ids'
+    require(isinstance(facts, dict) and set(facts) == {key} and isinstance(facts[key], list),
+            'closed CDN acknowledgement facts required')
+    ids = facts[key]
+    size = len(json.loads(payload['Functions'])) if kind == 'configuration' else len(payload['ObjectPath'].split('\n'))
+    require(0 < len(ids) <= size and len(set(ids)) == len(ids)
+            and all(isinstance(x, str) and re.fullmatch('[1-9][0-9]{0,31}', x) for x in ids)
+            and (kind != 'configuration' or len(ids) == size), 'CDN acknowledgement IDs differ')
+    if kind == 'configuration':
+        for row in json.loads(payload['Functions']):
+            require('configId' not in row or row['configId'] in ids, 'CDN existing configuration ID changed')
+
+
+def _cdn_snapshot(request, value):
+    require(isinstance(value, dict) and set(value) ==
+            {'resource_sha256','domain','detail','configs','sha256'}
+            and isinstance(value['configs'], list) and isinstance(value['detail'], dict)
+            and value['domain'] == request['resource']['domain']
+            and value['resource_sha256'] == hashlib.sha256(canonical(request['resource'])[:-1]).hexdigest()
+            and value['sha256'] == hashlib.sha256(canonical({k:v for k,v in value.items() if k != 'sha256'})[:-1]).hexdigest(),
+            'complete current configuration binding differs')
+
+
+def _configuration_ack_matches(request, ordinal, ids, after):
+    """Associate returned IDs with the exact batch functions in full current C1."""
+    _cdn_snapshot(request, after)
+    _cdn_ack_facts(request, 'configuration', ordinal, {'config_ids':ids})
+    scope, payload = _cdn_scope(request, 'configuration', ordinal)
+    actual = after['configs']; matched = set()
+    for function in json.loads(payload['Functions']):
+        args = {x['argName']:x['argValue'] for x in function['functionArgs']}
+        rows = []
+        for item in actual:
+            if not (isinstance(item, dict) and str(item.get('ConfigId')) in ids
+                    and item.get('FunctionName') == function['functionName'] and item.get('Status') == 'success'
+                    and isinstance(item.get('FunctionArgs'), dict)):continue
+            fields = item['FunctionArgs'].get('FunctionArg')
+            if (isinstance(fields, list) and len(fields) == len(args)
+                    and all(isinstance(x,dict) and set(x) == {'ArgName','ArgValue'} for x in fields)
+                    and len({x['ArgName'] for x in fields}) == len(fields)
+                    and {x['ArgName']:x['ArgValue'] for x in fields} == args):rows.append(item)
+        if len(rows) != 1:return False
+        number = str(rows[0]['ConfigId'])
+        if number in matched or ('configId' in function and function['configId'] != number):return False
+        matched.add(number)
+    return matched == set(ids)
 
 
 def module(filename):
@@ -91,7 +218,14 @@ class RunBudget:
         self.requests = self.get_bytes = self.put_bytes = 0
         self.read_only, self.cancelled, self.journal = read_only, False, None
 
+    def _check_journal_owner(self):
+        """A CDN journal cannot borrow a fresh ledger; legacy ports keep their contract."""
+        if getattr(self.journal, 'cdn_mode', False):
+            require(getattr(self.journal, 'budget', None) is self,
+                    'CDN journal belongs to a different execution budget')
+
     def check(self):
+        self._check_journal_owner()
         require(not self.cancelled and self.clock() < self.deadline, 'execution deadline or cancellation reached')
         if self.owned_shared is not None:
             self.owned_shared.check()
@@ -130,11 +264,20 @@ class RunBudget:
         ticket = self.journal.before_send(request.get_method(), parsed.hostname, parsed.path, '') if self.journal else None
         try:
             response = opener(request, timeout=min(timeout, self.remaining()))
-        except Exception:
-            self.after_sdk(ticket, None)
+        except Exception as error:
+            try:
+                self.after_sdk(ticket, None)
+            finally:
+                # urllib transfers an HTTPError's body through the exception.
+                if isinstance(error, HTTPError):error.close()
             raise
-        self.after_sdk(ticket, getattr(response, 'status', 200))
-        return _BudgetedResponse(response, self)
+        try:
+            self.after_sdk(ticket, getattr(response, 'status', 200))
+            return _BudgetedResponse(response, self)
+        except Exception:
+            # Ownership transfers only after headers and wrapper construction.
+            response.close()
+            raise
 
     def before_sdk(self, request):
         parsed = urlsplit(request.url)
@@ -147,10 +290,70 @@ class RunBudget:
         self.before_request(request.method, request.url, action=action,
             size=int(request.headers.get('Content-Length', 0)))
         if self.journal is not None:
+            if self.journal.cdn_mode:
+                pairs = parse_qsl(parsed.query, keep_blank_values=True)
+                raw = request.body if isinstance(request.body, bytes) else (request.body or '').encode()
+                require(isinstance(raw, bytes), 'SDK business body must be bytes')
+                pairs += parse_qsl(raw.decode('utf-8'), keep_blank_values=True)
+                require(len({key for key, value in pairs}) == len(pairs), 'duplicate SDK field')
+                unique = dict(pairs)
+                business = {key:value for key,value in pairs if key not in SDK_SIGNING_FIELDS}
+                if parsed.hostname in ('cdn.aliyuncs.com','sts.aliyuncs.com'):
+                    require(unique.get('RegionId') == self.journal.request['resource']['region']
+                            and unique.get('Format') == 'JSON'
+                            and unique.get('Version') == ('2015-04-01' if parsed.hostname == 'sts.aliyuncs.com' else '2018-05-10'),
+                            'SDK protocol/resource fields differ')
+                require(parsed.scheme == 'https' and parsed.hostname in
+                        ('cdn.aliyuncs.com','sts.aliyuncs.com', self.request_origin())
+                        and parsed.port in (None,443) and not parsed.fragment
+                        and parsed.username is None and parsed.password is None, 'SDK journal endpoint differs')
+                serialized = request.method.encode()+b'\n'+request.url.encode()+b'\n'+raw
+                return self.journal.before_send(request.method, parsed.hostname, parsed.path,
+                    unique.get('Action',''), business=business,
+                    serialized_sha256=hashlib.sha256(serialized).hexdigest())
             return self.journal.before_send(request.method, parsed.hostname, parsed.path, action)
         return None
 
+    def request_origin(self):
+        resource = self.journal.request['resource']
+        return resource['bucket'] + '.oss-' + resource['region'] + '.aliyuncs.com'
+
+    def begin_cdn_step(self, *, kind, ordinal, payload, before_sha256=None, target_sha256=None):
+        """Open one Provider-owned data scope, without granting execution authority."""
+        self.check()
+        if self.journal is None:return None
+        return self.journal.begin_cdn_step(kind, ordinal, payload, before_sha256, target_sha256)
+
+    def end_cdn_step(self, step):
+        self._check_journal_owner()
+        if self.journal is not None and step is not None:self.journal.end_cdn_step(step)
+
+    def consumed_sdk(self, ticket, status, size, body_sha256):
+        self.check()
+        if self.journal is not None:self.journal.consumed(ticket, status, size, body_sha256)
+
+    def parsed_cdn_response(self):
+        self.check()
+        if self.journal is not None:self.journal.parsed_response()
+
+    def acknowledge_cdn_step(self, step, facts):
+        self.check()
+        if self.journal is not None and step is not None:self.journal.acknowledge(step, facts)
+
+    def observed_cdn_configuration(self, observation):
+        self.check()
+        if self.journal is not None and self.journal.cdn_mode:
+            self.journal.observe_configuration(observation)
+
+    def cdn_configuration_matches(self, step, ids, observation):
+        self.check()
+        return (step is not None and self.journal is not None
+                and _configuration_ack_matches(self.journal.request,
+                    self.journal.steps[step]['scope']['ordinal'], ids, observation))
+
     def after_sdk(self, ticket, status=None):
+        # Keep late headers as observations, without allowing another owner.
+        self._check_journal_owner()
         if self.journal is not None and ticket is not None:
             self.journal.after_send(ticket, status)
 
@@ -162,31 +365,82 @@ class RunBudget:
 class EffectJournal:
     """Durably bind sanitized attempts before transport; never infer rollback."""
     def __init__(self, path, request, prepared_sha256, initial, budget):
-        self.path, self.budget, self.request = path, budget, request
+        self.path, self.budget, self.request = path, budget, copy.deepcopy(request)
         self.active_object, self.next_id, self.bytes_written = None, 0, 0
+        self.cdn_mode = request.get('operation') == 'cdn_effects'
+        self.active_step, self.steps, self.tickets, self.broken = None, {}, {}, False
+        self.configuration_observed = None
+        if self.cdn_mode:
+            budget.check()
+            require(budget.limits == request['limits'], 'CDN budget differs from exact request')
+            intent = _cdn_intent(request)
+            fresh = module('verify-object-storage-delivery-inputs.py')
+            prepared_raw = fresh.D._read(Path(request['output_dir']) / 'prepared/delivery.json', 'CDN preparation')
+            require(hashlib.sha256(prepared_raw).hexdigest() == prepared_sha256, 'CDN preparation bytes differ')
+            prepared = json.loads(prepared_raw, object_pairs_hook=fresh.C.reject_duplicate_pairs)
+            require(prepared['routes'] == intent['routes'], 'CDN intent differs from exact prepared routes')
         self.fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-        self.record({'event': 'run_start', 'request_sha256': digest(request),
-            'inputs_sha256': request['inputs_sha256'], 'plan_sha256': request['plan_sha256'],
-            'resource_sha256': digest(request['resource']), 'preparation_sha256': prepared_sha256,
-            'fresh_initial': initial})
+        try:
+            self.record({'event': 'run_start_v2' if self.cdn_mode else 'run_start', 'request_sha256': digest(request),
+                'inputs_sha256': request['inputs_sha256'], 'plan_sha256': request['plan_sha256'],
+                'resource_sha256': digest(request['resource']), 'preparation_sha256': prepared_sha256,
+                'fresh_initial': initial, **({'intent_sha256':digest(request['cdn_intent']),
+                    'effect_deadline_ns':int(budget.deadline*1e9)} if self.cdn_mode else {})})
+        except Exception:
+            self.close()
+            raise
 
     def record(self, value):
+        require(not self.broken, 'execution journal is incomplete')
         raw = canonical(value)
         require(self.bytes_written + len(raw) <= self.budget.limits['max_evidence_bytes']
                 - (10240 if self.budget.owned_shared is not None else 2048),
                 'execution journal exceeds evidence bound')
         view = memoryview(raw)
-        while view:
-            count = os.write(self.fd, view)
-            require(count > 0, 'execution journal write incomplete')
-            view = view[count:]
-        os.fsync(self.fd)
+        try:
+            while view:
+                count = os.write(self.fd, view)
+                require(count > 0, 'execution journal write incomplete')
+                view = view[count:]
+            os.fsync(self.fd)
+        except Exception:
+            if self.cdn_mode:
+                # A locally visible but uncommitted acknowledgement must not
+                # resolve an original unknown after fsync failure.
+                self.broken = True
+                os.ftruncate(self.fd, self.bytes_written)
+            raise
         self.bytes_written += len(raw)
 
-    def before_send(self, method, host, path, action):
+    def begin_cdn_step(self, kind, ordinal, payload, before_sha256, target_sha256):
+        require(self.cdn_mode and self.active_step is None, 'CDN scope missing or overlapping')
+        expected, business = _cdn_scope(self.request, kind, ordinal)
+        step = kind + ':' + str(ordinal)
+        require(step not in self.steps and payload == business
+                and before_sha256 in (None, expected['before_sha256'])
+                and target_sha256 in (None, expected['target_sha256']), 'CDN scope differs from intent')
+        self.record({'event':'cdn_step', 'step_id':step, **expected})
+        self.steps[step] = {'scope':expected, 'payload':business, 'ticket':None, 'ended':False}
+        self.active_step = step
+        return step
+
+    def end_cdn_step(self, step):
+        require(self.active_step == step and not self.steps[step]['ended'], 'CDN scope ownership differs')
+        self.record({'event':'cdn_step_end', 'step_id':step})
+        self.steps[step]['ended'] = True
+        self.active_step = None
+
+    def before_send(self, method, host, path, action, *, business=None, serialized_sha256=None):
         reads = {'GetCallerIdentity', 'DescribeCdnDomainDetail', 'DescribeCdnDomainConfigs', 'DescribeRefreshTaskById'}
-        require(method == 'GET' or (method == 'POST' and action in reads) or method == 'PUT',
+        mutating = method == 'POST' and action not in reads
+        require(method == 'GET' or (method == 'POST' and action in reads) or method == 'PUT'
+                or (self.cdn_mode and mutating),
                 'staging journal refuses an unscoped effect')
+        step = self.steps.get(self.active_step) if self.cdn_mode and mutating else None
+        if self.cdn_mode and mutating:
+            require(step is not None and step['ticket'] is None and host == 'cdn.aliyuncs.com'
+                    and path == '/' and business == step['payload'] and action in CDN_ACTIONS.values()
+                    and re.fullmatch('[0-9a-f]{64}', serialized_sha256 or ''), 'signed CDN request differs from active scope')
         if method == 'PUT':
             require(self.active_object is not None and unquote(path) == '/' + self.active_object['object_key'],
                     'PUT differs from the exact staging object')
@@ -199,12 +453,58 @@ class EffectJournal:
             'method': method, 'host': host, 'path': path, 'action': action,
             'object_key': self.active_object['object_key'] if self.active_object is not None else None,
             'outcome': 'unknown',
-            'effect_deadline_ns': int(self.budget.deadline * 1e9)})
+            'effect_deadline_ns': int(self.budget.deadline * 1e9),
+            **({'step_id':self.active_step, 'payload_sha256':digest(business),
+                'serialized_request_sha256':serialized_sha256} if step is not None else {})})
+        if step is not None:
+            step['ticket'] = self.next_id
+            self.tickets[self.next_id] = {'step_id':self.active_step, 'headers':False,
+                'consumed':False, 'parsed':False, 'acknowledged':False}
         return self.next_id
 
     def after_send(self, ticket, status):
         self.record({'event': 'request_result', 'request_id': ticket, 'status': status,
             'outcome': 'response_received' if status is not None else 'unknown'})
+        if ticket in self.tickets:
+            self.tickets[ticket].update(headers=True, status=status)
+
+    def consumed(self, ticket, status, size, body_sha256):
+        if ticket not in self.tickets:return
+        state = self.tickets[ticket]
+        require(state['headers'] and not state['consumed'] and state['status'] == status,
+                'CDN consumed response ownership differs')
+        self.record({'event':'response_consumed', 'request_id':ticket, 'status':status,
+            'bytes':size, 'body_sha256':body_sha256})
+        state['consumed'] = True
+
+    def parsed_response(self):
+        if self.active_step is None:return
+        ticket = self.steps[self.active_step]['ticket']
+        state = self.tickets[ticket]
+        require(state['consumed'] and not state['parsed'] and 200 <= state['status'] < 300,
+                'CDN parsed response lacks bounded consumption')
+        self.record({'event':'response_parsed', 'request_id':ticket})
+        state['parsed'] = True
+
+    def observe_configuration(self, observation):
+        _cdn_snapshot(self.request, observation)
+        self.record({'event':'configuration_observed', 'observation':observation})
+        self.configuration_observed = copy.deepcopy(observation)
+
+    def acknowledge(self, step, facts):
+        require(step in self.steps, 'unknown CDN scope')
+        ticket = self.steps[step]['ticket']
+        require(ticket in self.tickets and self.tickets[ticket]['parsed']
+                and not self.tickets[ticket]['acknowledged'], 'CDN acknowledgement lacks consumed response')
+        kind = self.steps[step]['scope']['kind']
+        _cdn_ack_facts(self.request, kind, self.steps[step]['scope']['ordinal'], facts)
+        if kind == 'configuration':
+            require(self.configuration_observed is not None and _configuration_ack_matches(self.request,
+                self.steps[step]['scope']['ordinal'], facts['config_ids'], self.configuration_observed),
+                'configuration acknowledgement differs from full C1')
+        self.record({'event':'cdn_ack', 'request_id':ticket, 'step_id':step, 'facts':facts,
+            'original_request_outcome':'acknowledged'})
+        self.tickets[ticket]['acknowledged'] = True
 
     def close(self):
         if self.fd is not None:
@@ -404,6 +704,135 @@ def _bound_staging_journal(request, raw, prepared_raw):
     return objects, unknown, tail, header
 
 
+def _bound_effect_journal(request, raw, prepared_raw):
+    """Parse one bounded version with strict CDN ordering and shared unknown accounting."""
+    require(len(raw) <= request['limits']['max_evidence_bytes'], 'prior journal exceeds bound')
+    fresh = module('verify-object-storage-delivery-inputs.py')
+    lines = raw.splitlines(keepends=True)
+    tail = lines.pop() if lines and not lines[-1].endswith(b'\n') else b''
+    events = [json.loads(line, object_pairs_hook=fresh.C.reject_duplicate_pairs) for line in lines]
+    require(events and isinstance(events[0], dict), 'prior journal header missing')
+    if events[0].get('event') == 'run_start':
+        objects, unknown, tail, header = _bound_staging_journal(request, raw, prepared_raw)
+        return {'objects':objects, 'unknown':unknown, 'unknown_by_kind':{'put':unknown,'configuration':0,'refresh':0},
+            'partial_tail':tail, 'header':header, 'cdn_steps':[], 'incomplete':bool(tail)}
+    header = events[0]
+    require(set(header) == {'event','request_sha256','inputs_sha256','plan_sha256','resource_sha256',
+        'preparation_sha256','fresh_initial','intent_sha256','effect_deadline_ns'}
+        and header['event'] == 'run_start_v2', 'unsupported effect journal version')
+    intent = _cdn_intent(request)
+    require(header['request_sha256'] == digest(request) and header['inputs_sha256'] == request['inputs_sha256']
+            and header['plan_sha256'] == request['plan_sha256']
+            and header['resource_sha256'] == digest(request['resource'])
+            and header['intent_sha256'] == digest(intent)
+            and type(header['effect_deadline_ns']) is int and header['effect_deadline_ns'] > 0,
+            'prior request/plan/resource/intent differs')
+    require(hashlib.sha256(prepared_raw).hexdigest() == header['preparation_sha256'], 'prior preparation differs')
+    prepared = json.loads(prepared_raw, object_pairs_hook=fresh.C.reject_duplicate_pairs)
+    require(prepared['routes'] == intent['routes'], 'prior intent differs from exact prepared routes')
+    steps, attempts, results, consumed, parsed, acknowledgements = {}, {}, {}, {}, set(), {}
+    next_ordinal = {'configuration':0, 'refresh':0}
+    active, current = None, None
+    reads = {'GetCallerIdentity','DescribeCdnDomainDetail','DescribeCdnDomainConfigs','DescribeRefreshTaskById'}
+    for event in events[1:]:
+        require(isinstance(event, dict), 'invalid effect event')
+        name = event.get('event')
+        if name == 'cdn_step':
+            require(active is None and set(event) == {'event','step_id','kind','ordinal','domain',
+                'payload_sha256','before_sha256','target_sha256'}, 'ambiguous CDN scope')
+            expected, payload = _cdn_scope(request, event['kind'], event['ordinal'])
+            step = event['kind'] + ':' + str(event['ordinal'])
+            require(event['step_id'] == step and step not in steps and event['ordinal'] == next_ordinal[event['kind']]
+                    and {k:v for k,v in event.items() if k not in ('event','step_id')} == expected,
+                    'prior CDN scope differs')
+            next_ordinal[event['kind']] += 1
+            steps[step] = {'scope':expected, 'payload':payload, 'ticket':None, 'ended':False}
+            active = step
+        elif name == 'cdn_step_end':
+            require(set(event) == {'event','step_id'} and active == event['step_id'], 'CDN scope end differs')
+            steps[active]['ended'] = True
+            active = None
+        elif name == 'request_attempt':
+            number = event.get('request_id')
+            require(type(number) is int and number == len(attempts)+1
+                    and number <= request['limits']['max_requests'] and event.get('outcome') == 'unknown'
+                    and event.get('effect_deadline_ns') == header['effect_deadline_ns']
+                    and event.get('object_key') is None, 'ambiguous prior request attempt')
+            fields = {'event','request_id','method','host','path','action','object_key','outcome','effect_deadline_ns'}
+            if event.get('action') in CDN_ACTIONS.values():
+                require(set(event) == fields | {'step_id','payload_sha256','serialized_request_sha256'}
+                        and active == event['step_id'] and active in steps
+                        and steps[active]['ticket'] is None and event['method'] == 'POST'
+                        and event['host'] == 'cdn.aliyuncs.com' and event['path'] == '/'
+                        and event['action'] == steps[active]['payload']['Action']
+                        and event['payload_sha256'] == steps[active]['scope']['payload_sha256']
+                        and re.fullmatch('[0-9a-f]{64}',event['serialized_request_sha256']), 'prior signed CDN attempt differs')
+                steps[active]['ticket'] = number
+            else:
+                origin = request['resource']['bucket']+'.oss-'+request['resource']['region']+'.aliyuncs.com'
+                require(set(event) == fields and active is None
+                        and ((event['method'] == 'GET' and event['host'] == origin and event['action'] == '')
+                            or (event['method'] == 'POST' and event['action'] in reads and event['path'] == '/'
+                                and event['host'] == ('sts.aliyuncs.com' if event['action'] == 'GetCallerIdentity' else 'cdn.aliyuncs.com'))),
+                        'unscoped prior effect or read')
+            attempts[number] = event
+        elif name == 'request_result':
+            number = event.get('request_id');status = event.get('status')
+            require(set(event) == {'event','request_id','status','outcome'} and type(number) is int and number in attempts and number not in results
+                    and (status is None or (type(status) is int and 100 <= status <= 599))
+                    and event['outcome'] == ('unknown' if status is None else 'response_received'), 'ambiguous prior response headers')
+            results[number] = event
+        elif name == 'response_consumed':
+            number = event.get('request_id')
+            require(set(event) == {'event','request_id','status','bytes','body_sha256'}
+                    and type(number) is int and number in results and number not in consumed and 'step_id' in attempts[number]
+                    and results[number]['status'] == event['status'] and type(event['bytes']) is int
+                    and 0 <= event['bytes'] <= 2*1024**2 and re.fullmatch('[0-9a-f]{64}',event['body_sha256']),
+                    'ambiguous prior consumed response')
+            consumed[number] = event
+        elif name == 'response_parsed':
+            number = event.get('request_id')
+            require(set(event) == {'event','request_id'} and type(number) is int and number in consumed and number not in parsed
+                    and type(consumed[number]['status']) is int and 200 <= consumed[number]['status'] < 300,
+                    'prior parsed response lacks consumption')
+            parsed.add(number)
+        elif name == 'configuration_observed':
+            require(set(event) == {'event','observation'} and active is None, 'configuration observation order differs')
+            _cdn_snapshot(request, event['observation'])
+            current = event['observation']
+        elif name == 'cdn_ack':
+            number, step = event.get('request_id'), event.get('step_id')
+            require(set(event) == {'event','request_id','step_id','facts','original_request_outcome'}
+                    and type(number) is int and step in steps and number == steps[step]['ticket'] and number in parsed
+                    and number not in acknowledgements and event['original_request_outcome'] == 'acknowledged',
+                    'ambiguous prior CDN acknowledgement')
+            kind, ordinal = steps[step]['scope']['kind'], steps[step]['scope']['ordinal']
+            _cdn_ack_facts(request, kind, ordinal, event['facts'])
+            if kind == 'configuration':
+                require(current is not None and _configuration_ack_matches(request, ordinal,
+                    event['facts']['config_ids'], current), 'prior configuration acknowledgement differs from C1')
+            acknowledgements[number] = event
+        else:
+            raise ExecutionError('unregistered effect journal event')
+    unknown = {'put':0,'configuration':0,'refresh':0}
+    for number, attempt in attempts.items():
+        if 'step_id' in attempt and number not in acknowledgements:
+            unknown[steps[attempt['step_id']]['scope']['kind']] += 1
+    task_ids = []
+    for event in acknowledgements.values():
+        for number in event['facts'].get('task_ids', []):
+            if number not in task_ids:task_ids.append(number)
+    result = {'objects':{}, 'unknown':sum(unknown.values()), 'unknown_by_kind':unknown,
+        'partial_tail':tail, 'header':header, 'cdn_steps':list(steps.values()),
+        'acknowledged_task_ids':task_ids,
+        'acknowledged_refresh_ordinals':[steps[x['step_id']]['scope']['ordinal']
+            for x in acknowledgements.values() if 'task_ids' in x['facts']],
+        'acknowledged_configuration_requests':[number for number,x in acknowledgements.items() if 'config_ids' in x['facts']],
+        'incomplete':bool(tail) or active is not None or any(x['ticket'] not in acknowledgements for x in steps.values())}
+    if current is not None:result['configuration_observed_now'] = current
+    return result
+
+
 def _reconcile_staging(request, *, provider, journal_path, journal_sha256, output_dir):
     """Observe exact prior keys/config without retry, rollback or causal rewriting."""
     request = _request(request)
@@ -453,5 +882,58 @@ def _reconcile_staging(request, *, provider, journal_path, journal_sha256, outpu
         result['error'] = 'read-only reconciliation incomplete'
     result['budget'] = budget.snapshot()
     require(len(canonical(result)) <= request['limits']['max_evidence_bytes'], 'reconciliation evidence exceeds limit')
+    fresh.D._json_write(output / 'reconciliation.json', result)
+    return result
+
+
+def _reconcile_cdn_effects(request, *, provider, journal_path, journal_sha256, output_dir):
+    """Observe prior finite CDN scope without retrying or resolving original unknowns."""
+    require(provider.resource == request['resource'], 'reconcile resource differs')
+    fresh = module('verify-object-storage-delivery-inputs.py')
+    raw = fresh.D._read(Path(journal_path), 'prior CDN effect journal')
+    require(hashlib.sha256(raw).hexdigest() == journal_sha256, 'prior journal digest differs')
+    prepared_raw = fresh.D._read(Path(request['output_dir']) / 'prepared/delivery.json', 'prior CDN preparation')
+    prior = _bound_effect_journal(request, raw, prepared_raw)
+    require(prior['header']['event'] == 'run_start_v2', 'CDN reconciliation requires scoped journal')
+    intent = _cdn_intent(request)
+    budget = RunBudget(request['limits'], read_only=True)
+    provider.bind_execution_controls(budget=budget)
+    fresh_status = 'verified'
+    try:
+        _input_bytes(fresh, request)
+        fresh.revalidate_delivery_anchors(inputs=Path(request['inputs']), expected_plan_sha256=request['plan_sha256'],
+            previous=prior['header']['fresh_initial'], budget=budget)
+    except Exception:
+        fresh_status = 'unverified'
+    output = Path(output_dir)
+    require(output.is_absolute() and not output.exists() and output.parent.is_dir(), 'new reconcile output required')
+    fresh.C.validate_candidate_output_paths((output,), (Path(request['output_dir']), Path(request['inputs'])))
+    output.mkdir(mode=0o700)
+    missing_ids = [x['scope']['ordinal'] for x in prior['cdn_steps']
+        if x['scope']['kind'] == 'refresh' and x['ticket'] is not None
+        and x['scope']['ordinal'] not in prior['acknowledged_refresh_ordinals']]
+    result = {'schema':'wukongim.cdn_effect_reconciliation/v1', 'status':'incomplete',
+        'request_sha256':digest(request), 'prior_journal_sha256':journal_sha256,
+        'resource_sha256':digest(request['resource']), 'intent_sha256':digest(intent),
+        'preparation_sha256':prior['header']['preparation_sha256'], 'fresh_anchor_status':fresh_status,
+        'original_effect_deadline_ns':prior['header']['effect_deadline_ns'],
+        'original_unknown_outcomes':prior['unknown'], 'original_unknown_by_kind':prior['unknown_by_kind'],
+        'partial_tail_bytes':len(prior['partial_tail']), 'unobservable_refresh_submissions':missing_ids,
+        'refresh_observed_now':[], **FALSE_FIELDS}
+    try:
+        result['resource'] = provider.observe_resource()
+        result['configuration_observed_now'] = provider.read_configuration()
+        if prior['acknowledged_task_ids']:
+            rows = provider._read_refresh_tasks(prior['acknowledged_task_ids'], intent['refresh_urls'])
+            result['refresh_observed_now'] = [{key:row[key] for key in ('TaskId','ObjectPath','ObjectType','Status')}
+                for row in rows]
+        if fresh_status == 'verified' and not prior['incomplete'] and not prior['unknown']:
+            result['status'] = 'reconciled_read_only'
+    except Exception:
+        result['error'] = 'read-only CDN reconciliation incomplete'
+    result['budget'] = budget.snapshot()
+    text = canonical(result)
+    require(not any(marker.encode() in text for marker in provider._credential_markers), 'reconciliation contains credential echo')
+    require(len(text) <= request['limits']['max_evidence_bytes'], 'reconciliation evidence exceeds limit')
     fresh.D._json_write(output / 'reconciliation.json', result)
     return result
