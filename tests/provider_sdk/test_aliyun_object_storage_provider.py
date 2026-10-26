@@ -828,6 +828,131 @@ class ProviderContract(unittest.TestCase):
         self.assertFalse(self.writes())
 
 
+    def _set_controlled_profile(self):
+        """Configure only fixture observations; never grant production authority."""
+        self.addCleanup(lambda: self.assertEqual(socket.socket.connect.call_count,0))
+        self.w.detail.update(ServerCertificateStatus='on',HttpsCname=RESOURCE['cname'])
+        query=next(x for x in self.w.configs if x['FunctionName']=='set_hashkey_args')
+        query['FunctionArgs']['FunctionArg']=[{'ArgName':k,'ArgValue':v} for k,v in
+            {'hashkey_args':'','disable':'on','keep_oss_args':'off'}.items()]
+        self.w.configs += [
+            config('l2_oss_key',{'private_oss_auth':'on'},5),
+            config('path_based_ttl_set',{'path':'/','ttl':'1','weight':'1',
+                'swift_origin_cache_high':'on','swift_no_cache_low':'off',
+                'swift_follow_cachetime':'off','force_revalidate':'off'},6),
+            config('https_force',{'enable':'on','https_rewrite':'301'},7),
+            config('https_tls_version',{'tls10':'off','tls11':'off','tls12':'on',
+                'tls13':'on','ciphersuitegroup':'strict'},8)]
+
+    def test_controlled_profile_c0_c1_preserves_full_body_and_actual_configids(self):
+        self._set_controlled_profile();profile=copy.deepcopy(self.w.configs)
+        fixture=native_routes_fixture();original=copy.deepcopy(fixture)
+        prior_ids=None
+        for label in ('A','B'):
+            rows=fixture['generations'][label]['delivery.json']['routes']
+            before=self.client.read_configuration()
+            ids=[x['ConfigId'] for x in before['configs'] if x['FunctionName']==self.p.FUNCTION]
+            self.w.requests.clear()
+            result=self.client.apply_rewrites(rows,before=before,managed_ids=ids)
+            self.assertEqual(result['state'],'readback_verified')
+            after=self.client.read_configuration()
+            self.assertEqual(result['before_sha256'],before['sha256'])
+            self.assertEqual(result['after_sha256'],after['sha256'])
+            self.assertNotEqual(before['sha256'],after['sha256'])
+            self.assertEqual([x for x in after['configs'] if x['FunctionName']!=self.p.FUNCTION],profile)
+            self.assertEqual(after['detail'],before['detail'])
+            batch=next(r for r in self.w.requests if r[2]=='BatchSetCdnDomainConfig')
+            self.assertIn('Signature',batch[3])
+            functions=json.loads(batch[3]['Functions'][0])
+            # Seventeen is specific to this existing 178-route native fixture.
+            self.assertEqual(len(functions),17)
+            self.assertEqual(inverse_finite_rules(functions),{x['public_uri']:'/'+x['object_key'] for x in rows})
+            observed_ids={x['ConfigId'] for x in after['configs'] if x['FunctionName']==self.p.FUNCTION}
+            if prior_ids is None:self.assertTrue(all('configId' not in x for x in functions))
+            else:
+                self.assertEqual({x['configId'] for x in functions},prior_ids)
+                self.assertEqual(observed_ids,prior_ids)
+            prior_ids=observed_ids
+            for key in self.p.FALSE_FIELDS:self.assertIs(result[key],False)
+        self.assertEqual(fixture,original)
+
+    def test_controlled_profile_unsafe_or_incomplete_facets_reject_before_write(self):
+        self._set_controlled_profile();baseline=copy.deepcopy(self.w.configs);detail=copy.deepcopy(self.w.detail)
+        for fault in ('private_missing','private_off','permanent_token','cache_ignore',
+                      'query_origin','tls10','certificate_off','foreign_https_cname','unknown'):
+            with self.subTest(fault=fault):
+                self.w.configs=copy.deepcopy(baseline);self.w.detail=copy.deepcopy(detail)
+                named={x['FunctionName']:x for x in self.w.configs}
+                if fault=='private_missing':self.w.configs.remove(named['l2_oss_key'])
+                elif fault=='permanent_token':named['l2_oss_key']['FunctionArgs']['FunctionArg'].append(
+                    {'ArgName':'perm_private_oss_tbl','ArgValue':'FIXTURE-NOT-A-CREDENTIAL'})
+                elif fault in ('certificate_off','foreign_https_cname'):
+                    self.w.detail['ServerCertificateStatus' if fault=='certificate_off' else 'HttpsCname']='off' if fault=='certificate_off' else 'foreign.invalid'
+                elif fault=='unknown':self.w.configs.append(config('gzip',{'enable':'on'},99))
+                else:
+                    function,arg,value={'private_off':('l2_oss_key','private_oss_auth','off'),
+                        'cache_ignore':('path_based_ttl_set','swift_no_cache_low','on'),
+                        'query_origin':('set_hashkey_args','keep_oss_args','on'),
+                        'tls10':('https_tls_version','tls10','on')}[fault]
+                    next(x for x in named[function]['FunctionArgs']['FunctionArg'] if x['ArgName']==arg)['ArgValue']=value
+                before=self.client.read_configuration();self.w.requests.clear()
+                with self.assertRaises(self.p.ProviderError):self.client.apply_rewrites([route()],before=before,managed_ids=[])
+                self.assertFalse(self.writes())
+
+    def test_controlled_profile_complete_body_or_configid_drift_rejects_before_write(self):
+        self._set_controlled_profile();baseline=copy.deepcopy(self.w.configs)
+        for fault in ('body','id','unknown_managed_id'):
+            with self.subTest(fault=fault):
+                self.w.configs=copy.deepcopy(baseline);before=self.client.read_configuration()
+                if fault=='body':self.w.configs[-1]['FunctionArgs']['FunctionArg'][0]['ArgValue']='on'
+                elif fault=='id':self.w.configs[-1]['ConfigId']='999'
+                self.w.requests.clear()
+                with self.assertRaises(self.p.ProviderError):
+                    self.client.apply_rewrites([route()],before=before,managed_ids=[90] if fault=='unknown_managed_id' else [])
+                self.assertFalse(self.writes())
+
+    def test_controlled_profile_partial_unknown_effects_keep_observation_without_retry(self):
+        self._set_controlled_profile();baseline=copy.deepcopy(self.w.configs)
+        rows=native_routes_fixture()['generations']['A']['delivery.json']['routes']
+        for fault in ('partial','timeout','wrongid'):
+            with self.subTest(fault=fault):
+                self.w.configs=copy.deepcopy(baseline);self.w.batch_fault=fault
+                before=self.client.read_configuration();self.w.requests.clear()
+                result=self.client.apply_rewrites(rows,before=before,managed_ids=[])
+                self.assertEqual(result['state'],'incomplete');self.assertTrue(result['write_attempted'])
+                after=self.client.read_configuration()
+                self.assertEqual(result['after_sha256'],after['sha256'])
+                self.assertNotEqual(before['sha256'],after['sha256'])
+                self.assertEqual(sum(x[2]=='BatchSetCdnDomainConfig' for x in self.w.requests),1)
+                self.assertFalse(any(x[0].method=='PUT' or x[2] in ('RefreshObjectCaches','DeleteSpecificConfig','BatchDeleteCdnDomainConfig') for x in self.w.requests))
+                self.assertEqual([x for x in after['configs'] if x['FunctionName']!=self.p.FUNCTION],baseline)
+                for key in self.p.FALSE_FIELDS:self.assertIs(result[key],False)
+                self.assertNotIn(SECRET,json.dumps(result));self.assertNotIn(TOKEN,json.dumps(result))
+
+    def test_controlled_profile_managed_ids_do_not_authorize_deletion_or_rechunk(self):
+        self._set_controlled_profile();baseline=copy.deepcopy(self.w.configs)
+        aliases=[route('/a'+str(i),'public/a'+str(i)) for i in range(51)]
+        for old,new in ((aliases[:50],aliases),(aliases,aliases+[route('/a51','public/a51')])):
+            self.w.configs=copy.deepcopy(baseline)
+            old_functions=self.p.compile_rewrites(old)
+            self.w.configs += [config(self.p.FUNCTION,{x['argName']:x['argValue'] for x in f['functionArgs']},100+i)
+                               for i,f in enumerate(old_functions)]
+            before=self.client.read_configuration()
+            ids=[x['ConfigId'] for x in before['configs'] if x['FunctionName']==self.p.FUNCTION]
+            self.w.requests.clear()
+            with self.assertRaisesRegex(self.p.ProviderError,'deletion'):
+                self.client.apply_rewrites(new,before=before,managed_ids=ids)
+            self.assertFalse(self.writes())
+
+    def test_controlled_profile_observation_never_opens_production_entrypoints(self):
+        self._set_controlled_profile();self.client.read_configuration();self.w.requests.clear()
+        with self.assertRaises(self.p.ProviderError):self.client.activate()
+        spec=importlib.util.spec_from_file_location('controlled_profile_execution',ROOT/'scripts/execute-object-storage-delivery.py')
+        execution=importlib.util.module_from_spec(spec);spec.loader.exec_module(execution)
+        with self.assertRaises(ValueError):execution.run_delivery({})
+        self.assertEqual(self.w.requests,[])
+
+
 if __name__=='__main__':
     import sys
     import importlib.metadata
