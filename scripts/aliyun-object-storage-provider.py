@@ -140,7 +140,7 @@ def compile_rewrites(routes):
 class _Session(requests.Session):
     """Per-instance, nonredirecting HTTP boundary shared by official SDK clients."""
     def __init__(self, hosts, adapter=None):
-        super().__init__();self.trust_env=False;self.hosts=frozenset(hosts)
+        super().__init__();self.trust_env=False;self.hosts=frozenset(hosts);self.execution_budget=None
         if adapter is not None:
             self.mount('https://',adapter)
 
@@ -149,18 +149,28 @@ class _Session(requests.Session):
         require(u.scheme=='https' and u.hostname in self.hosts and u.port in (None,443)
                 and u.username is None and u.password is None, 'SDK endpoint outside bound resource')
         require_private_sdk_logging()
-        kwargs.update(proxies={'http':None,'https':None},allow_redirects=False,verify=True,timeout=(5,10))
+        budget=self.execution_budget
+        ticket=budget.before_sdk(request) if budget is not None else None
+        remaining=budget.remaining() if budget is not None else 10
+        kwargs.update(proxies={'http':None,'https':None},allow_redirects=False,verify=True,timeout=(min(5,remaining),min(10,remaining)))
         query=parse_qs(u.query,keep_blank_values=True)
         streaming=kwargs.get('stream',False)
         kwargs['stream']=True
         response=None;started=time.monotonic()
         try:
             response=super().send(request,**kwargs)
+            if budget is not None:
+                budget.after_sdk(ticket,response.status_code);ticket=None
             require(not 300<=response.status_code<400, 'redirect refused')
             require(not response.headers.get('Content-Encoding'), 'encoded provider response refused')
             if not streaming or bool({'versioning','bucketInfo'} & set(query)) or response.status_code>=400:
                 raw=bytearray()
-                for chunk in response.iter_content(CHUNK):
+                chunks=iter(response.iter_content(CHUNK))
+                while True:
+                    if budget is not None:budget.check()
+                    try:chunk=next(chunks)
+                    except StopIteration:break
+                    if budget is not None:budget.consume_read(len(chunk))
                     raw.extend(chunk);require(len(raw)<=MAX_RESPONSE and time.monotonic()-started<=30,'provider response exceeds bound')
                 response.close();raw=bytes(raw)
                 if 'versioning' in query and response.status_code==200:
@@ -182,6 +192,7 @@ class _Session(requests.Session):
             return response
         except Exception:
             # Do not let either SDK log an exception containing a signed URL/token.
+            if budget is not None:budget.after_sdk(ticket,None)
             if response is not None:response.close()
             raise requests.RequestException('bounded provider transport failed') from None
 
@@ -211,6 +222,12 @@ class Provider:
         self.rpc=AcsClient(region_id=r['region'],credential=StsTokenCredential(access_key_id,access_key_secret,security_token),
             auto_retry=False,max_retry_time=0,connect_timeout=5,timeout=10,verify=True,proxy={'http':None,'https':None})
         self.rpc.session.close();self.rpc.session=self.session
+        self.execution_budget=None
+
+    def bind_execution_controls(self, *, budget):
+        """Attach per-instance bounds; these controls never grant publication authority."""
+        self.execution_budget=budget
+        self.session.execution_budget=budget
 
     def close(self):
         self.session.close()
@@ -255,7 +272,12 @@ class Provider:
             result=self.oss.get_object(oss.GetObjectRequest(bucket=self.resource['bucket'],key=key))
             body=result.body
             require(result.content_length==facts['size'] and result.cache_control==facts['cache_control'], 'object metadata differs')
-            for chunk in body.iter_bytes(block_size=CHUNK):
+            chunks=iter(body.iter_bytes(block_size=CHUNK))
+            while True:
+                if self.execution_budget is not None:self.execution_budget.check()
+                try:chunk=next(chunks)
+                except StopIteration:break
+                if self.execution_budget is not None:self.execution_budget.consume_read(len(chunk))
                 total+=len(chunk);require(total<=facts['size'] and time.monotonic()-start<=120,'object stream exceeds bound')
                 sha.update(chunk)
             require(total==facts['size'] and sha.hexdigest()==facts['sha256'],'full object bytes differ')
@@ -280,6 +302,7 @@ class Provider:
                     require(stat.S_ISREG(metadata.st_mode) and metadata.st_nlink==1 and metadata.st_size==facts['size'],'unsafe local object')
                     count=0;sha=hashlib.sha256()
                     for chunk in iter(lambda:source.read(CHUNK),b''):
+                        if self.execution_budget is not None:self.execution_budget.check()
                         count+=len(chunk);require(count<=facts['size'],'local object changed');sha.update(chunk);frozen.write(chunk)
                 require(count==facts['size'] and sha.hexdigest()==facts['sha256'],'local object differs')
             except OSError:raise ProviderError('local object cannot be frozen') from None

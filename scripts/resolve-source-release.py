@@ -126,14 +126,22 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 class GitHubReader:
-    def __init__(self, api_base_url: str, download_base_url: str, token: str | None) -> None:
+    def __init__(self, api_base_url: str, download_base_url: str, token: str | None,
+                 *, budget: Any = None) -> None:
         self.api_base_url = _validated_base_url(api_base_url, "API base URL")
         self.download_base_url = _validated_base_url(download_base_url, "download base URL")
         self.token = token
+        self.budget = budget
         self._no_redirect = urllib.request.build_opener(_NoRedirect())
         parsed_api = urllib.parse.urlsplit(self.api_base_url)
         if token and parsed_api.scheme != "https" and not _is_loopback_host(parsed_api.hostname or ""):
             raise ResolutionError("a GitHub token may be sent only over HTTPS or loopback HTTP")
+
+    def _open(self, open_callable: Any, request: Any, *, timeout: int) -> BinaryIO:
+        """Apply this reader's optional deadline and body-read budget to every open."""
+        if self.budget is not None:
+            return self.budget.open(open_callable, request, timeout=timeout)
+        return open_callable(request, timeout=timeout)
 
     def _headers(self, *, authorize: bool, accept: str) -> dict[str, str]:
         headers = {
@@ -153,7 +161,7 @@ class GitHubReader:
             method="GET",
         )
         try:
-            with self._no_redirect.open(request, timeout=30) as response:
+            with self._open(self._no_redirect.open, request, timeout=30) as response:
                 data = response.read(MAX_JSON_BYTES + 1)
         except (OSError, urllib.error.HTTPError) as error:
             raise ResolutionError(f"GitHub API read failed for {path}: {error}") from error
@@ -174,7 +182,7 @@ class GitHubReader:
             method="GET",
         )
         try:
-            return self._no_redirect.open(request, timeout=60)
+            return self._open(self._no_redirect.open, request, timeout=60)
         except urllib.error.HTTPError as error:
             if error.code not in {301, 302, 303, 307, 308}:
                 raise ResolutionError(f"asset {asset_id} download failed: HTTP {error.code}") from error
@@ -191,7 +199,7 @@ class GitHubReader:
                 method="GET",
             )
             try:
-                return urllib.request.urlopen(redirected_request, timeout=60)
+                return self._open(urllib.request.urlopen, redirected_request, timeout=60)
             except (OSError, urllib.error.HTTPError) as redirected_error:
                 raise ResolutionError(f"asset {asset_id} redirected download failed") from redirected_error
         except OSError as error:
@@ -397,6 +405,7 @@ def resolve_source_release(
     download_base_url: str,
     token: str | None,
     channel: str = "preview",
+    budget: Any = None,
 ) -> dict[str, Any]:
     """Read one source release for the requested channel, without publishing it."""
     if channel not in {"preview", "stable"}:
@@ -417,7 +426,7 @@ def resolve_source_release(
     except OSError as error:
         raise ResolutionError(f"cannot prepare output directory: {error}") from error
 
-    reader = GitHubReader(api_base_url, download_base_url, token)
+    reader = GitHubReader(api_base_url, download_base_url, token, budget=budget)
     try:
         release_path = f"repos/{SOURCE_REPOSITORY}/releases/{release_id}"
         initial = _release_snapshot(reader.api_json(release_path), release_id, channel)

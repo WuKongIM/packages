@@ -33,12 +33,16 @@ jobs:
       - name: Run mandatory offline SDK contracts
         run: |
           timeout 120 /tmp/provider-contract-venv/bin/python -B tests/provider_sdk/test_aliyun_object_storage_provider.py --receipt /tmp/provider-contract-receipt.json
+          timeout 120 /tmp/provider-contract-venv/bin/python -B tests/provider_sdk/test_object_storage_execution.py --receipt /tmp/provider-execution-receipt.json
+          test -s /tmp/provider-execution-receipt.json
           timeout 120 python3 -B -m unittest discover -s tests -p test_object_storage_delivery_inputs.py -v
-      - name: Retain bounded no-credential contract receipt
+      - name: Retain bounded no-credential contract receipts
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: object-storage-sdk-contract
-          path: /tmp/provider-contract-receipt.json
+          path: |
+            /tmp/provider-contract-receipt.json
+            /tmp/provider-execution-receipt.json
           if-no-files-found: error
           retention-days: 7
