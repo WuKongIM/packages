@@ -70,7 +70,8 @@ class _BudgetedResponse:
 
 class RunBudget:
     """Bound one invocation's reads, requests and time; this grants no authority."""
-    def __init__(self, limits, *, clock=time.monotonic, read_only=False):
+    def __init__(self, limits, *, clock=time.monotonic, read_only=False,
+                 owned_shared=None, absolute_deadline=None):
         bounds = {'max_requests': 50000, 'max_objects': 2048, 'max_routes': 1000,
             'max_put_bytes': 2 * 1024**3, 'max_get_bytes': 8 * 1024**3,
             'max_evidence_bytes': 8 * 1024**2}
@@ -83,15 +84,28 @@ class RunBudget:
         require(limits['max_evidence_bytes'] >= 4096, 'evidence bound too small')
         self.limits, self.clock = copy.deepcopy(limits), clock
         self.deadline = clock() + seconds
+        if absolute_deadline is not None:
+            require(owned_shared is not None and absolute_deadline <= self.deadline, 'owned deadline cannot widen limits')
+            self.deadline = absolute_deadline
+        self.owned_shared = owned_shared
         self.requests = self.get_bytes = self.put_bytes = 0
         self.read_only, self.cancelled, self.journal = read_only, False, None
 
     def check(self):
         require(not self.cancelled and self.clock() < self.deadline, 'execution deadline or cancellation reached')
+        if self.owned_shared is not None:
+            self.owned_shared.check()
 
     def remaining(self):
         self.check()
         return self.deadline - self.clock()
+
+    def run_process(self, argv, *, env, stdout_cap=1024*1024, stderr_cap=65536, timeout=None, pass_fds=()):
+        """Run only the fixed command chosen by a reviewed helper, under owned bounds."""
+        require(self.owned_shared is not None, 'owned process context required')
+        return module('object-storage-owned-execution.py').run_fixed_process(argv, env=env,
+            shared=self.owned_shared, stdout_cap=stdout_cap, stderr_cap=stderr_cap,
+            timeout=timeout, pass_fds=pass_fds)
 
     def before_request(self, method, url, *, action='', size=0):
         self.check()
@@ -158,7 +172,8 @@ class EffectJournal:
 
     def record(self, value):
         raw = canonical(value)
-        require(self.bytes_written + len(raw) <= self.budget.limits['max_evidence_bytes'] - 2048,
+        require(self.bytes_written + len(raw) <= self.budget.limits['max_evidence_bytes']
+                - (10240 if self.budget.owned_shared is not None else 2048),
                 'execution journal exceeds evidence bound')
         view = memoryview(raw)
         while view:
@@ -183,7 +198,8 @@ class EffectJournal:
         self.record({'event': 'request_attempt', 'request_id': self.next_id,
             'method': method, 'host': host, 'path': path, 'action': action,
             'object_key': self.active_object['object_key'] if self.active_object is not None else None,
-            'outcome': 'unknown'})
+            'outcome': 'unknown',
+            'effect_deadline_ns': int(self.budget.deadline * 1e9)})
         return self.next_id
 
     def after_send(self, ticket, status):
@@ -203,13 +219,14 @@ def _save_receipt(fresh, output, receipt, budget, journal):
     receipt['journal_sha256'] = hashlib.sha256(journal.path.read_bytes()).hexdigest()
     receipt['budget'] = budget.snapshot()
     raw = canonical(receipt)
-    if len(raw) + journal.bytes_written > budget.limits['max_evidence_bytes']:
+    evidence_limit = budget.limits['max_evidence_bytes'] - (8192 if budget.owned_shared is not None else 0)
+    if len(raw) + journal.bytes_written > evidence_limit:
         receipt = {'schema': 'wukongim.object_storage_execution/v1', 'status': 'incomplete',
             'stage': 'evidence_limit', 'request_sha256': receipt['request_sha256'],
             'journal_path': str(journal.path), 'journal_sha256': receipt['journal_sha256'],
             'omitted_receipt_bytes': len(raw), 'omitted_receipt_sha256': hashlib.sha256(raw).hexdigest(),
             **FALSE_FIELDS}
-        require(len(canonical(receipt)) + journal.bytes_written <= budget.limits['max_evidence_bytes'],
+        require(len(canonical(receipt)) + journal.bytes_written <= evidence_limit,
                 'bounded incomplete receipt cannot fit')
     fresh.D._json_write(output / 'execution.json', receipt)
     return receipt
@@ -224,9 +241,13 @@ def _request(request):
     """Validate data scope without interpreting a field as human authority."""
     fields = {'schema', 'operation', 'executor_sha', 'inputs', 'inputs_sha256',
               'plan_sha256', 'resource', 'output_dir', 'limits'}
-    require(isinstance(request, dict) and set(request) == fields, 'exact execution request required')
+    require(isinstance(request, dict), 'exact execution request required')
+    if request.get('schema') == 'wukongim.object_storage_execution_request/v2':
+        fields.add('process_limits')
+    require(set(request) == fields, 'exact execution request required')
     value = copy.deepcopy(request)
-    require(value['schema'] == 'wukongim.object_storage_execution_request/v1'
+    require(value['schema'] in ('wukongim.object_storage_execution_request/v1',
+            'wukongim.object_storage_execution_request/v2')
             and value['operation'] == 'stage_immutable', 'unsupported execution operation')
     require(isinstance(value['executor_sha'], str) and re.fullmatch('[0-9a-f]{40}', value['executor_sha']),
             'executor SHA invalid')
@@ -247,7 +268,8 @@ def _light_fence(fresh, request, initial, budget):
     """Bind each next PUT to fresh API identities without payload downloads."""
     _input_bytes(fresh, request)
     return fresh.revalidate_delivery_anchors(inputs=Path(request['inputs']),
-        expected_plan_sha256=request['plan_sha256'], previous=initial, budget=budget)
+        expected_plan_sha256=request['plan_sha256'], previous=initial, budget=budget, source_token=getattr(budget, 'source_token', None),
+            package_token=getattr(budget, 'package_token', None))
 
 
 def _stage_immutable(request, *, provider, budget=None):
@@ -258,6 +280,10 @@ def _stage_immutable(request, *, provider, budget=None):
     The public production entry remains disabled and cannot call it yet.
     """
     request = _request(request)
+    owned = request['schema'].endswith('/v2')
+    if owned:
+        require(budget is not None and budget.owned_shared is not None
+                and getattr(budget, 'owned_root_identity', None) is not None, 'owned v2 process context required')
     budget = budget or RunBudget(request['limits'])
     require(budget.limits == request['limits'], 'budget differs from exact request')
     budget.check()
@@ -266,8 +292,13 @@ def _stage_immutable(request, *, provider, budget=None):
     fresh = module('verify-object-storage-delivery-inputs.py')
     _input_bytes(fresh, request)
     initial = fresh.verify_delivery_inputs(inputs=Path(request['inputs']),
-        expected_plan_sha256=request['plan_sha256'], executor_sha=request['executor_sha'], budget=budget)
+        expected_plan_sha256=request['plan_sha256'], executor_sha=request['executor_sha'], budget=budget,
+        source_token=getattr(budget, 'source_token', None), package_token=getattr(budget, 'package_token', None))
     output = Path(request['output_dir'])
+    if owned:
+        metadata = output.stat(follow_symlinks=False)
+        require((metadata.st_dev, metadata.st_ino) == budget.owned_root_identity, 'owned output changed')
+        output = output / 'staging'
     require(not output.exists() and output.parent.is_dir(), 'execution output must be new')
     fresh.C.validate_candidate_output_paths((output,), (Path(request['inputs']),))
     output.mkdir(mode=0o700)
@@ -312,7 +343,8 @@ def _stage_immutable(request, *, provider, budget=None):
             journal.active_object = None
         receipt['stage'] = 'final_fence'
         receipt['fresh_final'] = fresh.verify_delivery_inputs(inputs=Path(request['inputs']),
-            expected_plan_sha256=request['plan_sha256'], executor_sha=request['executor_sha'], previous=initial, budget=budget)
+            expected_plan_sha256=request['plan_sha256'], executor_sha=request['executor_sha'], previous=initial, budget=budget, source_token=getattr(budget, 'source_token', None),
+            package_token=getattr(budget, 'package_token', None))
         receipt.update(status='staged_readback_verified', stage='complete')
     except Exception:
         receipt['error'] = 'staging incomplete; inspect exact recorded attempts'
@@ -321,13 +353,9 @@ def _stage_immutable(request, *, provider, budget=None):
 
 
 
-def _reconcile_staging(request, *, provider, journal_path, journal_sha256, output_dir):
-    """Observe exact prior keys/config without retry, rollback or causal rewriting."""
-    request = _request(request)
-    require(provider.resource == request['resource'], 'reconcile resource differs')
+def _bound_staging_journal(request, raw, prepared_raw):
+    """Interpret only the exact digest-bound unique staging attempt sequence."""
     fresh = module('verify-object-storage-delivery-inputs.py')
-    raw = fresh.D._read(Path(journal_path), 'prior execution journal')
-    require(hashlib.sha256(raw).hexdigest() == journal_sha256, 'prior journal digest differs')
     lines = raw.splitlines(keepends=True)
     tail = lines.pop() if lines and not lines[-1].endswith(b'\n') else b''
     events = [json.loads(line, object_pairs_hook=fresh.C.reject_duplicate_pairs) for line in lines]
@@ -337,8 +365,6 @@ def _reconcile_staging(request, *, provider, journal_path, journal_sha256, outpu
             and header.get('resource_sha256') == digest(request['resource'])
             and header.get('inputs_sha256') == request['inputs_sha256']
             and header.get('plan_sha256') == request['plan_sha256'], 'prior request/plan/resource differs')
-    prepared_path = Path(request['output_dir']) / 'prepared/delivery.json'
-    prepared_raw = fresh.D._read(prepared_path, 'prior prepared inventory')
     require(hashlib.sha256(prepared_raw).hexdigest() == header['preparation_sha256'], 'prior preparation differs')
     prepared = json.loads(prepared_raw, object_pairs_hook=fresh.C.reject_duplicate_pairs)
     allowed = {x['object_key']: {k: x[k] for k in ('size', 'sha256', 'cache_control')} for x in prepared['objects']}
@@ -375,6 +401,22 @@ def _reconcile_staging(request, *, provider, journal_path, journal_sha256, outpu
             active = None
     # Headers and a later exact GET do not resolve the original SDK operation.
     unknown = sum(1 for key in puts if completions.get(key) not in ('created', 'already_exists'))
+    return objects, unknown, tail, header
+
+
+def _reconcile_staging(request, *, provider, journal_path, journal_sha256, output_dir):
+    """Observe exact prior keys/config without retry, rollback or causal rewriting."""
+    request = _request(request)
+    require(provider.resource == request['resource'], 'reconcile resource differs')
+    fresh = module('verify-object-storage-delivery-inputs.py')
+    raw = fresh.D._read(Path(journal_path), 'prior execution journal')
+    require(hashlib.sha256(raw).hexdigest() == journal_sha256, 'prior journal digest differs')
+    prepared_root = Path(request['output_dir'])
+    if request['schema'].endswith('/v2'):
+        prepared_root = prepared_root / 'staging'
+    prepared_path = prepared_root / 'prepared/delivery.json'
+    prepared_raw = fresh.D._read(prepared_path, 'prior prepared inventory')
+    objects, unknown, tail, header = _bound_staging_journal(request, raw, prepared_raw)
     budget = RunBudget(request['limits'], read_only=True)
     provider.bind_execution_controls(budget=budget)
     fresh_anchor_status = 'verified'

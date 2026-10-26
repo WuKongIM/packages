@@ -112,8 +112,12 @@ def _executor_clean(executor_sha, budget=None):
     """Bind clean executing bytes and clamp each Git read to remaining time."""
     for arguments in (['git','rev-parse','HEAD'], ['git','status','--porcelain','--untracked-files=all']):
         if budget is not None: budget.check()
-        result=subprocess.run(arguments,cwd=ROOT.parent,capture_output=True,text=True,check=False,
-            timeout=min(10,budget.remaining()) if budget is not None else 10)
+        if budget is not None and getattr(budget, 'owned_shared', None) is not None:
+            result=budget.run_process(arguments, env={'PATH':__import__('os').environ.get('PATH',__import__('os').defpath)}, timeout=min(10,budget.remaining()))
+            result.stdout=result.stdout.decode('utf-8')
+        else:
+            result=subprocess.run(arguments,cwd=ROOT.parent,capture_output=True,text=True,check=False,
+                timeout=min(10,budget.remaining()) if budget is not None else 10)
         if budget is not None: budget.check()
         expected=executor_sha if arguments[1]=='rev-parse' else ''
         require(result.returncode==0 and result.stdout.strip()==expected,'executing checkout or clean state differs')

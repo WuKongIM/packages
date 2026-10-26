@@ -63,10 +63,64 @@ An unknown PUT is never retried. Existing Provider behavior performs a complete
 GET; exact bytes can establish the object's present state while the original
 request outcome remains unknown in the journal. Failed readback stops staging.
 
-The current budget stops new requests and checks stream reads but cannot revoke
-an in-flight remote request atomically. The v2 design's outer owned-process
-watchdog/cancellation lifecycle is still a later execution slice. This code does
-not claim that a blocked read is interrupted at an exact global deadline.
+## Owned Linux execution
+
+The internal `supervise_staging` capability accepts strict request schema v2.
+It adds `process_limits` with finite `max_process_output_bytes` (at most 64 MiB)
+and `max_processes` (at most 10,000); HTTP limits retain their v1 meaning.
+The public `run_delivery` entry still refuses. Neither request data, an inherited
+FD nor temporary credentials establish production authorization.
+
+A dedicated, single-thread Linux supervisor rejects existing unrelated children,
+becomes a subreaper and starts one worker in its own session/process group.
+Source helpers, `gh` and native metadata inspectors inherit that group. One
+absolute deadline covers input verification, materialization, SDK traffic and
+helpers; a reserve inside the same timeout covers TERM, KILL and reaping.
+Cancellation sets the shared numeric token without blocking the owner on a held
+lock; a worker signal also stops its next SDK request. Shutdown starts no cloud
+readback, retry or rollback. The exact owned group is terminated and adopted
+children are reaped. An unverified cleanup or invalid journal/budget leaves an
+incomplete result. OS scheduling, uninterruptible I/O and host/filesystem loss do
+not provide a universal real-time or durable-host-recovery guarantee.
+
+Temporary credentials cross an anonymous pipe and enter the concrete Provider
+constructor. They never enter request JSON, argv, evidence or helper environments.
+Only an explicitly supplied source token reaches the isolated `gh` environment.
+Helper commands come from reviewed code; request JSON cannot choose executable
+code. Streams are drained concurrently with per-command and aggregate byte caps;
+raw stderr is discarded. Process-output counts do not count HTTP calls hidden
+inside `gh`.
+
+The numeric budget FD is unlinked, private and inherited only by reviewed Python
+helpers. Traditional POSIX process-associated record locks protect explicit
+`pread`/`pwrite` updates and checksum validation. Inherited-OFD `flock` is not used.
+Each PID has one context/FD and one owning thread; no duplicate/reopened budget
+FD may be closed during its short critical section. A busy parent lock never
+blocks process cancellation. Corruption refuses further grants.
+
+V2 output is `supervision-start.json`, `supervision.json` and
+`staging/{prepared/,effects.jsonl,execution.json}` under a new private root.
+The worker checks its inherited directory FD identity. Supervisor evidence uses
+the same exact journal-binding parser as read-only reconciliation; raw HTTP
+headers or a later matching GET cannot clear an original unknown PUT. Evidence
+space for supervisor output is reserved before effects. Original v1 direct
+staging and its portable fixtures retain their layout.
+
+Explicit process acceptance is separate from default quick tests:
+
+```sh
+python tests/provider_sdk/owned_budget_process_integration.py --receipt /tmp/owned-budget.json
+python tests/provider_sdk/owned_runtime_process_integration.py --receipt /tmp/owned-runtime.json
+python tests/provider_sdk/owned_execution_integration.py --receipt /tmp/owned-staging.json
+```
+
+The last suite requires Linux and returns a failing unsupported receipt elsewhere.
+The contents-read SDK workflow invokes all three with fixed timeouts and uploads
+source-bound receipts. Zero tests, skipped cases, changed source, errors or
+failures cannot pass. Linux SDK fixtures use the actual staging/materializer,
+existing GitHub/native-tool seams and official SDK HTTP Wire with networking
+forbidden; they do not establish live provenance, platform authority or public
+package delivery.
 
 ## Read-only reconciliation
 

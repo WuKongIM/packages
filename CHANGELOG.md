@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Bound internal Linux staging and its helpers with one execution deadline,
+  owned-process cancellation and verified cleanup. Preserve uncertain upload
+  outcomes after forced termination; production publication remains disabled.
+
 - Add bounded internal object staging with fresh immutable-identity fences,
   durable request evidence and exact read-only reconciliation. Production entry,
   CDN activation and stable publication remain disabled.
