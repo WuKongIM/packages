@@ -344,6 +344,7 @@ class Provider:
         return snapshot
 
     def _configuration_ready(self, before):
+        """Validate an exact legacy or controlled profile without rewriting its observation."""
         detail=before['detail'];r=self.resource
         require(detail.get('DomainName')==r['domain'] and detail.get('Cname')==r['cname']
                 and detail.get('DomainStatus')=='online', 'CDN domain binding differs')
@@ -356,6 +357,21 @@ class Provider:
                   'set_req_host_header':{'domain_name':self.origin},
                   'https_origin_sni':{'enabled':'on','https_origin_sni':self.origin},
                   'set_hashkey_args':{'hashkey_args':'','disable':'off','keep_oss_args':'on'}}
+        controlled_names=('l2_oss_key','path_based_ttl_set','https_force','https_tls_version')
+        if any(isinstance(row,dict) and row.get('FunctionName') in controlled_names for row in before['configs']):
+            # Any controlled facet requires the whole supported profile. The
+            # legacy four-function primitive remains limited and non-activating.
+            require(detail.get('ServerCertificateStatus')=='on' and detail.get('HttpsCname')==r['cname'],
+                    'controlled CDN HTTPS binding differs')
+            expected['set_hashkey_args']={'hashkey_args':'','disable':'on','keep_oss_args':'off'}
+            expected.update({
+                'l2_oss_key':{'private_oss_auth':'on'},
+                'path_based_ttl_set':{'path':'/','ttl':'1','weight':'1',
+                    'swift_origin_cache_high':'on','swift_no_cache_low':'off',
+                    'swift_follow_cachetime':'off','force_revalidate':'off'},
+                'https_force':{'enable':'on','https_rewrite':'301'},
+                'https_tls_version':{'tls10':'off','tls11':'off','tls12':'on',
+                    'tls13':'on','ciphersuitegroup':'strict'}})
         for row in before['configs']:
             cid=str(row.get('ConfigId',''));name=row.get('FunctionName')
             require(cid.isdecimal() and int(cid)>0 and cid not in ids and row.get('ParentId') in ('0',0,None)
