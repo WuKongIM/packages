@@ -193,6 +193,14 @@ def run_checked_helper(filename: str, arguments: list[str], *, home: Path,
     if budget is not None:
         budget.check()
     timeout=700 if budget is None else min(700,budget.remaining())
+    if budget is not None and getattr(budget, 'owned_shared', None) is not None:
+        shared=budget.owned_shared
+        command=[sys.executable,'-B',str(ROOT/filename),*arguments,
+            '--owned-budget-fd',str(shared.fileno()),'--owned-request-sha256',shared.snapshot()['request_sha256']]
+        result=budget.run_process(command,env=environment,timeout=timeout,pass_fds=(shared.fileno(),))
+        require(result.returncode==0,'actual source verification failed: '+filename)
+        require(0 < len(result.stdout) <= AUDIT.MAX_JSON_BYTES,'source verification receipt exceeds limit')
+        return json.loads(result.stdout,object_pairs_hook=C.reject_duplicate_pairs)
     with tempfile.TemporaryFile() as output, tempfile.TemporaryFile() as errors:
         try:
             result=subprocess.run([sys.executable,'-B',str(ROOT/filename),*arguments],

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -384,7 +385,7 @@ def _write_json_file(directory_fd: int, name: str, value: Any) -> str:
 
 
 def _verify_one_attestation(
-    asset_path: Path, tag: str, source_sha: str
+    asset_path: Path, tag: str, source_sha: str, owned: Any = None
 ) -> Any:
     command = [
         "gh",
@@ -403,14 +404,18 @@ def _verify_one_attestation(
         "--format=json",
     ]
     try:
-        completed = subprocess.run(
-            command,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-            timeout=90,
-        )
+        if owned is not None:
+            completed = _owned_runtime().run_fixed_process(command,env=dict(os.environ),shared=owned,
+                timeout=min(90,owned.remaining()))
+        else:
+            completed = subprocess.run(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                timeout=90,
+            )
     except FileNotFoundError as error:
         raise VerificationError("gh CLI is not available") from error
     except subprocess.TimeoutExpired as error:
@@ -427,7 +432,7 @@ def _verify_one_attestation(
 
 
 def verify_source_attestations(
-    *, receipt_path: Path, asset_dir: Path, evidence_dir: Path, channel: str = "preview"
+    *, receipt_path: Path, asset_dir: Path, evidence_dir: Path, channel: str = "preview", owned: Any = None
 ) -> dict[str, Any]:
     """Verify source evidence for one channel without authorizing publication."""
     if channel not in {"preview", "stable"}:
@@ -468,9 +473,8 @@ def verify_source_attestations(
         resolved_asset_dir = asset_dir.resolve(strict=True)
         for name in sorted(receipt["assets"]):
             asset_path = resolved_asset_dir / name
-            verification = _verify_one_attestation(
-                asset_path, receipt["tag"], receipt["source_sha"]
-            )
+            verification = (_verify_one_attestation(asset_path, receipt["tag"], receipt["source_sha"], owned)
+                if owned is not None else _verify_one_attestation(asset_path, receipt["tag"], receipt["source_sha"]))
             evidence_name = f"{name}.attestation.json"
             evidence_sha256 = _write_json_file(directory_fd, evidence_name, verification)
             written_names.append(evidence_name)
@@ -520,6 +524,11 @@ def verify_source_attestations(
                 pass
 
 
+def _owned_runtime():
+    spec=importlib.util.spec_from_file_location('owned_runtime',Path(__file__).with_name('object-storage-owned-execution.py'))
+    runtime=importlib.util.module_from_spec(spec);spec.loader.exec_module(runtime);return runtime
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Verify fixed GitHub attestations for seven opaque source Release assets."
@@ -533,21 +542,26 @@ def _parser() -> argparse.ArgumentParser:
         default="preview",
         help="expected source classification; verification does not enable publication",
     )
+    parser.add_argument('--owned-budget-fd',type=int)
+    parser.add_argument('--owned-request-sha256')
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    owned=_owned_runtime().helper_context(args.owned_budget_fd,args.owned_request_sha256)
     try:
         summary = verify_source_attestations(
             receipt_path=args.receipt,
             asset_dir=args.asset_dir,
             evidence_dir=args.evidence_dir,
-            channel=args.channel,
+            channel=args.channel, owned=owned,
         )
     except VerificationError as error:
         print(f"source attestation verification failed: {error}", file=sys.stderr)
         return 1
+    if owned is not None:
+        owned.close()
     json.dump(summary, sys.stdout, sort_keys=True, separators=(",", ":"))
     sys.stdout.write("\n")
     return 0

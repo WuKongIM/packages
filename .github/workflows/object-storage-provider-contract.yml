@@ -35,6 +35,12 @@ jobs:
           timeout 120 /tmp/provider-contract-venv/bin/python -B tests/provider_sdk/test_aliyun_object_storage_provider.py --receipt /tmp/provider-contract-receipt.json
           timeout 120 /tmp/provider-contract-venv/bin/python -B tests/provider_sdk/test_object_storage_execution.py --receipt /tmp/provider-execution-receipt.json
           test -s /tmp/provider-execution-receipt.json
+          timeout 120 /tmp/provider-contract-venv/bin/python -B tests/provider_sdk/owned_budget_process_integration.py --receipt /tmp/provider-owned-budget-receipt.json
+          timeout 120 /tmp/provider-contract-venv/bin/python -B tests/provider_sdk/owned_runtime_process_integration.py --receipt /tmp/provider-owned-runtime-receipt.json
+          timeout 120 /tmp/provider-contract-venv/bin/python -B tests/provider_sdk/owned_execution_integration.py --receipt /tmp/provider-owned-staging-receipt.json
+          test -s /tmp/provider-owned-budget-receipt.json
+          test -s /tmp/provider-owned-runtime-receipt.json
+          test -s /tmp/provider-owned-staging-receipt.json
           timeout 120 python3 -B -m unittest discover -s tests -p test_object_storage_delivery_inputs.py -v
       - name: Retain bounded no-credential contract receipts
         if: always()
@@ -44,5 +50,9 @@ jobs:
           path: |
             /tmp/provider-contract-receipt.json
             /tmp/provider-execution-receipt.json
+            /tmp/provider-owned-budget-receipt.json
+            /tmp/provider-owned-runtime-receipt.json
+            /tmp/provider-owned-staging-receipt.json
+            /tmp/provider-owned-staging-receipt-cases
           if-no-files-found: error
           retention-days: 7
