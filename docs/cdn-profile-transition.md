@@ -117,14 +117,37 @@ assume atomic POP switching or temporarily remove coverage to fit the cap.
 
 ## Attempts, observations and remaining tests
 
-The existing effect journal admits staging only. It must gain separately bound
-configuration/refresh attempt types before an execution gateway can use these
-operations. Preserve exact request identity, pre-effect state, consumed SDK
-response/unknown outcome and full later observation. Timeout, malformed IDs,
-partial batches or body-read failure leave incomplete effects even when a later
-configuration appears to match. No automatic retry, rollback, deletion repair
-or resume follows. Read-only reconciliation binds the original request, plan,
-resource and journal and cannot promote unknown to successful publication.
+The default effect journal still admits staging only. Its private `cdn_effects`
+evidence version binds the complete C0, prepared routes, compiled functions and
+exact File URL set to the original request/plan/resource/preparation digests.
+Provider opens one scope immediately around each SDK submission. Before Wire,
+the actual signed POST's unique business fields must match the domain, action
+and exact ordered batch; unknown/deletion actions and conflicting query/body
+fields are refused. The sanitized unknown attempt is written and fsynced before
+transport. Neither an intent nor a budget or journal grants publication authority.
+
+The same RunBudget instance owns the journal throughout the invocation. Attaching
+it to a new budget with equal limits cannot renew its deadline or request/read
+credit. Ownership is checked at binding, before SDK/urllib dispatch and reads,
+and through response consumption and acknowledgement. Late headers and scope
+cleanup remain observations by the original owner; they do not extend its deadline.
+
+Headers, bounded EOF/JSON consumption, validated acknowledgement and later
+state are separate observations. Configuration IDs are acknowledged only after
+matching their batch functions in the complete raw C1 observation. A known
+earlier batch can stay acknowledged when a later batch is unknown. Valid refresh
+submission IDs may span batches; acknowledgement does not mean task completion.
+Timeout, malformed IDs, partial responses or interrupted bodies stay unknown
+even if later state matches. Journal write/fsync failure stops further effects;
+it never triggers retry. No rollback, deletion repair or resume follows.
+
+The versioned `run_start_v2` discriminator makes legacy staging parsers refuse
+CDN journals. The strict shared parser rejects unknown/duplicate/conflicting
+events and records a partial trailing line as incomplete. Read-only reconciliation
+binds the original request, intent, preparation and journal; it queries only
+recorded valid task IDs within the finite URL set. A lost submission response
+without IDs remains unobservable: no history scan, synthetic ID or resubmission.
+Current matching configuration/tasks never clear original unknown counts.
 
 The six new `test_controlled_profile_*` methods are the small first increment:
 full A/B profile preservation with actual observed IDs; unsafe/incomplete facets;
@@ -135,8 +158,10 @@ uses the existing official SDK HTTP Wire and independently requires zero socket
 connect attempts, even if an expected exception absorbs a transport failure.
 
 Positive authorized removal/rechunk, server-managed metadata evolution,
-certificate identity observation, actual edge URI semantics and configuration
-journal/reconciliation are not implemented or covered by these six tests.
+certificate identity observation and actual edge URI semantics are not
+implemented or covered by these six tests. Private journal/reconciliation uses
+additional `test_cdn_effect_journal_*` SDK contracts, including actual serialized
+request binding, body/ID/fsync faults, shared task IDs and read-only unknowns.
 Their next failure-first cases must use the agreed transition data contract and
 real SDK request/response path. Do not fabricate caller approval or substitute
 a method-by-method cloud facade to make them pass. Final public observer and
