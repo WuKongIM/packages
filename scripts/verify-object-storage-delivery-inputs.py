@@ -87,7 +87,7 @@ def _preview_control(reader, item, base, current):
         require(base64.b64decode(blob['content'].replace('\n',''),validate=True)==raw,'historical preview control bytes differ')
 
 
-def _preview_source(item, base, source_token, scratch):
+def _preview_source(item, base, source_token, scratch, budget=None):
     """Use the original preview resolver and both real preflight commands on seven assets."""
     archive=D.P.local_path(item['archive'],base,'preview archive')
     extracted=scratch/'snapshot'
@@ -96,29 +96,31 @@ def _preview_source(item, base, source_token, scratch):
     require(summary['sha256']==item['archive_sha256'] and summary['size']==item['archive_size'],'preview archive drifted')
     original=C.load_json(extracted/'audit/source-attestations/source-attestations.json','source attestation summary',canonical=True)
     fresh=S.SOURCE.resolve_source_release(release_id=item['source']['release_id'],output_dir=scratch/'assets',
-        api_base_url='https://api.github.com',download_base_url='https://api.github.com',token=source_token,channel='preview')
+        api_base_url='https://api.github.com',download_base_url='https://api.github.com',token=source_token,channel='preview',budget=budget)
     require({k:fresh[k] for k in ('repository','version','release_id','source_sha')}==item['source'], 'fresh preview source differs')
     require({x['name']:x['sha256'] for x in fresh['assets']}=={x['asset']:x['asset_sha256'] for x in original['assets']},
             'fresh seven-asset source closure differs from archived attestations')
     receipt=scratch/'resolution.json';receipt.write_bytes(C.canonical_json(fresh))
     S.run_checked_helper('verify-source-attestations.py',['--channel', 'preview','--receipt',str(receipt),
-        '--asset-dir',str(scratch/'assets'),'--evidence-dir',str(scratch/'attestations')],home=scratch,source_token=source_token)
+        '--asset-dir',str(scratch/'assets'),'--evidence-dir',str(scratch/'attestations')],home=scratch,source_token=source_token,budget=budget)
     S.run_checked_helper('verify-source-package-metadata.py',['--channel', 'preview','--receipt',str(receipt),
-        '--asset-dir',str(scratch/'assets')],home=scratch)
+        '--asset-dir',str(scratch/'assets')],home=scratch,budget=budget)
     return S.source_identity(fresh)
 
 
-def _executor_clean(executor_sha):
-    """An unchanged HEAD alone does not bind the executing helper bytes."""
-    result=subprocess.run(['git','rev-parse','HEAD'],cwd=ROOT.parent,capture_output=True,text=True,check=False,timeout=10)
-    require(result.returncode==0 and result.stdout.strip()==executor_sha,'executing checkout differs from reviewed control')
-    status=subprocess.run(['git','status','--porcelain','--untracked-files=all'],cwd=ROOT.parent,
-                          capture_output=True,text=True,check=False,timeout=10)
-    require(status.returncode==0 and not status.stdout,'executing checkout has unreviewed changes')
+def _executor_clean(executor_sha, budget=None):
+    """Bind clean executing bytes and clamp each Git read to remaining time."""
+    for arguments in (['git','rev-parse','HEAD'], ['git','status','--porcelain','--untracked-files=all']):
+        if budget is not None: budget.check()
+        result=subprocess.run(arguments,cwd=ROOT.parent,capture_output=True,text=True,check=False,
+            timeout=min(10,budget.remaining()) if budget is not None else 10)
+        if budget is not None: budget.check()
+        expected=executor_sha if arguments[1]=='rev-parse' else ''
+        require(result.returncode==0 and result.stdout.strip()==expected,'executing checkout or clean state differs')
 
 
 def verify_delivery_inputs(*, inputs, expected_plan_sha256, executor_sha, source_token=None, package_token=None,
-                           previous=None):
+                           previous=None, budget=None):
     """Run original local, fresh GitHub and source checks; re-run to fence before CDN.
 
     The first v1 observation anchors asset IDs absent from the original descriptor.
@@ -132,8 +134,8 @@ def verify_delivery_inputs(*, inputs, expected_plan_sha256, executor_sha, source
         composite=value.get('schema')=='wukongim.object_storage_plan_inputs/v2'
         plan,raw,value=D._load_plan(inputs,expected_plan_sha256,composite,False)
         require(isinstance(executor_sha,str) and re.fullmatch('[0-9a-f]{40}',executor_sha),'executor SHA invalid')
-        _executor_clean(executor_sha)
-        reader=A.GitHubReader('https://api.github.com','https://api.github.com',package_token)
+        _executor_clean(executor_sha,budget)
+        reader=A.GitHubReader('https://api.github.com','https://api.github.com',package_token,budget=budget)
         S.current_control(reader,executor_sha)
         audits=[];sources=[];controls=[]
         for channel,item in D._descriptors(value,composite):
@@ -146,17 +148,17 @@ def verify_delivery_inputs(*, inputs, expected_plan_sha256, executor_sha, source
                         executor_sha=executor_sha,seal_control_sha=seal))
                     fresh=S.verify_seal_inputs(reader=reader,expected_control_sha=executor_sha,archive_path=path('archive'),
                         receipt_path=path('receipt'),plan_path=path('plan'),control_root=path('control_dir'),source_root=path('source_dir'),
-                        apt_receipt=path('apt_receipt'),rpm_receipt=path('rpm_receipt'),source_token=source_token,test_only=False)
+                        apt_receipt=path('apt_receipt'),rpm_receipt=path('rpm_receipt'),source_token=source_token,test_only=False,budget=budget)
                     source=fresh['source']
                 else:
                     _preview_control(reader,item,inputs.parent,executor_sha)
-                    source=_preview_source(item,inputs.parent,source_token,scratch)
+                    source=_preview_source(item,inputs.parent,source_token,scratch,budget)
                 require(source['source_sha']!=D.V.TEST_PRODUCT_SHA,'TEST ONLY source identity refused')
                 sources.append({'channel':channel,'audit_release_id':item['audit_release_id'],'identity':source})
                 fresh=A.resolve_audit_release(release_id=item['audit_release_id'],expected_control_sha=seal,
                     output_dir=scratch/'audit',api_base_url='https://api.github.com',download_base_url='https://api.github.com',
                     token=package_token,expected_tag_state='exact',channel=channel,test_only=False,
-                    candidate_plan=path('plan') if channel=='stable' else None,candidate_receipt=path('receipt') if channel=='stable' else None)
+                    candidate_plan=path('plan') if channel=='stable' else None,candidate_receipt=path('receipt') if channel=='stable' else None,budget=budget)
                 identity=audit_identity(fresh)
                 if channel=='stable':
                     original=C.load_json(path('resolution'),'historical seal resolution',canonical=True)
@@ -170,7 +172,7 @@ def verify_delivery_inputs(*, inputs, expected_plan_sha256, executor_sha, source
         _,final_raw,_=D._load_plan(inputs,expected_plan_sha256,composite,False)
         require(final_raw==raw,'local input bytes changed during fresh verification')
         S.current_control(reader,executor_sha)
-        _executor_clean(executor_sha)
+        _executor_clean(executor_sha,budget)
         result={'executor_sha':executor_sha,'inputs_sha256':hashlib.sha256(raw).hexdigest(),'plan_sha256':expected_plan_sha256,
                 'audits':audits,'sources':sources,'controls':controls,'production_enabled':False,'publication_verified':False,
                 'cloud_verified':False,'original_verification':copy.deepcopy(plan['verification'])}
@@ -178,3 +180,64 @@ def verify_delivery_inputs(*, inputs, expected_plan_sha256, executor_sha, source
         return result
     except Exception:
         raise InputError('fresh delivery input authentication failed') from None
+
+
+def revalidate_delivery_anchors(*, inputs, expected_plan_sha256, previous,
+                                source_token=None, package_token=None, budget=None):
+    """Fence immutable API metadata without downloading payloads per object.
+
+    The preceding complete verification binds local bytes, attestations and native
+    metadata. This observation rechecks numeric releases, tags, asset IDs/digests,
+    source ancestry, current control and clean execution before the next write.
+    Complete verification still runs again at the end of the staging phase.
+    """
+    try:
+        inputs=Path(inputs)
+        raw=D._read(inputs,'delivery metadata fence inputs')
+        require(hashlib.sha256(raw).hexdigest()==previous['inputs_sha256']
+                and expected_plan_sha256==previous['plan_sha256'],'delivery input/plan anchor changed')
+        value=json.loads(raw,object_pairs_hook=C.reject_duplicate_pairs)
+        composite=value.get('schema')=='wukongim.object_storage_plan_inputs/v2'
+        descriptors={(channel,item['audit_release_id']):item for channel,item in D._descriptors(value,composite)}
+        executor=previous['executor_sha'];_executor_clean(executor,budget)
+        reader=A.GitHubReader('https://api.github.com','https://api.github.com',package_token,budget=budget)
+        S.current_control(reader,executor)
+        sources=[]
+        for item in previous['sources']:
+            original=item['identity'];channel=item['channel']
+            source_reader=S.SOURCE.GitHubReader('https://api.github.com','https://api.github.com',source_token,budget=budget)
+            snapshot=S.SOURCE._release_snapshot(source_reader.api_json(
+                'repos/'+S.SOURCE.SOURCE_REPOSITORY+'/releases/'+str(original['release_id'])),
+                original['release_id'],channel)
+            observed={'repository':S.SOURCE.SOURCE_REPOSITORY,'release_id':original['release_id'],
+                'tag':snapshot['tag'],'version':snapshot['version'],'prerelease':snapshot['prerelease'],
+                'published_at':snapshot['published_at'],'source_sha':S.SOURCE._peel_tag(source_reader,snapshot['tag']),
+                'assets':list(snapshot['assets'].values()),'checksum_asset':snapshot['checksum_name'],
+                'checksum_entries':original['checksum_entries']}
+            require(S.source_identity(observed)==original,'source immutable metadata changed')
+            S.SOURCE._verify_main_ancestry(source_reader,original['source_sha'])
+            sources.append(copy.deepcopy(item))
+        audits=[]
+        for original in previous['audits']:
+            channel=original['channel'];item=descriptors[(channel,original['release_id'])]
+            candidate=item['candidate'] if channel=='stable' else None
+            snapshot=A._release_snapshot(reader.api_json('repos/'+A.AUDIT_REPOSITORY+'/releases/'+str(original['release_id'])),
+                original['release_id'],original['control_sha'],channel,candidate)
+            require(snapshot['classification']==A.IMMUTABLE_COMPLETE and snapshot['draft'] is False
+                    and snapshot['immutable'] is True,'audit immutable metadata changed')
+            A._tag_snapshot(reader,snapshot['tag_name'],original['control_sha'])
+            S.require_ancestor(reader,original['control_sha'],executor)
+            observed={'channel':channel,'repository':A.AUDIT_REPOSITORY,'release_id':snapshot['id'],
+                'tag_name':snapshot['tag_name'],'control_sha':snapshot['target_commitish'],
+                'published_at':snapshot['published_at'],
+                'assets':sorted(snapshot['assets'].values(),key=lambda x:x['name'])}
+            require(observed==original,'audit numeric asset identity changed')
+            audits.append(observed)
+        S.current_control(reader,executor);_executor_clean(executor,budget)
+        require(D._read(inputs,'delivery metadata fence inputs')==raw,'delivery inputs changed during metadata fence')
+        return {'schema':'wukongim.object_storage_delivery_metadata_fence/v1','executor_sha':executor,
+            'inputs_sha256':previous['inputs_sha256'],'plan_sha256':expected_plan_sha256,
+            'sources':sources,'audits':audits,'asset_bytes_downloaded':False,'native_helpers_run':False,
+            'production_enabled':False,'publication_verified':False,'cloud_verified':False}
+    except Exception:
+        raise InputError('fresh delivery metadata fence failed') from None

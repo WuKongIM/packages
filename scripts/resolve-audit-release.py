@@ -120,12 +120,13 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 class GitHubReader:
     def __init__(self, api_base_url: str, download_base_url: str, token: str | None,
-                 *, deny_redirects: bool = False) -> None:
+                 *, deny_redirects: bool = False, budget: Any = None) -> None:
         self.api_base_url = _validated_base_url(api_base_url, "API base URL")
         self.download_base_url = _validated_base_url(
             download_base_url, "download base URL"
         )
         self.token = token
+        self.budget = budget
         self.deny_redirects = deny_redirects
         handlers = [_NoRedirect()]
         if deny_redirects:
@@ -138,6 +139,12 @@ class GitHubReader:
             raise ResolutionError(
                 "a GitHub token may be sent only over HTTPS or loopback HTTP"
             )
+
+    def _open(self, open_callable: Any, request: Any, *, timeout: int) -> BinaryIO:
+        """Apply this reader's optional deadline and body-read budget to every open."""
+        if self.budget is not None:
+            return self.budget.open(open_callable, request, timeout=timeout)
+        return open_callable(request, timeout=timeout)
 
     def _headers(self, *, authorize: bool, accept: str) -> dict[str, str]:
         headers = {
@@ -160,7 +167,7 @@ class GitHubReader:
             method="GET",
         )
         try:
-            with self._no_redirect.open(request, timeout=30) as response:
+            with self._open(self._no_redirect.open, request, timeout=30) as response:
                 data = response.read(MAX_JSON_BYTES + 1)
         except urllib.error.HTTPError as error:
             if allow_not_found and error.code == 404:
@@ -196,7 +203,7 @@ class GitHubReader:
             method="GET",
         )
         try:
-            return self._no_redirect.open(request, timeout=60)
+            return self._open(self._no_redirect.open, request, timeout=60)
         except urllib.error.HTTPError as error:
             if error.code not in {301, 302, 303, 307, 308}:
                 raise ResolutionError(
@@ -223,7 +230,7 @@ class GitHubReader:
                 method="GET",
             )
             try:
-                return urllib.request.urlopen(redirected_request, timeout=60)
+                return self._open(urllib.request.urlopen, redirected_request, timeout=60)
             except (OSError, urllib.error.HTTPError) as redirected_error:
                 raise ResolutionError(
                     f"audit asset {asset_id} redirected download failed"
@@ -482,6 +489,7 @@ def resolve_audit_release(
     test_only: bool = False,
     candidate_plan: Path | None = None,
     candidate_receipt: Path | None = None,
+    budget: Any = None,
 ) -> dict[str, Any]:
     """Classify, download, and revalidate one numeric package audit Release."""
 
@@ -506,7 +514,8 @@ def resolve_audit_release(
     elif candidate_plan is not None or candidate_receipt is not None:
         raise ResolutionError("candidate inputs require explicit stable mode")
     output_dir = Path(output_dir)
-    reader = GitHubReader(api_base_url, download_base_url, token, deny_redirects=test_only)
+    reader = GitHubReader(api_base_url, download_base_url, token, deny_redirects=test_only,
+                          budget=budget)
     created_output = _prepare_output_directory(output_dir)
     created_assets: list[Path] = []
     release_path = f"repos/{AUDIT_REPOSITORY}/releases/{release_id}"

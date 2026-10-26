@@ -181,7 +181,7 @@ def source_identity(value: dict[str, Any]) -> dict[str, Any]:
 
 
 def run_checked_helper(filename: str, arguments: list[str], *, home: Path,
-                       source_token: str | None = None) -> dict[str, Any]:
+                       source_token: str | None = None, budget: Any = None) -> dict[str, Any]:
     """Run a fixed reviewed CLI with isolated credentials and bounded receipt IO."""
     require(filename in ('verify-source-attestations.py','verify-source-package-metadata.py'),
             'unreviewed source helper')
@@ -190,13 +190,19 @@ def run_checked_helper(filename: str, arguments: list[str], *, home: Path,
                  'GH_NO_UPDATE_NOTIFIER':'1','GH_PROMPT_DISABLED':'1','PYTHONNOUSERSITE':'1'}
     if source_token:
         environment['GH_TOKEN']=source_token
+    if budget is not None:
+        budget.check()
+    timeout=700 if budget is None else min(700,budget.remaining())
     with tempfile.TemporaryFile() as output, tempfile.TemporaryFile() as errors:
         try:
             result=subprocess.run([sys.executable,'-B',str(ROOT/filename),*arguments],
                 stdin=subprocess.DEVNULL,stdout=output,stderr=errors,env=environment,
-                timeout=700,check=False)
+                timeout=timeout,check=False)
         except (OSError,subprocess.TimeoutExpired) as error:
             raise StableInputError('source verification helper did not complete: '+filename) from error
+        finally:
+            if budget is not None:
+                budget.check()
         require(result.returncode==0,'actual source verification failed: '+filename)
         output.seek(0); raw=output.read(AUDIT.MAX_JSON_BYTES+1)
         require(0 < len(raw) <= AUDIT.MAX_JSON_BYTES,'source verification receipt exceeds limit')
@@ -204,7 +210,7 @@ def run_checked_helper(filename: str, arguments: list[str], *, home: Path,
 
 
 def verify_source(*, source_root: Path, source_token: str | None,
-                  source_files: dict[str, Any]) -> dict[str, Any]:
+                  source_files: dict[str, Any], budget: Any = None) -> dict[str, Any]:
     """Fetch and attest source bytes now; saved successful JSON is insufficient."""
     try:
         # Parse the same bounded bytes whose digest is in the verified plan.
@@ -224,14 +230,14 @@ def verify_source(*, source_root: Path, source_token: str | None,
             scratch=Path(temporary)
             fresh=SOURCE.resolve_source_release(release_id=original['release_id'],
                 output_dir=scratch/'assets',api_base_url='https://api.github.com',
-                download_base_url='https://api.github.com',token=source_token,channel='stable')
+                download_base_url='https://api.github.com',token=source_token,channel='stable',budget=budget)
             require(source_identity(fresh)==expected,'fresh immutable source identity differs from candidate')
             receipt=scratch/'resolution.json'; receipt.write_bytes(C.canonical_json(fresh))
             run_checked_helper('verify-source-attestations.py',[
                 '--channel','stable','--receipt',str(receipt),'--asset-dir',str(scratch/'assets'),
-                '--evidence-dir',str(scratch/'attestations')],home=scratch,source_token=source_token)
+                '--evidence-dir',str(scratch/'attestations')],home=scratch,source_token=source_token,budget=budget)
             metadata=run_checked_helper('verify-source-package-metadata.py',[
-                '--channel','stable','--receipt',str(receipt),'--asset-dir',str(scratch/'assets')],home=scratch)
+                '--channel','stable','--receipt',str(receipt),'--asset-dir',str(scratch/'assets')],home=scratch,budget=budget)
             require(metadata==original_metadata,
                     'fresh native metadata differs from candidate')
         return expected
@@ -323,7 +329,8 @@ def verify_candidate(*, archive_path: Path, receipt_path: Path, plan_path: Path,
 def verify_seal_inputs(*, reader: Any, expected_control_sha: str, archive_path: Path,
                        receipt_path: Path, plan_path: Path, control_root: Path,
                        source_root: Path, apt_receipt: Path, rpm_receipt: Path,
-                       source_token: str | None, test_only: bool) -> dict[str, Any]:
+                       source_token: str | None, test_only: bool,
+                       budget: Any = None) -> dict[str, Any]:
     """Run checks in this process; no caller supplied 'verified' stamp can skip them."""
     plan=candidate_plan(plan_path,test_only)
     identity=candidate_identity(plan_path,receipt_path,test_only=test_only)
@@ -335,7 +342,7 @@ def verify_seal_inputs(*, reader: Any, expected_control_sha: str, archive_path: 
         control_root=control_root,source_root=source_root,apt_receipt=apt_receipt,
         rpm_receipt=rpm_receipt,test_only=test_only)
     source=None if test_only else verify_source(source_root=source_root,source_token=source_token,
-                                               source_files=plan['candidate']['source_files'])
+                                               source_files=plan['candidate']['source_files'],budget=budget)
     if source is not None:
         require(source['release_id']==identity['source']['release_id']
                 and source['source_sha']==identity['source']['source_sha']

@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Add bounded internal object staging with fresh immutable-identity fences,
+  durable request evidence and exact read-only reconciliation. Production entry,
+  CDN activation and stable publication remain disabled.
+
 - Verify RPM signature status independently of package paths, so valid packages
   in directories containing words such as `bad` are not incorrectly rejected.
 
