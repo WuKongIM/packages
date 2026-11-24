@@ -185,7 +185,9 @@ class GitHubWriter(resolver.GitHubReader):
             if parsed.scheme == "https"
             else http.client.HTTPConnection
         )
-        connection = connection_type(parsed.hostname, parsed.port, timeout=120)
+        # GitHub can take more than two minutes to answer for a full snapshot.
+        # The publishing job still bounds the complete seal operation.
+        connection = connection_type(parsed.hostname, parsed.port, timeout=300)
         try:
             request_target = urllib.parse.urlunsplit(
                 ("", "", parsed.path, urllib.parse.urlsplit(url).query, "")
@@ -244,6 +246,8 @@ class GitHubWriter(resolver.GitHubReader):
                     f"audit asset upload failed with HTTP {response.status}: {artifact['name']}"
                 )
             raw = response.read(resolver.MAX_JSON_BYTES + 1)
+        except TimeoutError as error:
+            raise SealError(f"audit asset upload timed out: {artifact['name']}") from error
         except (OSError, http.client.HTTPException) as error:
             raise SealError(f"audit asset upload failed: {artifact['name']}") from error
         finally:
